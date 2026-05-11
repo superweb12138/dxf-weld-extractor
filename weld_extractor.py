@@ -133,12 +133,6 @@ def parse_weldmark(blk):
                 size_above = sz
             else:
                 size_below = sz
-        elif txt.strip() == 'G':
-            # 'G' suffix marks a groove weld on that side → hf=0
-            if pos[1] >= ref_y:
-                groove_above = True
-            else:
-                groove_below = True
         elif 'CJP' in txt.upper():
             # CJP (complete joint penetration) = groove weld; mark the side it appears on
             if pos[1] >= ref_y:
