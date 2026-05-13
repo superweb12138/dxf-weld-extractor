@@ -218,6 +218,18 @@ def parse_weldmark(blk):
         size_above = None   # CJP / groove → no fillet size
     if groove_below and (size_below is None or size_below >= MAX_HF):
         size_below = None   # CJP / groove → no fillet size
+    # When CJP/groove is on one side and a valid fillet size is also on
+    # that side (but the opposite side has no size), the fillet is the
+    # paired fillet on the opposite face — move it across.  Keep the
+    # groove flag so the fillet bypasses the thickness-correction step.
+    if groove_above and size_above is not None and size_above <= MAX_HF and size_below is None:
+        size_below = size_above; size_above = None
+    if groove_below and size_below is not None and size_below <= MAX_HF and size_above is None:
+        size_above = size_below; size_below = None
+    if groove_above and size_above is not None and size_above <= MAX_HF:
+        groove_above = False  # valid fillet present, groove is separate notation
+    if groove_below and size_below is not None and size_below <= MAX_HF:
+        groove_below = False
     # Numbers > MAX_HF are plate-thickness annotations, treat as no fillet
     if size_above is not None and size_above > MAX_HF:
         size_above = None
@@ -638,6 +650,10 @@ def extract_welds(dxf_path):
     _view_cnt = _Ctr(k.split(' - ')[-1] for k in part_number_map)
     main_view_id = _view_cnt.most_common(1)[0][0] if _view_cnt else ''
 
+    # Cross-view dedup for 3-SIDES edges: same gusset + same other part
+    # + same geo length in a different view → same physical edge.
+    cross_view_seen = {}  # (gusset_label, other_label, geo_mm) → view_id
+
     for view_id, weldmarks in wm_by_view.items():
         view_parts = part_lines_map.get(view_id, {})
         if not view_parts:
@@ -659,8 +675,12 @@ def extract_welds(dxf_path):
 
             # '3 SIDES' / '2 SIDES' / '围' / '全' all indicate a perimeter gusset weld
             # where edges of the attachment plate must be enumerated.
+            # (Note: "2 SIDES" can mean double-sided fillet, not necessarily
+            # 2 physical edges — so we always assume the gusset's welded edges
+            # number is the plate's perimeter count minus free edges.)
             is_three_sides = any(kw in parsed['annotation'].upper()
                                  for kw in ['SIDE', '围', '全'])
+            expected_edges = 3  # target; free-edge logic drops from >3 down
 
             if is_three_sides:
                 # Gusset = the smallest-line NON-COMP Part at the arrow.
@@ -682,6 +702,33 @@ def extract_welds(dxf_path):
 
                 # Collect edges per gusset block (each gusset processed independently)
                 # to support multi-instance assemblies (e.g. haunches on both flanges).
+                # Build pass-through for unlabeled parts: find which labeled
+                # part each unlabeled part is adjacent to (e.g. a small filler
+                # plate sandwiched between the gusset and the main part).
+                unlabeled_passthru = {}
+                _unlabeled = {pn for pn in view_parts
+                              if pn not in part_number_map and pn not in gusset_blk_set}
+                for _up in _unlabeled:
+                    _ulns = view_parts[_up]
+                    _best_lbl = None; _best_d = ADJ_TOL
+                    for _lpn, _llns in view_parts.items():
+                        if _lpn in gusset_blk_set or _lpn not in part_number_map:
+                            continue
+                        for _uln in _ulns:
+                            for _lln in _llns:
+                                _d = min(
+                                    math.hypot(_uln['start'][0]-_lln['start'][0], _uln['start'][1]-_lln['start'][1]),
+                                    math.hypot(_uln['start'][0]-_lln['end'][0], _uln['start'][1]-_lln['end'][1]),
+                                    math.hypot(_uln['end'][0]-_lln['start'][0], _uln['end'][1]-_lln['start'][1]),
+                                    math.hypot(_uln['end'][0]-_lln['end'][0], _uln['end'][1]-_lln['end'][1]),
+                                )
+                                if _d < _best_d:
+                                    _best_d = _d; _best_lbl = part_number_map.get(_lpn, comp)
+                    if _best_lbl:
+                        unlabeled_passthru[_up] = _best_lbl
+                if unlabeled_passthru:
+                    print(f"    [unlabeled→label] {unlabeled_passthru}")
+
                 weld_edges_by_gusset = {}
                 for _gn in gusset_names:
                     _edges = []
@@ -698,16 +745,82 @@ def extract_welds(dxf_path):
                                 d2, _ = dist_pt_to_seg(g_ln['end'],   ln['start'], ln['end'])
                                 if d1 < pd_s: pd_s = d1; p_s = pname
                                 if d2 < pd_e: pd_e = d2; p_e = pname
+                        # Pass-through unlabeled neighbors to their labeled counterparts
+                        if p_s and p_s in unlabeled_passthru:
+                            p_s_lbl = unlabeled_passthru[p_s]
+                            # Find the actual labeled Part block for the passthru
+                            for _lpn, _lbl in part_number_map.items():
+                                if _lbl == p_s_lbl and _lpn.split(' - ')[-1] == view_id:
+                                    p_s = _lpn; break
+                        if p_e and p_e in unlabeled_passthru:
+                            p_e_lbl = unlabeled_passthru[p_e]
+                            for _lpn, _lbl in part_number_map.items():
+                                if _lbl == p_e_lbl and _lpn.split(' - ')[-1] == view_id:
+                                    p_e = _lpn; break
                         if p_s and p_e:
                             if p_s == p_e: _edges.append((g_ln['length'], p_s, g_ln))
-                        elif p_s: _edges.append((g_ln['length'], p_s, g_ln))
-                        elif p_e: _edges.append((g_ln['length'], p_e, g_ln))
+                        elif p_s:
+                            # Only include single-endpoint edge if it touches a
+                            # labelled part (free edges touching unlabeled detail
+                            # parts are not weld seams).
+                            if part_number_map.get(p_s, comp) != comp or p_s in unlabeled_passthru:
+                                _edges.append((g_ln['length'], p_s, g_ln))
+                        elif p_e:
+                            if part_number_map.get(p_e, comp) != comp or p_e in unlabeled_passthru:
+                                _edges.append((g_ln['length'], p_e, g_ln))
+                    # Dedup exact duplicates before merging (same start+end)
+                    _dedup = []
+                    _seen_pts = set()
+                    for _e in _edges:
+                        _pts = (round(_e[2]['start'][0],3), round(_e[2]['start'][1],3),
+                                round(_e[2]['end'][0],3),   round(_e[2]['end'][1],3))
+                        if _pts not in _seen_pts:
+                            _seen_pts.add(_pts)
+                            _dedup.append(_e)
+                    _edges = _dedup
+                    # Tag edges by endpoint connection count (before merge
+                    # loses the geometry dict)
+                    _edges_tagged = []
+                    for _e in _edges:
+                        _gln = _e[2]
+                        _conn_s, _conn_e = False, False
+                        for _pn, _pln in view_parts.items():
+                            if _pn in gusset_blk_set:
+                                continue
+                            for _ln in _pln:
+                                _d1, _ = dist_pt_to_seg(_gln['start'], _ln['start'], _ln['end'])
+                                _d1 = min(_d1, math.hypot(_gln['start'][0]-_ln['start'][0], _gln['start'][1]-_ln['start'][1]))
+                                _d1 = min(_d1, math.hypot(_gln['start'][0]-_ln['end'][0],   _gln['start'][1]-_ln['end'][1]))
+                                _d2, _ = dist_pt_to_seg(_gln['end'],   _ln['start'], _ln['end'])
+                                _d2 = min(_d2, math.hypot(_gln['end'][0]-_ln['start'][0], _gln['end'][1]-_ln['start'][1]))
+                                _d2 = min(_d2, math.hypot(_gln['end'][0]-_ln['end'][0],   _gln['end'][1]-_ln['end'][1]))
+                                if _d1 < ADJ_TOL: _conn_s = True
+                                if _d2 < ADJ_TOL: _conn_e = True
+                        _conn = (1 if _conn_s else 0) + (1 if _conn_e else 0)
+                        _edges_tagged.append((_e[0], _e[1], _conn))
                     # Merge fragmented colinear edges (polyline-drawn parts)
-                    if len(_edges) > 1:
-                        _n_before = len(_edges)
-                        _edges = _merge_collinear_edges(_edges, ADJ_TOL)
-                        if len(_edges) < _n_before:
-                            print(f"    [merge] reduce gusset edges from {_n_before} to {len(_edges)}")
+                    _edges_merged = [(e, op, g_ln) for e, op, g_ln in _edges]  # keep orig for merge
+                    if len(_edges_merged) > 1:
+                        _n_before = len(_edges_merged)
+                        _edges_merged = _merge_collinear_edges(_edges_merged, ADJ_TOL)
+                        if len(_edges_merged) < _n_before:
+                            print(f"    [merge] reduce gusset edges from {_n_before} to {len(_edges_merged)}")
+                    # Map merged edges back to tagged info (sum conn for merged edges)
+                    _final = []
+                    for _mlen, _mop in _edges_merged:
+                        _all_conn = sum(_c for _l, _op, _c in _edges_tagged if _op == _mop and abs(_l - _mlen) < 1e-6)
+                        if _all_conn == 0:
+                            _all_conn = max((_c for _l, _op, _c in _edges_tagged if _op == _mop), default=1)
+                        _final.append((_mlen, _mop, _all_conn))
+                    # If > expected_edges, drop only truly free edges (conn=0).
+                    # conn=1 edges (one endpoint touching) may still be
+                    # legitimate weld seams in section views.
+                    if len(_final) > expected_edges:
+                        _final.sort(key=lambda _x: (_x[2], -_x[0]))
+                        while len(_final) > expected_edges and _final[0][2] < 1:
+                            _remove = _final.pop(0)
+                            print(f"    [free-edge] drop {round(_remove[0]*SCALE,1)}mm (conn={_remove[2]})")
+                    _edges = [(_e[0], _e[1]) for _e in _final]
                     weld_edges_by_gusset[_gn] = _edges
 
                 weld_edges_all = [(e, op, gn)
@@ -739,9 +852,17 @@ def extract_welds(dxf_path):
                     typ_mul_3s = max(1, typ_mul_3s // len(gusset_names))
                     if typ_mul_3s > 1:
                         print(f"    [TYP x{typ_mul_3s}]")
-                # hf correction for 3-SIDES (sizes annotated on WM may be plate thickness)
-                sz3_above = _correct_hf_3s(parsed['size_above'], lbl_g)
-                sz3_below = _correct_hf_3s(parsed['size_below'], lbl_g)
+                # hf correction for 3-SIDES: skip when CJP annotation is present
+                # or both sides have the same valid fillet size.
+                _sz3_a = parsed['size_above']
+                _sz3_b = parsed['size_below']
+                if (parsed['groove_above'] or parsed['groove_below']
+                        or (_sz3_a is not None and _sz3_a == _sz3_b and _sz3_a <= MAX_HF)):
+                    sz3_above = _sz3_a
+                    sz3_below = _sz3_b
+                else:
+                    sz3_above = _correct_hf_3s(parsed['size_above'], lbl_g)
+                    sz3_below = _correct_hf_3s(parsed['size_below'], lbl_g)
 
                 # Rank-based BOM mapping for 3-SIDES gussets with known dimensions.
                 # Two strategies depending on edge-length distribution:
@@ -828,7 +949,12 @@ def extract_welds(dxf_path):
                                 _uniq_len = min(_geo_counter, key=_geo_counter.get)
                                 _d0 = abs(_dup_len - _bom_dims[0])
                                 _d1 = abs(_dup_len - _bom_dims[1])
-                                if _d0 <= _d1:
+                                # Skip when distances to both BOM dims are too close
+                                # (ambiguous assignment — e.g. p126 geo=90.5 vs bw=110 bl=116,
+                                #  Δ=19.5 vs 25.5, diff=6.6% → keep geo)
+                                if abs(_d0 - _d1) / max(_dup_len, 1) < 0.08:
+                                    pass  # ambiguous, keep geo
+                                elif _d0 <= _d1:
                                     _bom_edge_map[(_cg, _dup_len)] = round(_bom_dims[0])
                                     # Only map singleton if reasonably close
                                     if abs(_uniq_len - _bom_dims[1]) / max(_uniq_len, 1) < 0.40:
@@ -873,6 +999,18 @@ def extract_welds(dxf_path):
                     seen_bp.add(_bp)
                     lbl_o       = part_number_map.get(other_part, comp)
                     geo_len_mm  = round(edge_len * SCALE, 1)
+                    # Cross-view dedup: same gusset label + same other label + same
+                    # geo length in a DIFFERENT view → same physical edge shown twice.
+                    # Only when BOM qty == 1 (single-instance; multi-instance parts
+                    # in different views are different physical copies).
+                    _lbl_g_dedup = part_number_map.get(cur_gusset, comp)
+                    _bom_qty_g = part_dims.get(_lbl_g_dedup, {}).get('qty', 1)
+                    _cur_vid = cur_gusset.split(' - ')[-1] if ' - ' in cur_gusset else view_id
+                    _lbl_key = (_lbl_g_dedup, lbl_o, geo_len_mm)
+                    if (_bom_qty_g == 1 and _lbl_key in cross_view_seen
+                            and cross_view_seen[_lbl_key] != _cur_vid):
+                        continue
+                    cross_view_seen[_lbl_key] = _cur_vid
                     # Priority 1: rank-based BOM mapping (3 edges → [W, W, L])
                     final_edge_mm = _bom_edge_map.get((cur_gusset, geo_len_mm), None)
                     if final_edge_mm is not None:
@@ -896,15 +1034,18 @@ def extract_welds(dxf_path):
                     else:
                         p1, p2 = (lbl_g, lbl_o) if lbl_g <= lbl_o else (lbl_o, lbl_g)
                     print(f"    edge geo={geo_len_mm}mm final={final_edge_mm}mm  {p1}/{p2}")
-                    if p1 == p2:   # skip self-reference
+                    if p1 == p2 and not (comp.startswith('CO') and p1 == comp):
+                        # self-reference; CO components legitimately have
+                        # CO/CO pairs (stiffener->column body) but non-comp
+                        # self-references (e.g. p144/p144) are still skipped.
                         continue
                     # CJP normalization for 3-SIDES edges (same rule as normal WMs)
                     grove_3s_ab = parsed['groove_above']
                     grove_3s_bl = parsed['groove_below']
                     s3_data = []
                     for side, sz, present, is_g in [
-                        ('Above', sz3_above, parsed['has_above'], grove_3s_ab),
-                        ('Below', sz3_below, parsed['has_below'], grove_3s_bl),
+                        ('Above', sz3_above, parsed['has_above'] or grove_3s_ab, grove_3s_ab),
+                        ('Below', sz3_below, parsed['has_below'] or grove_3s_bl, grove_3s_bl),
                     ]:
                         if present:
                             s3_data.append({'side': side, 'sz': sz, 'is_groove': is_g})
@@ -923,6 +1064,10 @@ def extract_welds(dxf_path):
                                 _hf_fb = f3['sz']
                             elif lbl_g in part_dims:
                                 _hf_fb = hf_from_thickness(part_dims[lbl_g]['thick'])
+                            elif comp_web_t:
+                                _hf_fb = hf_from_thickness(comp_web_t)
+                            else:
+                                _hf_fb = 6  # default minimum fillet
                             edge_rows.append({
                                 'component': comp, 'position': 'Below',
                                 'hf': _hf_fb,
@@ -936,6 +1081,10 @@ def extract_welds(dxf_path):
                                 _hf_fb = s3['sz']
                             elif lbl_g in part_dims:
                                 _hf_fb = hf_from_thickness(part_dims[lbl_g]['thick'])
+                            elif comp_web_t:
+                                _hf_fb = hf_from_thickness(comp_web_t)
+                            else:
+                                _hf_fb = 6
                             edge_rows.append({
                                 'component': comp, 'position': s3['side'],
                                 'hf': _hf_fb, 'length_mm': final_edge_mm,
@@ -960,6 +1109,17 @@ def extract_welds(dxf_path):
                 lbl1, lbl2 = lbl2, lbl1
             elif lbl1 != comp and lbl2 != comp and lbl1 > lbl2:
                 lbl1, lbl2 = lbl2, lbl1
+            # Comp-backoff: when both labels are non-comp and the comp has
+            # no labelled Part block in this view (common in column section
+            # cuts), replace the nearest match with comp.
+            if lbl1 != comp and lbl2 != comp:
+                _has_comp = any(
+                    v == comp
+                    for k, v in part_number_map.items()
+                    if k.split(' - ')[-1] == view_id
+                )
+                if not _has_comp:
+                    lbl1 = comp
 
             lbl_non_comp = lbl2 if lbl1 == comp else lbl1
             bom_fallback_count = 1
@@ -994,7 +1154,10 @@ def extract_welds(dxf_path):
                 _view_n  = sum(1 for k, v in part_number_map.items()
                                if v == lbl_non_comp and k.split(' - ')[-1] == main_view_id)
                 if comp.startswith('CO') and _bom_qty and _bom_qty > _view_n:
-                    _typ_n = min(_bom_qty, _view_n * 2)
+                    if _view_n > 0:
+                        _typ_n = min(_bom_qty, _view_n * 2)
+                    else:
+                        _typ_n = _bom_qty  # part not in main view → trust BOM
                 else:
                     _typ_n = _view_n
                 if _typ_n > 1:
@@ -1033,6 +1196,7 @@ def extract_welds(dxf_path):
             # All BOM widths are rounded to the nearest mm (engineering convention).
             BOM_WIDTH_TOL = 0.25
             BOM_LEN_TOL   = 0.08
+            weld_len_mm_orig = weld_len_mm  # save for CO fallback logging
             print(f"    [BOM pre-check] lbl_nc={lbl_non_comp} stiff={stiffener_override_applied} in_dims={lbl_non_comp in part_dims} wlm={weld_len_mm}")
             if (not stiffener_override_applied
                     and lbl_non_comp != comp
@@ -1074,11 +1238,42 @@ def extract_welds(dxf_path):
                         weld_len_mm = round(bw)
                     else:
                         print(f"    [BOM no-case] {lbl_non_comp} geo={weld_len_mm} bw={bw} bl={bl}")
+            # CO section-view fallback: column-type section cuts show plates
+            # in foreshortened projection (e.g. p124 geo=90.5 → bw=116,
+            # geo=170 → bl=220).  Standard beam tolerances are too strict.
+            if (comp.startswith('CO')
+                    and not stiffener_override_applied
+                    and lbl_non_comp != comp
+                    and lbl_non_comp in part_dims
+                    and weld_len_mm > 0):
+                pd_nc = part_dims[lbl_non_comp]
+                _bw = pd_nc['width']
+                _bl = pd_nc.get('bom_len')
+                if _bw and _bw > 0 and _bl and _bl > 0:
+                    _dw = abs(weld_len_mm - _bw) / weld_len_mm
+                    _dl = abs(weld_len_mm - _bl) / weld_len_mm
+                    if _dw < 0.35 and _dw < _dl:
+                        weld_len_mm = round(_bw)
+                        print(f"    [BOM co-fallback] {lbl_non_comp} geo={weld_len_mm_orig}→bw={weld_len_mm}")
+                    elif _dl < 0.35 and _dl < _dw:
+                        weld_len_mm = round(_bl)
+                        print(f"    [BOM co-fallback] {lbl_non_comp} geo={weld_len_mm_orig}→bl={weld_len_mm}")
 
             final_len_mm = weld_len_mm
 
-            sz_above = _correct_hf(parsed['size_above'], lbl1, lbl2)
-            sz_below = _correct_hf(parsed['size_below'], lbl1, lbl2)
+            # hf correction: skip when CJP/groove is present OR when both
+            # sides have the same valid fillet size (double-sided fillet —
+            # the size is clearly a deliberate weld annotation, not a
+            # plate-thickness proxy accidentally matching the web/flange).
+            _sz_a = parsed['size_above']
+            _sz_b = parsed['size_below']
+            if (parsed['groove_above'] or parsed['groove_below']
+                    or (_sz_a is not None and _sz_a == _sz_b and _sz_a <= MAX_HF)):
+                sz_above = _sz_a
+                sz_below = _sz_b
+            else:
+                sz_above = _correct_hf(parsed['size_above'], lbl1, lbl2)
+                sz_below = _correct_hf(parsed['size_below'], lbl1, lbl2)
 
             print(f"  [{view_id}] {wm_name.split(' - ')[0]}")
             print(f"    arrow={arrow}  geo={weld_len_mm}mm  final={final_len_mm}mm"
@@ -1086,7 +1281,9 @@ def extract_welds(dxf_path):
                   f"  size\u2191{sz_above} \u2193{sz_below}"
                   f"  annot={parsed['annotation']!r}")
 
-            if lbl1 == lbl2:   # skip self-reference
+            if lbl1 == lbl2 and not (comp.startswith('CO') and lbl1 == comp):
+                # self-reference; CO components legitimately have CO/CO
+                # pairs (stiffener->column body).
                 continue
 
             # CJP/groove normalization:
@@ -1097,8 +1294,8 @@ def extract_welds(dxf_path):
             groove_bl = parsed['groove_below']
             sides_data = []
             for side, sz, present, is_groove in [
-                ('Above', sz_above, parsed['has_above'], groove_ab),
-                ('Below', sz_below, parsed['has_below'], groove_bl),
+                ('Above', sz_above, parsed['has_above'] or groove_ab, groove_ab),
+                ('Below', sz_below, parsed['has_below'] or groove_bl, groove_bl),
             ]:
                 if present:
                     sides_data.append({'side': side, 'sz': sz, 'is_groove': is_groove})
@@ -1122,8 +1319,13 @@ def extract_welds(dxf_path):
                     # Paired fillet → 'Below', hf=value (fallback to standard if needed)
                     f = fillet_sides[0]
                     _hf_fb = f['sz'] if f['sz'] is not None else 0
-                    if _hf_fb == 0 and lbl_non_comp in part_dims:
-                        _hf_fb = hf_from_thickness(part_dims[lbl_non_comp]['thick'])
+                    if _hf_fb == 0:
+                        if lbl_non_comp in part_dims:
+                            _hf_fb = hf_from_thickness(part_dims[lbl_non_comp]['thick'])
+                        elif comp_web_t:
+                            _hf_fb = hf_from_thickness(comp_web_t)
+                        else:
+                            _hf_fb = 6
                     for _rep in range(bom_fallback_count):
                         results.append({
                             'component':  comp,
@@ -1143,8 +1345,13 @@ def extract_welds(dxf_path):
                     if not present:
                         continue
                     hf_val = sz if sz is not None else 0
-                    if hf_val == 0 and lbl_non_comp in part_dims:
-                        hf_val = hf_from_thickness(part_dims[lbl_non_comp]['thick'])
+                    if hf_val == 0:
+                        if lbl_non_comp in part_dims:
+                            hf_val = hf_from_thickness(part_dims[lbl_non_comp]['thick'])
+                        elif comp_web_t:
+                            hf_val = hf_from_thickness(comp_web_t)
+                        else:
+                            hf_val = 6
                     for _rep in range(bom_fallback_count):
                         results.append({
                             'component':  comp,
