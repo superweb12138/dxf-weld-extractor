@@ -639,6 +639,44 @@ def extract_welds(dxf_path):
     print(f"  Part label candidates: {[x['label'] for x in all_labels]}")
     print(f"  Part→label map : {part_number_map}")
 
+    # Infer dimensions for non-BOM parts by geometry analysis.
+    # For CO components, many stiffener parts (p183, p197, etc.) are not
+    # listed in the BOM but we need width/length for the CO-fallback and
+    # thickness for hf correction.
+    _inferred = {}
+    for _pn, _lbl in part_number_map.items():
+        if _lbl == comp or _lbl in part_dims:
+            continue
+        # Collect lines for this label across all views
+        _all_lns = []
+        for _vid, _pmap in part_lines_map.items():
+            if _pn in _pmap:
+                _all_lns.extend(_pmap[_pn])
+        if not _all_lns:
+            continue
+        # Bounding-box based dimension estimate
+        _xs = [p[0] for ln in _all_lns for p in (ln['start'], ln['end'])]
+        _ys = [p[1] for ln in _all_lns for p in (ln['start'], ln['end'])]
+        _w = max(_xs) - min(_xs)
+        _h = max(_ys) - min(_ys)
+        _w_mm = round(_w * SCALE, 1)
+        _h_mm = round(_h * SCALE, 1)
+        _bw = min(_w_mm, _h_mm)
+        _bl = max(_w_mm, _h_mm)
+        # Thickness: use comp_web_t if available, else default 12mm
+        _t = comp_web_t if comp_web_t else 12
+        # qty stays 1 — TYP multiplier uses main_view count, not all-view instances
+        _inferred[_lbl] = {'thick': _t, 'width': _bw, 'bom_len': _bl, 'qty': 1}
+    if _inferred:
+        _inf_strs = []
+        for _lbl, _dim in _inferred.items():
+            _inf_strs.append('%s:w=%s L=%s qty=%s' % (_lbl, _dim['width'], _dim['bom_len'], _dim['qty']))
+        print('  [infer-dims] %s' % _inf_strs)
+    # Merge inferred into part_dims (inferred don't overwrite existing BOM data)
+    for _lbl, _dim in _inferred.items():
+        if _lbl not in part_dims:
+            part_dims[_lbl] = _dim
+
     # Extract welds
     results = []
     skipped = []
@@ -726,6 +764,14 @@ def extract_welds(dxf_path):
                                     _best_d = _d; _best_lbl = part_number_map.get(_lpn, comp)
                     if _best_lbl:
                         unlabeled_passthru[_up] = _best_lbl
+                # Prevent passthru from mapping unlabeled parts to the
+                # gusset's own label (creates self-reference that gets
+                # skipped — the edge should go to comp instead).
+                _lbl_g = part_number_map.get(gusset_name, comp)
+                if _lbl_g != comp:
+                    for _up in list(unlabeled_passthru):
+                        if unlabeled_passthru[_up] == _lbl_g:
+                            del unlabeled_passthru[_up]
                 if unlabeled_passthru:
                     print(f"    [unlabeled→label] {unlabeled_passthru}")
 
@@ -1154,10 +1200,7 @@ def extract_welds(dxf_path):
                 _view_n  = sum(1 for k, v in part_number_map.items()
                                if v == lbl_non_comp and k.split(' - ')[-1] == main_view_id)
                 if comp.startswith('CO') and _bom_qty and _bom_qty > _view_n:
-                    if _view_n > 0:
-                        _typ_n = min(_bom_qty, _view_n * 2)
-                    else:
-                        _typ_n = _bom_qty  # part not in main view → trust BOM
+                    _typ_n = _bom_qty  # BOM is more reliable for column stiffeners
                 else:
                     _typ_n = _view_n
                 if _typ_n > 1:
