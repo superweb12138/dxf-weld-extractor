@@ -65,10 +65,10 @@ def _merge_collinear_edges(edges_with_lines, adj_tol):
 
     edges_with_lines: list of (length, other_part, gusset_line_dict)
     adj_tol: max endpoint distance to consider two lines touching
-    Returns: list of (merged_length, other_part)
+    Returns: list of (merged_length, other_part, source_fragments)
     """
     if len(edges_with_lines) <= 1:
-        return [(e, op) for e, op, _ in edges_with_lines]
+        return [(e, op, [g_ln]) for e, op, g_ln in edges_with_lines]
 
     groups = defaultdict(list)
     for ln_len, op, g_ln in edges_with_lines:
@@ -77,7 +77,7 @@ def _merge_collinear_edges(edges_with_lines, adj_tol):
     merged = []
     for op, items in groups.items():
         if len(items) == 1:
-            merged.append((items[0][0], op))
+            merged.append((items[0][0], op, [items[0][1]]))
             continue
 
         n = len(items)
@@ -117,7 +117,8 @@ def _merge_collinear_edges(edges_with_lines, adj_tol):
 
         for comp_items in comps.values():
             total_len = sum(it[0] for it in comp_items)
-            merged.append((total_len, op))
+            source_fragments = [it[1] for it in comp_items]
+            merged.append((total_len, op, source_fragments))
 
     return merged
 
@@ -547,6 +548,11 @@ def parse_bom(doc, comp):
 
             if pm:
                 t, w = float(pm.group(1)), float(pm.group(2))
+                # Filter: if the found "length" is unreasonably large compared
+                # to the plate width (e.g. weight column misread as length),
+                # discard it.  Typical plate aspect ratio L/W <= 4.
+                if bom_len and w > 0 and bom_len > w * 4:
+                    bom_len = None
                 part_dims[mark] = {'thick': t, 'width': w, 'bom_len': bom_len, 'qty': qty}
             elif hm and mark == comp:
                 d, b, tw, tf = (float(hm.group(i)) for i in (1, 2, 3, 4))
@@ -791,18 +797,50 @@ def extract_welds(dxf_path):
                                 d2, _ = dist_pt_to_seg(g_ln['end'],   ln['start'], ln['end'])
                                 if d1 < pd_s: pd_s = d1; p_s = pname
                                 if d2 < pd_e: pd_e = d2; p_e = pname
-                        # Pass-through unlabeled neighbors to their labeled counterparts
-                        if p_s and p_s in unlabeled_passthru:
-                            p_s_lbl = unlabeled_passthru[p_s]
-                            # Find the actual labeled Part block for the passthru
-                            for _lpn, _lbl in part_number_map.items():
-                                if _lbl == p_s_lbl and _lpn.split(' - ')[-1] == view_id:
-                                    p_s = _lpn; break
-                        if p_e and p_e in unlabeled_passthru:
-                            p_e_lbl = unlabeled_passthru[p_e]
-                            for _lpn, _lbl in part_number_map.items():
-                                if _lbl == p_e_lbl and _lpn.split(' - ')[-1] == view_id:
-                                    p_e = _lpn; break
+                        # For unlabeled neighbours, scan the gusset edge directly
+                        # against all labelled non-comp parts to find the real
+                        # neighbour.
+                        _lbl_gn = part_number_map.get(_gn, comp)
+                        if p_s and p_s not in part_number_map:
+                            _best_r = None; _best_rd = ADJ_TOL * 5
+                            for _pn2, _pln2 in view_parts.items():
+                                if _pn2 in gusset_blk_set:
+                                    continue
+                                _lbl2 = part_number_map.get(_pn2, comp)
+                                if _lbl2 == comp or _lbl2 == _lbl_gn:
+                                    continue
+                                for _ln2 in _pln2:
+                                    _d = min(
+                                        math.hypot(g_ln['start'][0]-_ln2['start'][0], g_ln['start'][1]-_ln2['start'][1]),
+                                        math.hypot(g_ln['start'][0]-_ln2['end'][0],   g_ln['start'][1]-_ln2['end'][1]),
+                                        math.hypot(g_ln['end'][0]  -_ln2['start'][0], g_ln['end'][1]  -_ln2['start'][1]),
+                                        math.hypot(g_ln['end'][0]  -_ln2['end'][0],   g_ln['end'][1]  -_ln2['end'][1]))
+                                    if _d < _best_rd:
+                                        _best_rd = _d
+                                        for _lpn2, _lbl2b in part_number_map.items():
+                                            if _lbl2b == _lbl2 and _lpn2.split(' - ')[-1] == view_id:
+                                                _best_r = _lpn2; break
+                            if _best_r: p_s = _best_r
+                        if p_e and p_e not in part_number_map:
+                            _best_r = None; _best_rd = ADJ_TOL * 5
+                            for _pn2, _pln2 in view_parts.items():
+                                if _pn2 in gusset_blk_set:
+                                    continue
+                                _lbl2 = part_number_map.get(_pn2, comp)
+                                if _lbl2 == comp or _lbl2 == _lbl_gn:
+                                    continue
+                                for _ln2 in _pln2:
+                                    _d = min(
+                                        math.hypot(g_ln['start'][0]-_ln2['start'][0], g_ln['start'][1]-_ln2['start'][1]),
+                                        math.hypot(g_ln['start'][0]-_ln2['end'][0],   g_ln['start'][1]-_ln2['end'][1]),
+                                        math.hypot(g_ln['end'][0]  -_ln2['start'][0], g_ln['end'][1]  -_ln2['start'][1]),
+                                        math.hypot(g_ln['end'][0]  -_ln2['end'][0],   g_ln['end'][1]  -_ln2['end'][1]))
+                                    if _d < _best_rd:
+                                        _best_rd = _d
+                                        for _lpn2, _lbl2b in part_number_map.items():
+                                            if _lbl2b == _lbl2 and _lpn2.split(' - ')[-1] == view_id:
+                                                _best_r = _lpn2; break
+                            if _best_r: p_e = _best_r
                         if p_s and p_e:
                             if p_s == p_e: _edges.append((g_ln['length'], p_s, g_ln))
                         elif p_s:
@@ -851,13 +889,15 @@ def extract_welds(dxf_path):
                         _edges_merged = _merge_collinear_edges(_edges_merged, ADJ_TOL)
                         if len(_edges_merged) < _n_before:
                             print(f"    [merge] reduce gusset edges from {_n_before} to {len(_edges_merged)}")
+                    else:
+                        _edges_merged = [(e, op, [g_ln]) for e, op, g_ln in _edges_merged]
                     # Map merged edges back to tagged info (sum conn for merged edges)
                     _final = []
-                    for _mlen, _mop in _edges_merged:
+                    for _mlen, _mop, _frags in _edges_merged:
                         _all_conn = sum(_c for _l, _op, _c in _edges_tagged if _op == _mop and abs(_l - _mlen) < 1e-6)
                         if _all_conn == 0:
                             _all_conn = max((_c for _l, _op, _c in _edges_tagged if _op == _mop), default=1)
-                        _final.append((_mlen, _mop, _all_conn))
+                        _final.append((_mlen, _mop, _all_conn, _frags))
                     # If > expected_edges, drop only truly free edges (conn=0).
                     # conn=1 edges (one endpoint touching) may still be
                     # legitimate weld seams in section views.
@@ -866,12 +906,12 @@ def extract_welds(dxf_path):
                         while len(_final) > expected_edges and _final[0][2] < 1:
                             _remove = _final.pop(0)
                             print(f"    [free-edge] drop {round(_remove[0]*SCALE,1)}mm (conn={_remove[2]})")
-                    _edges = [(_e[0], _e[1]) for _e in _final]
+                    _edges = [(_e[0], _e[1], _e[3]) for _e in _final]
                     weld_edges_by_gusset[_gn] = _edges
 
-                weld_edges_all = [(e, op, gn)
+                weld_edges_all = [(e, op, gn, frags)
                                   for gn, edges in weld_edges_by_gusset.items()
-                                  for e, op in edges]
+                                  for e, op, frags in edges]
                 if not weld_edges_all:
                     skipped.append((wm_name, "3 SIDES: no adjacent edges found"))
                     continue
@@ -883,7 +923,7 @@ def extract_welds(dxf_path):
                 typ_mul_3s = 1
                 if parsed['is_typ']:
                     _cand = {part_number_map.get(op, comp)
-                             for _, op, _ in weld_edges_all
+                             for _, op, _, _ in weld_edges_all
                              if part_number_map.get(op, comp) != comp}
                     _cand.add(lbl_g)
                     _cand.discard(comp)
@@ -927,6 +967,17 @@ def extract_welds(dxf_path):
                     _pd3 = part_dims[lbl_g]
                     _bw3 = _pd3.get('width')
                     _bl3 = _pd3.get('bom_len')
+                    # If BOM has width but no length, estimate from the
+                    # gusset's median geo edge (e.g. BE022 p200 268mm).
+                    if _bw3 and not _bl3:
+                        _geo_vals = sorted(set(
+                            round(_el * SCALE, 1)
+                            for _el, _op, _cg, _ in weld_edges_all
+                            if part_number_map.get(_cg, comp) == lbl_g
+                        ))
+                        if len(_geo_vals) >= 2:
+                            _bl3 = _geo_vals[len(_geo_vals)//2]  # median
+                            print(f"    [BOM infer] {lbl_g} L={_bl3} (from geo median {_geo_vals})")
                     
                     # Strategy C: Flange plate override (for p200-like plates)
                     # Check if this is a flange plate (width ≈ comp flange width)
@@ -941,7 +992,7 @@ def extract_welds(dxf_path):
                     if _bw3 and _is_flange_plate:
                         # Collect all unique geo lengths from this gusset
                         _gusset_geo_lens = []
-                        for _el, _op, _cg in weld_edges_all:
+                        for _el, _op, _cg, _ in weld_edges_all:
                             _geo_mm = round(_el * SCALE, 1)
                             if _geo_mm not in _gusset_geo_lens:
                                 _gusset_geo_lens.append(_geo_mm)
@@ -958,7 +1009,7 @@ def extract_welds(dxf_path):
                             _comp_depth = comp_dims.get('depth', _bl3 if _bl3 else 270)
                             
                             # Map all geo edges for all gusset instances
-                            for _cg in set(_cg for _, _, _cg in weld_edges_all):
+                            for _cg in set(_cg for _, _, _cg, _ in weld_edges_all):
                                 for _g in _gusset_geo_lens:
                                     if _g == _sorted_geo[-1]:
                                         # Largest edge → comp depth
@@ -974,7 +1025,7 @@ def extract_welds(dxf_path):
                         # Collect dedup edge lengths per gusset WITH multiplicity
                         _gusset_geo_counts = defaultdict(Counter)
                         _seenv = set()
-                        for _el, _op, _cg in weld_edges_all:
+                        for _el, _op, _cg, _ in weld_edges_all:
                             _bp = (_cg, _op, round(_el, 2))
                             if _bp not in _seenv:
                                 _seenv.add(_bp)
@@ -1028,7 +1079,11 @@ def extract_welds(dxf_path):
                                     if _i == _best_bl_idx:
                                         _bom_edge_map[(_cg, _geo)] = round(_bl_larger)
                                     else:
-                                        _bom_edge_map[(_cg, _geo)] = round(_bw_smaller)
+                                        # Only map to bw if the edge is within 80%
+                                        # range (avoids e.g. p42 33→73 but allows
+                                        # p200 438.9→140 in section-view projection)
+                                        if abs(_geo - _bw_smaller) / max(_geo, 1) < 0.80:
+                                            _bom_edge_map[(_cg, _geo)] = round(_bw_smaller)
                         if _bom_edge_map:
                             print(f"    [BOM map] {lbl_g}  w={_bw3} L={_bl3}")
 
@@ -1038,18 +1093,47 @@ def extract_welds(dxf_path):
                 # (e.g. two haunch blocks at different positions) to each contribute edges.
                 edge_rows = []   # accumulate edge rows; extended by typ_mul_3s at end
                 seen_bp = set()
-                for edge_len, other_part, cur_gusset in weld_edges_all:
+                for edge_len, other_part, cur_gusset, edge_frags in weld_edges_all:
                     _bp = (cur_gusset, other_part, round(edge_len, 2))
                     if _bp in seen_bp:
                         continue
                     seen_bp.add(_bp)
                     lbl_o       = part_number_map.get(other_part, comp)
                     geo_len_mm  = round(edge_len * SCALE, 1)
+                    # Per-edge label override: when other_part is unlabeled (maps to comp),
+                    # scan source fragments for a closer non-comp neighbour.
+                    _lbl_g_dedup = part_number_map.get(cur_gusset, comp)
+                    if lbl_o == comp:
+                        _comp_d = 1e9
+                        _best_nc = None
+                        _best_nc_d = 1e9
+                        for g_ln in edge_frags:
+                            for ep in (g_ln['start'], g_ln['end']):
+                                for pn, plns in view_parts.items():
+                                    if pn in gusset_blk_set:
+                                        continue
+                                    _pn_lbl = part_number_map.get(pn, comp)
+                                    for ln in plns:
+                                        d = min(
+                                            math.hypot(ep[0]-ln['start'][0], ep[1]-ln['start'][1]),
+                                            math.hypot(ep[0]-ln['end'][0], ep[1]-ln['end'][1]),
+                                        )
+                                        d_int, _ = dist_pt_to_seg(ep, ln['start'], ln['end'])
+                                        d = min(d, d_int)
+                                        if _pn_lbl == comp:
+                                            if d < _comp_d:
+                                                _comp_d = d
+                                        elif _pn_lbl != _lbl_g_dedup:
+                                            if d < _best_nc_d:
+                                                _best_nc_d = d
+                                                _best_nc = _pn_lbl
+                        if _best_nc and (_best_nc_d <= _comp_d or _comp_d > ADJ_TOL):
+                            lbl_o = _best_nc
+                            print(f"    [per-edge ovr] {other_part}→{_best_nc} nc_d={round(_best_nc_d,1)} comp_d={round(_comp_d,1)}")
                     # Cross-view dedup: same gusset label + same other label + same
                     # geo length in a DIFFERENT view → same physical edge shown twice.
                     # Only when BOM qty == 1 (single-instance; multi-instance parts
                     # in different views are different physical copies).
-                    _lbl_g_dedup = part_number_map.get(cur_gusset, comp)
                     _bom_qty_g = part_dims.get(_lbl_g_dedup, {}).get('qty', 1)
                     _cur_vid = cur_gusset.split(' - ')[-1] if ' - ' in cur_gusset else view_id
                     _lbl_key = (_lbl_g_dedup, lbl_o, geo_len_mm)
