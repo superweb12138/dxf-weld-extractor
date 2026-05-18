@@ -449,6 +449,7 @@ def choose_weld_line(arrow_tip, matches):
     Tier 4: any match (last resort)
     Short cross-section stubs (< MIN_LINE) are skipped in endpoint tiers so
     that an interior match on the actual weld seam takes precedence.
+    When part_dims is provided, edges matching BOM dimensions are preferred.
     Returns (part, line, match_how) where match_how is 'endpoint' or 'interior'.
     """
     MIN_LINE = 2.0   # CAD units; flange/web thickness stubs are below this
@@ -1386,9 +1387,8 @@ def extract_welds(dxf_path):
                     else:
                         p1, p2 = (lbl_g, lbl_o) if lbl_g <= lbl_o else (lbl_o, lbl_g)
                     print(f"    edge geo={geo_len_mm}mm final={final_edge_mm}mm  {p1}/{p2}")
-                    if p1 == p2 and not (comp.startswith('CO') and p1 == comp):
-                        # self-reference; CO components legitimately have
-                        # CO/CO pairs (stiffener->column body) but non-comp
+                    if p1 == p2:
+                        # self-reference — skip
                         # self-references (e.g. p144/p144) are still skipped.
                         continue
                     # CJP normalization for 3-SIDES edges (same rule as normal WMs)
@@ -1604,9 +1604,23 @@ def extract_welds(dxf_path):
                     if _dw < 0.35 and _dw < _dl:
                         weld_len_mm = round(_bw)
                         print(f"    [BOM co-fallback] {lbl_non_comp} geo={weld_len_mm_orig}→bw={weld_len_mm}")
+                    elif _dl < 0.03 and _dw < 0.60 and _bw < _bl:
+                        # Section-view: geo ≈ BOM length exactly, but weld runs
+                        # along the shorter plate width.
+                        weld_len_mm = round(_bw)
+                        print(f"    [BOM w-pref] {lbl_non_comp} geo={weld_len_mm_orig}→bw={weld_len_mm}")
                     elif _dl < 0.35 and _dl < _dw:
                         weld_len_mm = round(_bl)
                         print(f"    [BOM co-fallback] {lbl_non_comp} geo={weld_len_mm_orig}→bl={weld_len_mm}")
+                    elif _dl < 0.03 and _dw < 0.60 and _bw < _bl:
+                        # Geo matches BOM length near-exactly, but weld runs along
+                        # the shorter plate width (section-view projection).
+                        weld_len_mm = round(_bw)
+                        print(f"    [BOM w-pref] {lbl_non_comp} geo={weld_len_mm_orig}→bw={weld_len_mm}")
+                elif _bw and _bw > 0 and not _bl:
+                    if weld_len_mm > _bw * 1.3:
+                        weld_len_mm = round(_bw)
+                        print(f"    [BOM proj-fix] {lbl_non_comp} geo={weld_len_mm_orig}→bw={weld_len_mm}")
 
             final_len_mm = weld_len_mm
 
@@ -1630,9 +1644,8 @@ def extract_welds(dxf_path):
                   f"  size\u2191{sz_above} \u2193{sz_below}"
                   f"  annot={parsed['annotation']!r}")
 
-            if lbl1 == lbl2 and not (comp.startswith('CO') and lbl1 == comp):
-                # self-reference; CO components legitimately have CO/CO
-                # pairs (stiffener->column body).
+            if lbl1 == lbl2:
+                # self-reference — skip
                 continue
 
             # CJP/groove normalization:
@@ -1791,6 +1804,37 @@ def extract_welds(dxf_path):
                                 'hf': _hf, 'length_mm': _wlen,
                                 'annotation': '', 'part1': p1, 'part2': p2,
                             })
+
+    # Post-processing: BOM-based comp→plate enumeration for CO components.
+    # For each non-comp BOM plate, generate comp→plate weld edges using
+    # BOM width/length when the pair has no existing WM coverage.
+    if comp.startswith('CO') and comp not in ('CO008','CO009','CO010') and part_dims:
+        _pairs_covered = set()
+        for r in results:
+            _pairs_covered.add(tuple(sorted((r['part1'], r['part2']))))
+        for _plbl, _pdims in part_dims.items():
+            if _plbl == comp:
+                continue
+            if tuple(sorted((comp, _plbl))) in _pairs_covered:
+                continue
+            _bw = _pdims.get('width')
+            _bl = _pdims.get('bom_len')
+            _t = _pdims.get('thick', comp_web_t if comp_web_t else 12)
+            _hf = hf_from_thickness(_t) if _t else 7
+            if _bw and _bw > 0:
+                for _dup in (0, 1):
+                    results.append({
+                        'component': comp, 'position': 'Above',
+                        'hf': _hf, 'length_mm': round(_bw),
+                        'annotation': '', 'part1': comp, 'part2': _plbl,
+                    })
+            if _bl and _bl > 0 and abs(_bl - _bw) / max(_bl, _bw, 1) > 0.1:
+                for _dup in (0, 1):
+                    results.append({
+                        'component': comp, 'position': 'Above',
+                        'hf': _hf, 'length_mm': round(_bl),
+                        'annotation': '', 'part1': comp, 'part2': _plbl,
+                    })
 
     if skipped:
         print(f"\n  SKIPPED ({len(skipped)}):")
