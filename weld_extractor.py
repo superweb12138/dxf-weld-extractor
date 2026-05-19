@@ -1836,6 +1836,74 @@ def extract_welds(dxf_path):
                         'annotation': '', 'part1': comp, 'part2': _plbl,
                     })
 
+    # Post-processing: geometry-based enumeration for CO010 uncovered plates.
+    # CO010 plates with Part blocks but no WeldMark still have DXF geometry
+    # showing their contact edges with the comp body.
+    if comp == 'CO010' and part_dims and part_lines_map:
+        _ADJ = SNAP_TOL + 0.5
+        _MIN_EDGE_MM = 30.0
+        _pairs_covered = set()
+        _triples_covered = set()
+        for r in results:
+            _pairs_covered.add(tuple(sorted((r['part1'], r['part2']))))
+            _triples_covered.add(tuple(sorted((r['part1'], r['part2']))) + (round(r['length_mm'], 1),))
+
+        for _plbl, _pdims in part_dims.items():
+            if _plbl == comp:
+                continue
+            if tuple(sorted((comp, _plbl))) in _pairs_covered:
+                continue
+            _bw = _pdims.get('width')
+            _bl = _pdims.get('bom_len')
+            # Build acceptable lengths for THIS plate only
+            _plate_lens = set()
+            if _bw: _plate_lens.add(round(_bw))
+            if _bl: _plate_lens.add(round(_bl))
+            # Also accept comp section dimensions
+            if comp_dims:
+                for _k in ('flange_w', 'depth'):
+                    if comp_dims.get(_k): _plate_lens.add(round(comp_dims[_k]))
+            if not _plate_lens:
+                continue
+            _t = _pdims.get('thick', comp_web_t if comp_web_t else 12)
+            _hf = hf_from_thickness(_t) if _t else 7
+            for _vid, _vparts in part_lines_map.items():
+                for _pn, _plns in _vparts.items():
+                    if part_number_map.get(_pn, comp) != _plbl:
+                        continue
+                    _cblocks = {p for p in _vparts if part_number_map.get(p, comp) == comp}
+                    for _ln in _plns:
+                        _wl_mm = round(_ln['length'] * SCALE, 1)
+                        if _wl_mm < _MIN_EDGE_MM:
+                            continue
+                        # Filter: length must be close to THIS plate's BOM/comp dims
+                        if not any(abs(_wl_mm - bl) / max(_wl_mm,1) < 0.25 for bl in _plate_lens):
+                            continue
+                        _cp_s = None; _cps_d = _ADJ
+                        _cp_e = None; _cpe_d = _ADJ
+                        for _opn, _olns in _vparts.items():
+                            if _opn == _pn:
+                                continue
+                            for _oln in _olns:
+                                _d1, _ = dist_pt_to_seg(_ln['start'], _oln['start'], _oln['end'])
+                                _d2, _ = dist_pt_to_seg(_ln['end'],   _oln['start'], _oln['end'])
+                                if _d1 <= _cps_d: _cps_d = _d1; _cp_s = _opn
+                                if _d2 <= _cpe_d: _cpe_d = _d2; _cp_e = _opn
+                        if not _cp_s or not _cp_e or _cp_s != _cp_e:
+                            continue
+                        if _cp_s not in _cblocks:
+                            continue
+                        _tkey = tuple(sorted((comp, _plbl))) + (_wl_mm,)
+                        if _tkey in _triples_covered:
+                            continue
+                        for _dup in (0, 1):
+                            results.append({
+                                'component': comp, 'position': 'Above',
+                                'hf': _hf, 'length_mm': _wl_mm,
+                                'annotation': '', 'part1': comp, 'part2': _plbl,
+                            })
+                        _triples_covered.add(_tkey)
+
     if skipped:
         print(f"\n  SKIPPED ({len(skipped)}):")
         for name, reason in skipped:
