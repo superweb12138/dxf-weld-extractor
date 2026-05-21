@@ -17,7 +17,7 @@ def loose_key(r):
     return (r['comp'],r['pos'],r['hf'],p)
 
 manual = load('焊缝统计.xlsx', 'Weld_number_list(Assembly)')
-script = load('焊缝统计_auto.xlsx', '焊缝统计')
+script = load('焊缝统计_new.xlsx', '焊缝统计')
 
 HAVE_DXF = {'BE018','BE019','BE020','BE021','BE022','BE023','CO007','CO008','CO009'}
 manual = [r for r in manual if r['comp'] in HAVE_DXF]

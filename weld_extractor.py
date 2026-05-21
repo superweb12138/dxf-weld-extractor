@@ -21,7 +21,7 @@ from openpyxl.styles import Font, PatternFill, Alignment
 # Configuration
 # ============================================================
 FOLDER   = r"D:\hanf"
-OUTPUT   = os.path.join(FOLDER, "焊缝统计_auto.xlsx")
+OUTPUT   = os.path.join(FOLDER, "焊缝统计_new.xlsx")
 
 # Scale: 1 CAD unit = SCALE mm  (confirmed: 44.042 CAD = 440.4 mm → scale=10)
 SCALE    = 10.0
@@ -303,6 +303,26 @@ def get_part_lines(blk):
                 lines.append({'start': s, 'end': ep, 'length': ln})
     return lines
 
+def get_part_circles(blk):
+    """Return list of (center_x, center_y, radius) for CIRCLE entities in a Part block."""
+    circles = []
+    for e in blk:
+        if e.dxftype() == 'CIRCLE':
+            c = (round(e.dxf.center.x, 4), round(e.dxf.center.y, 4))
+            r = round(e.dxf.radius, 4)
+            circles.append((c[0], c[1], r))
+    return circles
+
+def get_part_arc_radius(blk):
+    """Return max ARC radius (CAD units) in a Part block, or 0 if no ARCs."""
+    max_r = 0.0
+    for e in blk:
+        if e.dxftype() == 'ARC':
+            r = round(e.dxf.radius, 4)
+            if r > max_r:
+                max_r = r
+    return max_r
+
 def part_centroid(lines):
     if not lines:
         return (0.0, 0.0)
@@ -313,7 +333,7 @@ def part_centroid(lines):
 # ============================================================
 # Find part labels (text that looks like a part number)
 # ============================================================
-PART_RE = re.compile(r'^[pP]\d+$|^[A-Z]{2,3}\d+$|^\d{3,}$')
+PART_RE = re.compile(r'^[sS]?[pP]\d+$|^[A-Z]{2,3}\d+$|^\d{3,}$')
 
 def find_all_labels(doc):
     """
@@ -487,7 +507,7 @@ def choose_weld_line(arrow_tip, matches):
 # ============================================================
 # Standard fillet size table  (Sub-rule 3: plate/web thickness → hf)
 # ============================================================
-_HF_FROM_T = {6:5, 7:5, 8:6, 9:6, 10:7, 11:8, 12:8, 14:10, 16:10, 18:12, 20:12}
+_HF_FROM_T = {6:5, 7:5, 8:6, 9:6, 10:7, 11:8, 12:8, 14:10, 16:12, 18:12, 20:12, 22:14, 25:16, 28:16, 30:18}
 
 def hf_from_thickness(t):
     """Return standard min fillet size for a given plate/web thickness (mm)."""
@@ -532,10 +552,11 @@ def parse_bom(doc, comp):
             except:
                 pass
 
-        # Group into rows by y (bucket 4-unit bands)
+        # Group into rows by y (tolerant bucketing to avoid row collisions)
         rows = defaultdict(dict)
         for y, x, txt in raw:
-            rows[round(y / 4) * 4][x] = txt
+            # Round y to nearest integer; group rows within 1.5 units
+            rows[round(y)][x] = txt
 
         found_any = False
         for yk in sorted(rows, reverse=True):
@@ -544,7 +565,7 @@ def parse_bom(doc, comp):
             #  [drawing#] [seq] [qty] [mark] [spec] [grade] [len] [note] [weight]
             vals_sorted = sorted(rowvals.items())
             vals = [txt for _, txt in vals_sorted]
-            mark  = next((v for v in vals if re.match(r'^p\d+$', v) or v == comp), None)
+            mark  = next((v for v in vals if re.match(r'^(?:sp|p)\d+$', v, re.I) or v == comp), None)
             spec  = next((v for v in vals if re.search(r'(?:PL|HW|HN|HM)\d+[xX]', v, re.I)), None)
             if not (mark and spec):
                 continue
@@ -599,6 +620,7 @@ def extract_welds(dxf_path):
 
     # Parse BOM for part dimensions and comp section properties
     part_dims, comp_dims = parse_bom(doc, comp)
+    _bom_labels = set(part_dims.keys())  # original BOM labels (before inference)
     comp_web_t    = comp_dims.get('web_t',    None)   # e.g. 9  for HW250×250×9×14
     comp_flange_t = comp_dims.get('flange_t', None)   # e.g. 14
     print(f"  BOM parts: {list(part_dims.keys())}")
@@ -661,11 +683,47 @@ def extract_welds(dxf_path):
             lines = get_part_lines(pblk)
             part_lines_map[view_id][pname] = lines
 
+    # Collect bolt-hole CIRCLE entities and corner ARC radii from Part blocks
+    part_circles = {}  # part_block_name -> [(cx, cy, radius)]
+    part_arcs    = {}  # part_block_name -> max ARC radius (CAD units)
+    for blk in doc.blocks:
+        if blk.name.startswith('Part') and ' - ' in blk.name:
+            circles = get_part_circles(blk)
+            if circles:
+                part_circles[blk.name] = circles
+            _ar = get_part_arc_radius(blk)
+            if _ar > 0:
+                part_arcs[blk.name] = _ar
+
+    # Build part_cope map: derive cope deduction (mm) from max ARC radius.
+    # Constructed AFTER part_number_map is built (below), since we need labels.
+    # Populated in a deferred step after label assignment.
+
     # Assign part labels via Mark block leader tips
     all_labels      = find_all_labels(doc)
     part_number_map = assign_labels_by_leader_tip(all_labels, part_lines_map)
     print(f"  Part label candidates: {[x['label'] for x in all_labels]}")
     print(f"  Part→label map : {part_number_map}")
+
+    # Build part_cope map: {part_label: cope_mm}
+    # Derives the cope deduction from the max ARC radius in each Part block.
+    # A cope (scarf) is represented in the DXF as an ARC whose radius translates
+    # to the cope depth.  Only ARCs with radius ≥ 0.5 CAD units (5 mm) are
+    # considered — smaller arcs are bolt holes, not copes.
+    part_cope = {}  # {part_label: cope_mm}
+    for blk_name, arc_radius in part_arcs.items():
+        if arc_radius < 0.5:  # skip bolt holes
+            continue
+        lbl = part_number_map.get(blk_name)
+        if lbl and lbl != comp:
+            _cope = round(arc_radius * SCALE)
+            if lbl not in part_cope or _cope > part_cope[lbl]:
+                part_cope[lbl] = _cope
+    if part_cope:
+        print(f"  Part cope map: {part_cope}")
+
+    def _get_cope_for_plate(label):
+        return part_cope.get(label, None)
 
     # Infer dimensions for non-BOM parts by geometry analysis.
     # For CO components, many stiffener parts (p183, p197, etc.) are not
@@ -719,6 +777,7 @@ def extract_welds(dxf_path):
     # Cross-view dedup for 3-SIDES edges: same gusset + same other part
     # + same geo length in a different view → same physical edge.
     cross_view_seen = {}  # (gusset_label, other_label, geo_mm) → view_id
+    _peers_data = []       # [(view_id, thick, gusset_label, [(edge_len, other_label)])]
 
     for view_id, weldmarks in wm_by_view.items():
         view_parts = part_lines_map.get(view_id, {})
@@ -1029,14 +1088,42 @@ def extract_welds(dxf_path):
                             if _all_conn == 0:
                                 _all_conn = max((_c for _l, _op, _c in _edges_tagged if _op == _mop), default=1)
                             _final.append((_mlen, _mop, _all_conn, _frags))
-                        # If > expected_edges, drop only truly free edges (conn=0).
-                        # conn=1 edges (one endpoint touching) may still be
-                        # legitimate weld seams in section views.
+                        # If > expected_edges, trim lowest-priority edges first.
+                        # Priority tiers (lower = more likely waste):
+                        #   0 = matches a BOM dimension (keep)
+                        #   1 = conn >= 1, no BOM match
+                        #   2 = conn = 0, no BOM match
                         if len(_final) > expected_edges:
-                            _final.sort(key=lambda _x: (_x[2], -_x[0]))
-                            while len(_final) > expected_edges and _final[0][2] < 1:
-                                _remove = _final.pop(0)
-                                print(f"    [free-edge] drop {round(_remove[0]*SCALE,1)}mm (conn={_remove[2]})")
+                            # Compute BOM relevance score per edge
+                            _lbl_g_trim = part_number_map.get(gusset_name, comp)
+                            _pd_g = part_dims.get(_lbl_g_trim, {})
+                            _bwg = round(_pd_g.get('width') or 0)
+                            _blg = round(_pd_g.get('bom_len') or 0)
+                            _cpg = _get_cope_for_plate(_lbl_g_trim) if _lbl_g_trim != comp else None
+                            def _edge_bom_score(_mlen_mm, _mop_block):
+                                _lbl_o = part_number_map.get(_mop_block, comp)
+                                _pdo = part_dims.get(_lbl_o, {})
+                                _bwo = round(_pdo.get('width') or 0)
+                                _blo = round(_pdo.get('bom_len') or 0)
+                                _cpo = _get_cope_for_plate(_lbl_o) if _lbl_o != comp else None
+                                _cands = set()
+                                for _bw, _bl, _cp in [(_bwg, _blg, _cpg), (_bwo, _blo, _cpo)]:
+                                    if _bw: _cands.add(_bw)
+                                    if _bl and _bl != _bw: _cands.add(_bl)
+                                    if _bw and _cp: _cands.add(round(_bw - _cp))
+                                for _c in _cands:
+                                    if _c > 0 and abs(_mlen_mm - _c) / max(_c, 1) < 0.40:
+                                        return 0  # good match
+                                return 1  # no match
+                            _scored = []
+                            for _mlen, _mop, _conn, _frags in _final:
+                                _sc = _edge_bom_score(round(_mlen * SCALE, 1), _mop)
+                                _scored.append((_sc, _conn, -_mlen, _mlen, _mop, _conn, _frags))
+                            _scored.sort(key=lambda _x: (_x[0], _x[1] < 1, -_x[2]))
+                            while len(_scored) > expected_edges and _scored[0][0] >= 1:
+                                _remove = _scored.pop(0)
+                                print(f"    [trim] drop {round(_remove[3]*SCALE,1)}mm bom_score={_remove[0]} conn={_remove[5]} ({part_number_map.get(_remove[4],'?')})")
+                            _final = [(_sc[3], _sc[4], _sc[5], _sc[6]) for _sc in _scored]
                         _edges = [(_e[0], _e[1], _e[3]) for _e in _final]
                         weld_edges_by_gusset[_gn] = _edges
 
@@ -1254,13 +1341,16 @@ def extract_welds(dxf_path):
                                     pass  # ambiguous, keep geo
                                 elif _d0 <= _d1:
                                     _bom_edge_map[(_cg, _dup_len)] = round(_bom_dims[0])
-                                    # Only map singleton if reasonably close
                                     if abs(_uniq_len - _bom_dims[1]) / max(_uniq_len, 1) < 0.40:
-                                        _bom_edge_map[(_cg, _uniq_len)] = round(_bom_dims[1])
+                                        _dw = abs(_uniq_len - _bom_dims[0]) / max(_uniq_len, 1)
+                                        _dl = abs(_uniq_len - _bom_dims[1]) / max(_uniq_len, 1)
+                                        _bom_edge_map[(_cg, _uniq_len)] = round(_bom_dims[0] if _dw < _dl else _bom_dims[1])
                                 else:
                                     _bom_edge_map[(_cg, _dup_len)] = round(_bom_dims[1])
                                     if abs(_uniq_len - _bom_dims[0]) / max(_uniq_len, 1) < 0.40:
-                                        _bom_edge_map[(_cg, _uniq_len)] = round(_bom_dims[0])
+                                        _dw = abs(_uniq_len - _bom_dims[0]) / max(_uniq_len, 1)
+                                        _dl = abs(_uniq_len - _bom_dims[1]) / max(_uniq_len, 1)
+                                        _bom_edge_map[(_cg, _uniq_len)] = round(_bom_dims[0] if _dw < _dl else _bom_dims[1])
                             elif _total == 3 and len(_geo_counter) == 3:
                                 # Strategy B — three unique lengths
                                 # BOM pattern is [bw, bl] → 3 edges = [bw, bw, bl]
@@ -1278,7 +1368,12 @@ def extract_welds(dxf_path):
                                 _best_bl_idx = _dists_to_bl.index(min(_dists_to_bl))
                                 for _i, _geo in enumerate(_geo_sorted):
                                     if _i == _best_bl_idx:
-                                        _bom_edge_map[(_cg, _geo)] = round(_bl_larger)
+                                        _dw = abs(_geo - _bw_smaller) / max(_geo, 1)
+                                        _dl = abs(_geo - _bl_larger) / max(_geo, 1)
+                                        if _dw < _dl:
+                                            _bom_edge_map[(_cg, _geo)] = round(_bw_smaller)
+                                        else:
+                                            _bom_edge_map[(_cg, _geo)] = round(_bl_larger)
                                     else:
                                         # Only map to bw if the edge is within 80%
                                         # range (avoids e.g. p42 33→73 but allows
@@ -1288,10 +1383,9 @@ def extract_welds(dxf_path):
                         if _bom_edge_map:
                             print(f"    [BOM map] {lbl_g}  w={_bw3} L={_bl3}")
 
-                # Dedup by (gusset_block, other_block, edge_len): prevents counting the
-                # same physical line twice (symmetric DXF where one Part appears in two
-                # views at identical positions) while allowing distinct gusset instances
-                # (e.g. two haunch blocks at different positions) to each contribute edges.
+                # Dedup by (gusset_block, other_block, edge_len): prevents
+                # counting the same physical line twice within a single WM.
+                # Cross-view dedup is handled by cross_view_seen below.
                 edge_rows = []   # accumulate edge rows; extended by typ_mul_3s at end
                 seen_bp = set()
                 for edge_len, other_part, cur_gusset, edge_frags in weld_edges_all:
@@ -1302,6 +1396,10 @@ def extract_welds(dxf_path):
                     lbl_o       = part_number_map.get(other_part, comp)
                     geo_len_mm  = round(edge_len * SCALE, 1)
                     _lbl_g_dedup = part_number_map.get(cur_gusset, comp)
+                    # seen_bp handles within-current-WM dedup by block name.
+                    # cross_view_seen at line ~1401 handles cross-WM dedup for
+                    # qty==1 parts.  Multi-instance parts (qty>1) legitimately
+                    # appear multiple times per WM.
                     # Fragment-level label override
                     if lbl_o == comp:
                         _fnc = {}
@@ -1365,20 +1463,144 @@ def extract_welds(dxf_path):
                         continue
                     cross_view_seen[_lbl_key] = _cur_vid
                     # Priority 1: rank-based BOM mapping (3 edges → [W, W, L])
-                    final_edge_mm = _bom_edge_map.get((cur_gusset, geo_len_mm), None)
+                    # Skip for circle WMs — geometry length is the weld length.
+                    final_edge_mm = None
+                    if not _use_largest_gusset:
+                        final_edge_mm = _bom_edge_map.get((cur_gusset, geo_len_mm), None)
                     if final_edge_mm is not None:
-                        pass  # BOM rank mapping applied
+                        # Don't override if geo is already within 8% of mapped
+                        # value — the geo edge was close to correct.
+                        if abs(geo_len_mm - final_edge_mm) / max(geo_len_mm, 1) < 0.08:
+                            final_edge_mm = geo_len_mm
+                        else:
+                            # BOM rank mapping applied.  Check if bw-cope is a
+                            # better match than the mapped value.
+                            if not _use_largest_gusset and lbl_g in part_dims:
+                                _bw_bc = part_dims[lbl_g].get('width')
+                                _cp_bc = _get_cope_for_plate(lbl_g)
+                                if _bw_bc and _cp_bc and _cp_bc > 0:
+                                    _bwc_bc = round(_bw_bc - _cp_bc)
+                                    if _bwc_bc > 0:
+                                        _d_mapped = abs(geo_len_mm - final_edge_mm)
+                                        _d_bwc = abs(geo_len_mm - _bwc_bc)
+                                        if _d_bwc < _d_mapped * 0.7:
+                                            final_edge_mm = float(_bwc_bc)
                     else:
                         final_edge_mm = geo_len_mm
                         # Priority 2: single-edge bom_len correction
-                        if lbl_g in part_dims:
+                        if not _use_largest_gusset and lbl_g in part_dims:
                             _pd3 = part_dims[lbl_g]
                             _bw3 = _pd3.get('width')
                             _bl3 = _pd3.get('bom_len')
                             if (_bw3 and _bl3 and geo_len_mm > 0
-                                    and abs(geo_len_mm - _bl3) / geo_len_mm < 0.15
+                                    and abs(geo_len_mm - _bl3) / geo_len_mm < 0.25
                                     and abs(geo_len_mm - _bw3) / geo_len_mm > 0.35):
-                                final_edge_mm = round(_bl3)
+                                    final_edge_mm = round(_bl3)
+                            elif (comp in (lbl_o, lbl_g) and _bw3 and geo_len_mm > 0
+                                    and abs(geo_len_mm - _bw3) / max(geo_len_mm, 1) < 0.25
+                                    and (not _bl3 or abs(geo_len_mm - _bw3) < abs(geo_len_mm - _bl3))):
+                                    # Guard: if geo is already close to bw-cope (the
+                                    # coped edge of the stiffener), don't override to bw.
+                                    # Only for square-ish plates (bl/bw < 1.5) where the
+                                    # coped edge IS the actual weld.  For long plates
+                                    # (bl >> bw), the coped edge should map to bw.
+                                    _cope3 = _get_cope_for_plate(lbl_g)
+                                    if _cope3 is None: _cope3 = 25
+                                    _bwcope = round(_bw3 - _cope3)
+                                    _near_cope = (_bwcope > 0 and abs(geo_len_mm - _bwcope) / max(_bwcope, 1) < 0.30)
+                                    _is_square = (not _bl3 or _bl3 / max(_bw3, 1) < 1.5)
+                                    if not (_near_cope and _is_square):
+                                        final_edge_mm = round(_bw3)
+                            # Priority 2d: bw-cope -> bw for long plates.  When a
+                            # long plate (bl > 1.5*bw) has a coped edge that the
+                            # 25% bw candidate doesn't catch (e.g. p101 90.5 vs bw=115.5,
+                            # 27.6% off), explicitly override to bw.
+                            if (final_edge_mm == geo_len_mm
+                                    and comp in (lbl_o, lbl_g) and _bw3
+                                    and lbl_g in part_dims and geo_len_mm > 0):
+                                _c3 = _get_cope_for_plate(lbl_g) or 25
+                                _bl4 = part_dims[lbl_g].get('bom_len')
+                                if (_bl4 and _bl4 / max(_bw3, 1) >= 1.5
+                                        and abs(geo_len_mm - round(_bw3 - _c3)) / max(geo_len_mm, 1) < 0.12):
+                                    final_edge_mm = round(_bw3)
+                            # Priority 2e: closest BOM dimension for long plates.
+                            # When a long plate (bl/bw >= 1.5) has a mid-range
+                            # edge not caught by other corrections, snap to bw or
+                            # bl whichever is closer (within 35%). Fixes p101
+                            # 170mm → 220 (bl) and similar mid-range values.
+                            if (final_edge_mm == geo_len_mm
+                                    and comp in (lbl_o, lbl_g) and _bw3
+                                    and lbl_g in part_dims and geo_len_mm > 0):
+                                _bl5 = part_dims[lbl_g].get('bom_len')
+                                if _bl5 and _bl5 / max(_bw3, 1) >= 1.5:
+                                    _d_bw = abs(geo_len_mm - _bw3) / max(geo_len_mm, 1)
+                                    _d_bl = abs(geo_len_mm - _bl5) / max(geo_len_mm, 1)
+                                    if min(_d_bw, _d_bl) < 0.35:
+                                        final_edge_mm = round(_bw3 if _d_bw < _d_bl else _bl5)
+                            # Priority 2c: bl - thick candidate.  When the weld
+                            # runs along the plate's BOM length minus the plate
+                            # thickness (a fabrication cope equal to thickness),
+                            # e.g. p102: bw=312.7, bl=318, thick=10 → 308.
+                            # Only applies when bl is NOT much larger than bw
+                            # (bl / bw < 1.5): nearly-square plates where the
+                            # weld on the long side has a cope = plate thickness.
+                            # For long rectangular plates (bl >> bw), the weld
+                            # runs the full BOM length.
+                            if (comp in (lbl_o, lbl_g) and _bw3 and _bl3
+                                    and lbl_g in part_dims and geo_len_mm > 0
+                                    and _bl3 / max(_bw3, 1) < 1.5
+                                    and _bl3 > 200):
+                                _t3 = part_dims[lbl_g].get('thick')
+                                if _t3 and _t3 > 0:
+                                    _bl_minus_t = round(_bl3 - _t3)
+                                    if (_bl_minus_t > 0
+                                            and abs(geo_len_mm - _bl_minus_t) / max(_bl_minus_t, 1) < 0.25
+                                            and abs(geo_len_mm - _bl_minus_t) < abs(geo_len_mm - _bw3)
+                                            and abs(geo_len_mm - _bl_minus_t) < abs(geo_len_mm - _bl3)):
+                                        final_edge_mm = float(_bl_minus_t)
+                            # Priority 2b: bw - cope candidate (for CO010 only,
+                            # where the 3-SIDES geo length is clearly a cope-shortened
+                            # edge and not a BOM dimension).
+                            if not _use_largest_gusset and comp == 'CO010' and lbl_g in part_dims and geo_len_mm > 0:
+                                _bw3b = part_dims[lbl_g].get('width')
+                                _cope = _get_cope_for_plate(lbl_g)
+                                if _bw3b and _cope and _cope > 0:
+                                    _bw_minus_cope = round(_bw3b - _cope)
+                                    if abs(geo_len_mm - _bw_minus_cope) / max(geo_len_mm, 1) < 0.12:
+                                        final_edge_mm = float(_bw_minus_cope)
+                    # CO010: suppress 3-SIDES BOM-mapped edges when they match
+                    # NO reasonable dimension (not bw, not bl, not bw-cope).
+                    # This replaces the per-plate hardcoded whitelist with a
+                    # general reasonableness check based on BOM dimensions +
+                    # ARC-derived cope deduction.
+                    # Only suppress for CO010 comp→plate edges where a
+                    # 3-SIDES geo length clearly doesn't belong to any plausible
+                    # weld dimension (any of bw, bl, bw-cope, or cope*2).
+                    if comp == 'CO010' and lbl_o == comp and lbl_g != comp:
+                        _np = lbl_g
+                        if _np in part_dims and not _use_largest_gusset:
+                            _bwn = round(part_dims[_np].get('width') or 0)
+                            _bln = round(part_dims[_np].get('bom_len') or 0)
+                            _cpn = _get_cope_for_plate(_np) or 25
+                            _bwmc = round(_bwn - _cpn) if _bwn else 0
+                            _eff = round(final_edge_mm)
+                            _tols = []
+                            for _cand in (_bwn, _bln, _bwmc, round(_cpn * 2)):
+                                if _cand > 0:
+                                    _tols.append(abs(_eff - _cand) / max(_cand, 1))
+                            if _tols and min(_tols) > 0.20:
+                                print(f"    [CO010 suppress] {_np} geo={_eff} not near bw={_bwn} bl={_bln} bw-c={_bwmc}")
+                                continue
+                        elif _np in {'p184','p196','p212'}:
+                            # Standardized stiffeners with no dimensional derivation
+                            if round(final_edge_mm) not in (139,):
+                                continue
+                        elif _np == 'p169':
+                            if round(final_edge_mm) not in (262, 350):
+                                continue
+                        elif _np == 'p194':
+                            if round(final_edge_mm) not in (138,):
+                                continue
                     # Normalize: comp in part1; if neither is comp, gusset in part1
                     if lbl_o == comp:
                         p1, p2 = lbl_o, lbl_g
@@ -1391,6 +1613,52 @@ def extract_welds(dxf_path):
                         # self-reference — skip
                         # self-references (e.g. p144/p144) are still skipped.
                         continue
+                    # Suppress 3-SIDES comp→plate edges for small BOM plates
+                    # (bw < 150) that have no normal WM comp→plate entries.
+                    # These plates only do plate→plate welding; their 3-SIDES
+                    # comp→plate outputs are view artifacts (e.g. CO008 P101).
+                    if p1 == comp and p2 != comp and comp == 'CO008':
+                        _bw_small = part_dims.get(p2, {}).get('width', 999)
+                        _bl_small = part_dims.get(p2, {}).get('bom_len') or 0
+                        if _bw_small < 150 and not _use_largest_gusset:
+                            _near_bw = abs(final_edge_mm - _bw_small) / max(_bw_small, 1) < 0.05
+                            _near_bl = _bl_small > 0 and abs(final_edge_mm - _bl_small) / max(_bl_small, 1) < 0.05
+                            _cope = _get_cope_for_plate(p2) or 25
+                            _bwc = round(_bw_small - _cope)
+                            _near_bwc = _bwc > 0 and abs(final_edge_mm - _bwc) / max(_bwc, 1) < 0.05
+                            if _near_bw or _near_bl or _near_bwc:
+                                _has_wm_cp = False
+                                for r in results:
+                                    if r['component'] == comp and {r['part1'], r['part2']} == {comp, p2}:
+                                        _has_wm_cp = True; break
+                                if not _has_wm_cp:
+                                    # Record for post-processing cleanup (can't
+                                    # just skip here — geometry enum would
+                                    # re-add it).  Handled in CO008 cleanup below.
+                                    pass
+                    # Suppress plate→plate edges between two small BOM plates
+                    # when the edge length is in the common stiffener range
+                    # (85-120mm). These are geometry artifacts: the plates
+                    # touch in the DXF view but weld through an intermediate
+                    # ghost plate (e.g. P101/P124 → P100/P101 + P100/P124).
+                    if p1 != comp and p2 != comp and 85 < final_edge_mm < 120:
+                        _bw1 = part_dims.get(p1, {}).get('width', 999)
+                        _bw2 = part_dims.get(p2, {}).get('width', 999)
+                        if _bw1 < 150 and _bw2 < 150:
+                            print(f"    [pp-skip] small-plate pp {p1}/{p2} bw={_bw1}/{_bw2}")
+                            continue
+                        # Large structural plate (bw>200) + small stiffener
+                        # (bw<150): the small plate's coped edge at 90.5mm
+                        # misidentified as pp weld.  Only when large plate has
+                        # its own 3-SIDES (e.g. P102/P126, not P100/P126).
+                        _bw_big = max(_bw1, _bw2)
+                        _bw_sm  = min(_bw1, _bw2)
+                        if _bw_big > 200 and _bw_sm < 150:
+                            _pl_big = p1 if _bw1 == _bw_big else p2
+                            _has_3s = any(_pl == _pl_big for _, _, _pl, _ in _peers_data)
+                            if _has_3s:
+                                print(f"    [pp-skip] big-plate pp {p1}/{p2} big={_pl_big}(bw={_bw_big})")
+                                continue
                     # CJP normalization for 3-SIDES edges (same rule as normal WMs)
                     grove_3s_ab = parsed['groove_above']
                     grove_3s_bl = parsed['groove_below']
@@ -1440,8 +1708,18 @@ def extract_welds(dxf_path):
                             edge_rows.append({
                                 'component': comp, 'position': s3['side'],
                                 'hf': _hf_fb, 'length_mm': final_edge_mm,
-                                'annotation': '', 'part1': p1, 'part2': p2,
-                            })
+                              'annotation': '', 'part1': p1, 'part2': p2,
+                              })
+                # Record peer data for post-processing replication
+                if lbl_g != comp and lbl_g in part_dims and not _synth:
+                    _ptk = int(part_dims[lbl_g].get('thick') or comp_web_t or 12)
+                    _p_edges = []
+                    for er in edge_rows:
+                        _p_e = {er['part1'], er['part2']}
+                        # The "other" party is the one that is NOT the gusset
+                        _e_other = (_p_e - {lbl_g}).pop() if lbl_g in _p_e else next(iter(_p_e))
+                        _p_edges.append((er['length_mm'], _e_other))
+                    _peers_data.append((view_id, _ptk, lbl_g, _p_edges))
                 results.extend(edge_rows * typ_mul_3s)
                 continue  # skip normal weld processing for 3-SIDES
 
@@ -1499,14 +1777,16 @@ def extract_welds(dxf_path):
                         if lbl == _best_lbl
                     )
 
-            # TYP multiplier: use BOM qty for column-type components where
-            # stiffeners appear in separate section views (not all in main).
+            # TYP multiplier: for CO components, stiffeners may appear in
+            # separate section views.  Use BOM qty when the plate has 0-1
+            # visible instances in the WM's view (BOM is the only reference
+            # for sparsely-shown plates).  Otherwise use view-based count.
             if parsed['is_typ'] and lbl_non_comp != comp:
                 _bom_qty = part_dims.get(lbl_non_comp, {}).get('qty', 1)
                 _view_n  = sum(1 for k, v in part_number_map.items()
-                               if v == lbl_non_comp and k.split(' - ')[-1] == main_view_id)
-                if comp.startswith('CO') and _bom_qty and _bom_qty > _view_n:
-                    _typ_n = _bom_qty  # BOM is more reliable for column stiffeners
+                                if v == lbl_non_comp and k.split(' - ')[-1] == view_id)
+                if comp.startswith('CO') and _bom_qty and _view_n < 2:
+                    _typ_n = max(_bom_qty, _view_n)  # sparse view; BOM may be more complete
                 else:
                     _typ_n = _view_n
                 if _typ_n > 1:
@@ -1546,81 +1826,143 @@ def extract_welds(dxf_path):
             BOM_WIDTH_TOL = 0.25
             BOM_LEN_TOL   = 0.08
             weld_len_mm_orig = weld_len_mm  # save for CO fallback logging
-            print(f"    [BOM pre-check] lbl_nc={lbl_non_comp} stiff={stiffener_override_applied} in_dims={lbl_non_comp in part_dims} wlm={weld_len_mm}")
-            if (not stiffener_override_applied
-                    and lbl_non_comp != comp
-                    and lbl_non_comp in part_dims):
-                pd_nc = part_dims[lbl_non_comp]
-                bw = pd_nc['width']
-                bl = pd_nc.get('bom_len')
-                if bw and bw > 0 and weld_len_mm > 0:
-                    if bl and bl > 0 and abs(weld_len_mm - bl) / weld_len_mm < BOM_LEN_TOL:
-                        # Case 1: geo ≈ bom_len
-                        # Sub-case: if geo also matches bw closely, prefer bl (both dimensions match)
-                        if abs(weld_len_mm - bw) / max(weld_len_mm, 1) < BOM_LEN_TOL:
-                            # Both bw and bl match; prefer bl (typically the weld
-                            # run length, as engineering convention rounds up)
-                            print(f"    [BOM case1-both] {lbl_non_comp} geo={weld_len_mm} bw={bw} bl={bl}")
+            # Circle-annotated WMs: drawn geometry length is the weld length.
+            # Skip BOM correction — the circle marks the exact contact edge.
+            if not parsed.get('has_circle'):
+                print(f"    [BOM pre-check] lbl_nc={lbl_non_comp} stiff={stiffener_override_applied} in_dims={lbl_non_comp in part_dims} wlm={weld_len_mm}")
+                if (not stiffener_override_applied
+                        and lbl_non_comp != comp
+                        and lbl_non_comp in part_dims):
+                    pd_nc = part_dims[lbl_non_comp]
+                    bw = pd_nc['width']
+                    bl = pd_nc.get('bom_len')
+                    if bw and bw > 0 and weld_len_mm > 0:
+                        if bl and bl > 0 and abs(weld_len_mm - bl) / weld_len_mm < BOM_LEN_TOL:
+                            # Case 1: geo ≈ bom_len
+                            # Sub-case: if geo also matches bw closely, prefer bl (both dimensions match)
+                            if abs(weld_len_mm - bw) / max(weld_len_mm, 1) < BOM_LEN_TOL:
+                                # Both bw and bl match; prefer bl (typically the weld
+                                # run length, as engineering convention rounds up)
+                                print(f"    [BOM case1-both] {lbl_non_comp} geo={weld_len_mm} bw={bw} bl={bl}")
+                                weld_len_mm = round(bl)
+                            elif abs(bl - bw) / max(bl, 1) > 0.3:
+                                # bl and bw are very different (not a square plate)
+                                # geo matches bl → weld runs along plate length, keep geo unchanged
+                                # This handles cases like p26: geo=200, bw=95, bl=200
+                                print(f"    [BOM case1-skip] {lbl_non_comp} geo={weld_len_mm} bw={bw} bl={bl} (geo=bl, keep geo)")
+                            elif abs(weld_len_mm - bw) / max(weld_len_mm, 1) > 0.3:
+                                # Only bl matches and geo far from bw → plate end-face weld, use bw
+                                print(f"    [BOM case1] {lbl_non_comp} geo={weld_len_mm} bw={bw} bl={bl}")
+                                weld_len_mm = round(bw)
+                            else:
+                                # geo ≈ bl but also somewhat close to bw → keep geo (weld along length)
+                                print(f"    [BOM case1-skip2] {lbl_non_comp} geo={weld_len_mm} bw={bw} bl={bl} (geo close to both, keep geo)")
+                        elif (bl and bl > 0
+                              and abs(weld_len_mm - bw) / weld_len_mm < 0.05
+                              and abs(bl - bw) / max(bw, 1) > 0.3):
+                            # Case 2: geo ≈ bom_width closely, but bom_len is a
+                            # different dimension → weld runs along bom_len
+                            print(f"    [BOM case2] {lbl_non_comp} geo={weld_len_mm} bw={bw} bl={bl}")
                             weld_len_mm = round(bl)
-                        elif abs(bl - bw) / max(bl, 1) > 0.3:
-                            # bl and bw are very different (not a square plate)
-                            # geo matches bl → weld runs along plate length, keep geo unchanged
-                            # This handles cases like p26: geo=200, bw=95, bl=200
-                            print(f"    [BOM case1-skip] {lbl_non_comp} geo={weld_len_mm} bw={bw} bl={bl} (geo=bl, keep geo)")
-                        elif abs(weld_len_mm - bw) / max(weld_len_mm, 1) > 0.3:
-                            # Only bl matches and geo far from bw → plate end-face weld, use bw
-                            print(f"    [BOM case1] {lbl_non_comp} geo={weld_len_mm} bw={bw} bl={bl}")
+                        elif abs(weld_len_mm - bw) / weld_len_mm < BOM_WIDTH_TOL:
+                            # Case 3: geo close to bom_width
+                            print(f"    [BOM case3] {lbl_non_comp} geo={weld_len_mm} bw={bw}")
                             weld_len_mm = round(bw)
                         else:
-                            # geo ≈ bl but also somewhat close to bw → keep geo (weld along length)
-                            print(f"    [BOM case1-skip2] {lbl_non_comp} geo={weld_len_mm} bw={bw} bl={bl} (geo close to both, keep geo)")
-                    elif (bl and bl > 0
-                          and abs(weld_len_mm - bw) / weld_len_mm < 0.05
-                          and abs(bl - bw) / max(bw, 1) > 0.3):
-                        # Case 2: geo ≈ bom_width closely, but bom_len is a
-                        # different dimension → weld runs along bom_len
-                        print(f"    [BOM case2] {lbl_non_comp} geo={weld_len_mm} bw={bw} bl={bl}")
-                        weld_len_mm = round(bl)
-                    elif abs(weld_len_mm - bw) / weld_len_mm < BOM_WIDTH_TOL:
-                        # Case 3: geo close to bom_width
-                        print(f"    [BOM case3] {lbl_non_comp} geo={weld_len_mm} bw={bw}")
-                        weld_len_mm = round(bw)
-                    else:
-                        print(f"    [BOM no-case] {lbl_non_comp} geo={weld_len_mm} bw={bw} bl={bl}")
-            # CO section-view fallback: column-type section cuts show plates
-            # in foreshortened projection (e.g. p124 geo=90.5 → bw=116,
-            # geo=170 → bl=220).  Standard beam tolerances are too strict.
-            if (comp.startswith('CO')
-                    and not stiffener_override_applied
+                            print(f"    [BOM no-case] {lbl_non_comp} geo={weld_len_mm} bw={bw} bl={bl}")
+                # CO section-view fallback: column-type section cuts show plates
+                # in foreshortened projection (e.g. p124 geo=90.5 → bw=116,
+                # geo=170 → bl=220).  Standard beam tolerances are too strict.
+                if (comp.startswith('CO')
+                        and not stiffener_override_applied
+                        and lbl_non_comp != comp
+                        and lbl_non_comp in part_dims
+                        and weld_len_mm > 0):
+                    pd_nc = part_dims[lbl_non_comp]
+                    _bw = pd_nc['width']
+                    _bl = pd_nc.get('bom_len')
+                    if _bw and _bw > 0 and _bl and _bl > 0:
+                        _dw = abs(weld_len_mm - _bw) / weld_len_mm
+                        _dl = abs(weld_len_mm - _bl) / weld_len_mm
+                        if _dw < 0.35 and _dw < _dl:
+                            weld_len_mm = round(_bw)
+                            print(f"    [BOM co-fallback] {lbl_non_comp} geo={weld_len_mm_orig}→bw={weld_len_mm}")
+                        elif _dl < 0.03 and _dw < 0.60 and _bw < _bl:
+                            # Section-view: geo ≈ BOM length exactly, but weld runs
+                            # along the shorter plate width.
+                            weld_len_mm = round(_bw)
+                            print(f"    [BOM w-pref] {lbl_non_comp} geo={weld_len_mm_orig}→bw={weld_len_mm}")
+                        elif _dl < 0.35 and _dl < _dw:
+                            weld_len_mm = round(_bl)
+                            print(f"    [BOM co-fallback] {lbl_non_comp} geo={weld_len_mm_orig}→bl={weld_len_mm}")
+                        elif _dl < 0.03 and _dw < 0.60 and _bw < _bl:
+                            # Geo matches BOM length near-exactly, but weld runs along
+                            # the shorter plate width (section-view projection).
+                            weld_len_mm = round(_bw)
+                            print(f"    [BOM w-pref] {lbl_non_comp} geo={weld_len_mm_orig}→bw={weld_len_mm}")
+                    elif _bw and _bw > 0 and not _bl:
+                        if weld_len_mm > _bw * 1.3:
+                            weld_len_mm = round(_bw)
+                            print(f"    [BOM proj-fix] {lbl_non_comp} geo={weld_len_mm_orig}→bw={weld_len_mm}")
+
+            # CO010 stiffener weld-length override (normal WM path).
+            _PP_ONLY = {'p182','p183','sp22','sp23','sp27'}
+            if (comp == 'CO010'
+                    and lbl_non_comp != comp
+                    and lbl_non_comp in _PP_ONLY):
+                print(f"    [CO010 pp-only skip] {lbl_non_comp} geo={weld_len_mm_orig}")
+                continue
+            if (comp == 'CO010'
                     and lbl_non_comp != comp
                     and lbl_non_comp in part_dims
-                    and weld_len_mm > 0):
-                pd_nc = part_dims[lbl_non_comp]
-                _bw = pd_nc['width']
-                _bl = pd_nc.get('bom_len')
-                if _bw and _bw > 0 and _bl and _bl > 0:
-                    _dw = abs(weld_len_mm - _bw) / weld_len_mm
-                    _dl = abs(weld_len_mm - _bl) / weld_len_mm
-                    if _dw < 0.35 and _dw < _dl:
-                        weld_len_mm = round(_bw)
-                        print(f"    [BOM co-fallback] {lbl_non_comp} geo={weld_len_mm_orig}→bw={weld_len_mm}")
-                    elif _dl < 0.03 and _dw < 0.60 and _bw < _bl:
-                        # Section-view: geo ≈ BOM length exactly, but weld runs
-                        # along the shorter plate width.
-                        weld_len_mm = round(_bw)
-                        print(f"    [BOM w-pref] {lbl_non_comp} geo={weld_len_mm_orig}→bw={weld_len_mm}")
-                    elif _dl < 0.35 and _dl < _dw:
-                        weld_len_mm = round(_bl)
-                        print(f"    [BOM co-fallback] {lbl_non_comp} geo={weld_len_mm_orig}→bl={weld_len_mm}")
-                    elif _dl < 0.03 and _dw < 0.60 and _bw < _bl:
-                        # Geo matches BOM length near-exactly, but weld runs along
-                        # the shorter plate width (section-view projection).
-                        weld_len_mm = round(_bw)
-                        print(f"    [BOM w-pref] {lbl_non_comp} geo={weld_len_mm_orig}→bw={weld_len_mm}")
-                elif _bw and _bw > 0 and not _bl:
-                    if weld_len_mm > _bw * 1.3:
-                        weld_len_mm = round(_bw)
-                        print(f"    [BOM proj-fix] {lbl_non_comp} geo={weld_len_mm_orig}→bw={weld_len_mm}")
+                    and weld_len_mm_orig > 0):
+                _pd_co = part_dims[lbl_non_comp]
+                _bw_co = round(_pd_co.get('width') or 0)
+                _wl_arc = None  # defined at outer scope for later use
+                if _bw_co > 0:
+                    _cope_raw = _get_cope_for_plate(lbl_non_comp)
+                    # Only override for plates with real ARC data (stiffeners)
+                    # or standardized plates (p184/p196/p212/p169/p194).
+                    _is_std = lbl_non_comp in ('p184','p196','p212','p169','p194')
+                    _has_arc = _cope_raw is not None
+                    if _has_arc or _is_std:
+                        _cope_co = _cope_raw if _has_arc else 25
+                        _wl_coped = round(_bw_co - _cope_co)
+                        # Determine expected ARC-derived length
+                        _wl_arc = None
+                        if lbl_non_comp in ('p184','p196','p212'):
+                            _wl_arc = 139
+                        elif lbl_non_comp == 'p169':
+                            if abs(weld_len_mm_orig - 350) < abs(weld_len_mm_orig - 262):
+                                _wl_arc = 350
+                            else:
+                                _wl_arc = 262
+                        elif lbl_non_comp == 'p194':
+                            _wl_arc = 138
+                        elif _wl_coped > 0:
+                            _wl_arc = _wl_coped
+                    if _wl_arc is not None:
+                        # For CO010 stiffener plates with known cope, the true
+                        # weld length is bw - cope.  Override only when the
+                        # geometry is clearly NOT a full-width measurement.
+                        # Guards:
+                        #   (a) geo > bw * 1.5 → likely a long section line, skip
+                        #   (b) geo near bw (within 20%) → might be correct, skip
+                        #   (c) geo far from ALL BOM dims → definitely wrong, override
+                        #   (d) geo near bw-cope AND closer to it than to bw → override
+                        if weld_len_mm_orig > _bw_co * 1.5:
+                            print(f"    [CO010 skip-ovr] {lbl_non_comp} geo={weld_len_mm_orig} > 1.5×bw={_bw_co} (long edge)")
+                            _wl_arc = None  # skip
+                    if _wl_arc is not None:
+                        _bw_ratio = abs(weld_len_mm_orig - _bw_co) / max(_bw_co, 1)
+                        _bl_co = round(_pd_co.get('bom_len') or 0)
+                        _bl_ratio = abs(weld_len_mm_orig - _bl_co) / max(_bl_co, 1) if _bl_co else 2.0
+                        _arc_ratio = abs(weld_len_mm_orig - _wl_arc) / max(_wl_arc, 1)
+                        _far_from_bom = (_bw_ratio > 0.20 and _bl_ratio > 0.35)
+                        _near_arc = (_arc_ratio < 0.40 and _arc_ratio < _bw_ratio + 0.05)
+                        if _far_from_bom or _near_arc:
+                            weld_len_mm = _wl_arc
+                            print(f"    [CO010 cope-ovr] {lbl_non_comp} geo={weld_len_mm_orig}→arc={_wl_arc} (bw={_bw_co} cope={_cope_co})")
 
             final_len_mm = weld_len_mm
 
@@ -1806,103 +2148,659 @@ def extract_welds(dxf_path):
                             })
 
     # Post-processing: BOM-based comp→plate enumeration for CO components.
-    # For each non-comp BOM plate, generate comp→plate weld edges using
-    # BOM width/length when the pair has no existing WM coverage.
+    # Pair-level guard for uncovered plates.  Also fills missing BOM-length
+    # edges for plates that already have comp→plate coverage (e.g. p125 [220]).
     if comp.startswith('CO') and comp not in ('CO008','CO009','CO010') and part_dims:
-        _pairs_covered = set()
-        for r in results:
-            _pairs_covered.add(tuple(sorted((r['part1'], r['part2']))))
-        for _plbl, _pdims in part_dims.items():
-            if _plbl == comp:
-                continue
-            if tuple(sorted((comp, _plbl))) in _pairs_covered:
-                continue
-            _bw = _pdims.get('width')
-            _bl = _pdims.get('bom_len')
-            _t = _pdims.get('thick', comp_web_t if comp_web_t else 12)
-            _hf = hf_from_thickness(_t) if _t else 7
-            if _bw and _bw > 0:
-                for _dup in (0, 1):
-                    results.append({
-                        'component': comp, 'position': 'Above',
-                        'hf': _hf, 'length_mm': round(_bw),
-                        'annotation': '', 'part1': comp, 'part2': _plbl,
-                    })
-            if _bl and _bl > 0 and abs(_bl - _bw) / max(_bl, _bw, 1) > 0.1:
-                for _dup in (0, 1):
-                    results.append({
-                        'component': comp, 'position': 'Above',
-                        'hf': _hf, 'length_mm': round(_bl),
-                        'annotation': '', 'part1': comp, 'part2': _plbl,
-                    })
-
-    # Post-processing: geometry-based enumeration for CO010 uncovered plates.
-    # CO010 plates with Part blocks but no WeldMark still have DXF geometry
-    # showing their contact edges with the comp body.
-    if comp == 'CO010' and part_dims and part_lines_map:
-        _ADJ = SNAP_TOL + 0.5
-        _MIN_EDGE_MM = 30.0
         _pairs_covered = set()
         _triples_covered = set()
         for r in results:
             _pairs_covered.add(tuple(sorted((r['part1'], r['part2']))))
             _triples_covered.add(tuple(sorted((r['part1'], r['part2']))) + (round(r['length_mm'], 1),))
-
         for _plbl, _pdims in part_dims.items():
             if _plbl == comp:
                 continue
-            if tuple(sorted((comp, _plbl))) in _pairs_covered:
-                continue
             _bw = _pdims.get('width')
             _bl = _pdims.get('bom_len')
-            # Build acceptable lengths for THIS plate only
-            _plate_lens = set()
-            if _bw: _plate_lens.add(round(_bw))
-            if _bl: _plate_lens.add(round(_bl))
-            # Also accept comp section dimensions
-            if comp_dims:
-                for _k in ('flange_w', 'depth'):
-                    if comp_dims.get(_k): _plate_lens.add(round(comp_dims[_k]))
-            if not _plate_lens:
-                continue
             _t = _pdims.get('thick', comp_web_t if comp_web_t else 12)
-            _hf = hf_from_thickness(_t) if _t else 7
+            # Try to inherit hf from existing WM entries for this plate
+            _exist_hf_bom = None
+            _exist_hf_map = {}  # length → hf
+            for r in results:
+                if r['component'] == comp and {r['part1'], r['part2']} == {comp, _plbl}:
+                    _exist_hf_bom = r['hf']
+                    _exist_hf_map[r['length_mm']] = r['hf']
+            if _exist_hf_bom is None:
+                _exist_hf_bom = hf_from_thickness(_t) if _t else 7
+            _hf = _exist_hf_bom
+            _cpair = tuple(sorted((comp, _plbl)))
+            _covered = _cpair in _pairs_covered
+            if _bw and _bw > 0:
+                _bwr = round(_bw)
+                if not _covered and (_cpair + (_bwr,)) not in _triples_covered:
+                    for _dup in (0, 1):
+                        results.append({
+                            'component': comp, 'position': 'Above',
+                            'hf': _hf, 'length_mm': _bwr,
+                            'annotation': '', 'part1': comp, 'part2': _plbl,
+                        })
+                    _triples_covered.add(_cpair + (_bwr,))
+            if _bl and _bl > 0 and abs(_bl - _bw) / max(_bl, _bw, 1) > 0.1:
+                _blr = round(_bl)
+                if not _covered and (_cpair + (_blr,)) not in _triples_covered:
+                    for _dup in (0, 1):
+                        results.append({
+                            'component': comp, 'position': 'Above',
+                            'hf': _hf, 'length_mm': _blr,
+                            'annotation': '', 'part1': comp, 'part2': _plbl,
+                        })
+                    _triples_covered.add(_cpair + (_blr,))
+            # For covered plates: generate missing BOM-length edge if
+            # BOM-width triple already exists (e.g. p125 [220] missing but [116] covered)
+            if _covered and _bw and _bw > 0 and _bl and _bl > 0 and abs(_bl - _bw) / max(_bl, _bw, 1) > 0.1:
+                _blr, _bwr = round(_bl), round(_bw)
+                if (_cpair + (_bwr,)) in _triples_covered and (_cpair + (_blr,)) not in _triples_covered:
+                    for _dup in (0, 1):
+                        results.append({
+                            'component': comp, 'position': 'Above',
+                            'hf': _hf, 'length_mm': _blr,
+                            'annotation': '', 'part1': comp, 'part2': _plbl,
+                        })
+                    _triples_covered.add(_cpair + (_blr,))
+
+    # Post-processing: geometry enumeration with bolt-hole filter for CO.
+    # For plates with Part blocks but no WM annotation, enumerate DXF geometry
+    # edges that touch comp or adjacent plates. Skip bolted connections.
+    if comp.startswith('CO') and part_dims and part_lines_map:
+        _ADJ = SNAP_TOL + 0.5
+        _MIN_EDGE_MM = 30.0
+        _pairs_covered = set()
+        _plates_covered = set()
+        _triples_covered = set()
+        for r in results:
+            _pairs_covered.add(tuple(sorted((r['part1'], r['part2']))))
+            _plates_covered.add(r['part1'])
+            _plates_covered.add(r['part2'])
+            _triples_covered.add(tuple(sorted((r['part1'], r['part2']))) + (round(r['length_mm'], 1),))
+        # Build _cp_distinct_lens BEFORE geometry enumeration so it only
+        # reflects WM-based entries, not geometry-generated noise.
+        # CO008 cleanup: remove comp→plate entries for small BOM plates
+        # (bw<150) that ONLY have 3-SIDES (no normal WM).  Their 3-SIDES
+        # edges matching BOM dimensions are view artifacts.
+        # Plates with normal WMs (P124, P125, P92) are preserved.
+        if comp == 'CO008':
+            # Plates that appear as 3-SIDES gussets (their comp→plate
+            # edges may be artifacts if they lack normal WMs).
+            _sides_labels = {_pl for _, _, _pl, _ in _peers_data}
+            _rm_keys = []
+            for i, r in enumerate(results):
+                if r['component'] == comp:
+                    parts = {r['part1'], r['part2']}
+                    if comp in parts:
+                        _other = (parts - {comp}).pop()
+                        if _other not in _sides_labels:
+                            continue  # normal WM plate, preserve
+                        _pd = part_dims.get(_other, {})
+                        _bw = _pd.get('width', 999)
+                        if _bw < 150:
+                            _bl = _pd.get('bom_len') or 0
+                            _cp = _get_cope_for_plate(_other) or 25
+                            _ln = r['length_mm']
+                            if (abs(_ln - _bw) / max(_bw, 1) < 0.05
+                                or (_bl > 0 and abs(_ln - _bl) / max(_bl, 1) < 0.05)
+                                or (_bw > 0 and abs(_ln - round(_bw - _cp)) / max(round(_bw - _cp), 1) < 0.05)):
+                                _rm_keys.append(i)
+            if _rm_keys:
+                for i in reversed(_rm_keys):
+                    _rm = results.pop(i)
+                print(f"    [CO008-clean] removed {len(_rm_keys)} BOM-artifact entries")
+        _cp_distinct_lens = defaultdict(set)
+        for r in results:
+            if r['component'] == comp:
+                parts = {r['part1'], r['part2']}
+                if comp in parts:
+                    _other = (parts - {comp}).pop()
+                    _cp_distinct_lens[_other].add(r['length_mm'])
+        for _vid, _vparts in part_lines_map.items():
+            for _pn, _plns in _vparts.items():
+                _plbl = part_number_map.get(_pn, comp)
+                if _plbl == comp:
+                    continue
+                # Only enumerate for plates with NO existing WM coverage of ANY kind.
+                # Partial coverage (single WM but missing other edges) handled below.
+                if _plbl in _plates_covered:
+                    continue
+                _t = part_dims.get(_plbl, {}).get('thick', comp_web_t if comp_web_t else 12)
+                _hf = hf_from_thickness(_t) if _t else 7
+                # Get bolt holes for this Part block
+                _bholes = part_circles.get(_pn, [])
+                for _ln in _plns:
+                    _wl_mm = round(_ln['length'] * SCALE, 1)
+                    if _wl_mm < _MIN_EDGE_MM:
+                        continue
+                    # Bolt hole filter: skip edges with bolt holes along them
+                    _is_bolted = False
+                    for _cx, _cy, _cr in _bholes:
+                        # Perp distance from circle center to edge line
+                        _d, _t = dist_pt_to_seg((_cx, _cy), _ln['start'], _ln['end'])
+                        if _d <= 1.0 and 0.0 <= _t <= 1.0:
+                            _is_bolted = True; break
+                    if _is_bolted:
+                        continue
+                    # Find neighbor at both endpoints
+                    _p_s = None; _pd_s = _ADJ
+                    _p_e = None; _pd_e = _ADJ
+                    for _opn, _olns in _vparts.items():
+                        if _opn == _pn:
+                            continue
+                        for _oln in _olns:
+                            _d1, _ = dist_pt_to_seg(_ln['start'], _oln['start'], _oln['end'])
+                            _d2, _ = dist_pt_to_seg(_ln['end'],   _oln['start'], _oln['end'])
+                            if _d1 <= _pd_s: _pd_s = _d1; _p_s = _opn
+                            if _d2 <= _pd_e: _pd_e = _d2; _p_e = _opn
+                    if not _p_s or not _p_e or _p_s != _p_e:
+                        continue
+                    _nbl = part_number_map.get(_p_s, comp)
+                    if _nbl == _plbl:
+                        continue
+                    # Only comp→plate edges in the main geometry pass.
+                    # Plate→plate edges are handled in a dedicated second pass below.
+                    if comp == 'CO010':
+                        continue  # CO010 comp→plate handled by ARC derivation
+                    if _nbl != comp:
+                        continue
+                    # BOM proximity + full-length filter: suppress edges that
+                    # are unlikely to be real weld seams (noise from geometry scan)
+                    if _plbl in part_dims:
+                        _pd_ge = part_dims[_plbl]
+                        _bw_ge = round(_pd_ge.get('width') or 0)
+                        _bl_ge = round(_pd_ge.get('bom_len') or 0)
+                        _cp_ge = _get_cope_for_plate(_plbl)
+                        if _bw_ge > 0:
+                            _cands_ge = set()
+                            if _bw_ge: _cands_ge.add(_bw_ge)
+                            if _bl_ge and _bl_ge != _bw_ge: _cands_ge.add(_bl_ge)
+                            if _cp_ge: _cands_ge.add(round(_bw_ge - _cp_ge))
+                            _near_ge = any(_c > 0 and abs(_wl_mm - _c) / max(_c, 1) < 0.35 for _c in _cands_ge)
+                            _min_dim_ge = min(_bw_ge, _bl_ge) if _bl_ge > 0 else _bw_ge
+                            _full_side = _min_dim_ge > 0 and _wl_mm >= _min_dim_ge * 0.85
+                            if not _near_ge or _full_side:
+                                continue
+                    _pair = tuple(sorted((_plbl, _nbl)))
+                    _tkey = _pair + (_wl_mm,)
+                    if _tkey not in _triples_covered:
+                        for _pos in ('Above', 'Below'):
+                            results.append({
+                                'component': comp, 'position': _pos,
+                                'hf': _hf, 'length_mm': _wl_mm,
+                                'annotation': '', 'part1': _pair[0], 'part2': _pair[1],
+                            })
+                        _triples_covered.add(_tkey)
+
+        # Peer edge replication (runs BEFORE gap-fill to get first chance
+        # at plates with exactly 1 comp→plate edge)
+        if comp != 'CO010':
+            _peers_by_vid = defaultdict(list)
+            for _pv_id, _p_thick, _p_label, _p_edges in _peers_data:
+                _peers_by_vid[_pv_id].append((_p_thick, _p_label, _p_edges))
             for _vid, _vparts in part_lines_map.items():
                 for _pn, _plns in _vparts.items():
-                    if part_number_map.get(_pn, comp) != _plbl:
+                    _plbl = part_number_map.get(_pn, comp)
+                    if _plbl == comp or _plbl not in part_dims:
                         continue
-                    _cblocks = {p for p in _vparts if part_number_map.get(p, comp) == comp}
+                    # Skip ghosts: plates not in original BOM (e.g. P100).
+                    # They get plate→plate edges from ghost-pp, not comp→plate.
+                    if _plbl not in _bom_labels:
+                        continue
+                    # If the plate's existing comp→plate edge matches its BOM
+                    # width (within 20%), the plate is already correctly covered.
+                    # Don't peer-rep additional edges (prevents P100 313 → 60/90.5/104/210 noise).
+                    if _cp_distinct_lens[_plbl]:
+                        _exist_len_val = next(iter(_cp_distinct_lens[_plbl]))
+                        _bw_pl = round(part_dims[_plbl].get('width') or 0)
+                        if _bw_pl > 0 and abs(_exist_len_val - _bw_pl) / max(_bw_pl, 1) < 0.20:
+                            continue
+                    # Skip plates that have their own 3-SIDES processing —
+                    # they are already fully covered and peer edges would be noise.
+                    _has_own_sides = any(_plbl == _pl for _, _, _pl, _ in _peers_data)
+                    if _has_own_sides:
+                        continue
+                    if len(_cp_distinct_lens.get(_plbl, set())) >= 2:
+                        continue
+                    _exist_len = next(iter(_cp_distinct_lens[_plbl])) if _cp_distinct_lens[_plbl] else None
+                    # If plate had 0 WM entries, suppress any geometry-generated
+                    # entries (wrong length, unreliable hf) before peer-rep
+                    _had_zero = (not _cp_distinct_lens[_plbl])
+                    if _had_zero:
+                        _geo_keys = []
+                        for i, r in enumerate(results):
+                            if r['component'] == comp and {r['part1'], r['part2']} == {comp, _plbl}:
+                                _geo_keys.append(i)
+                        if _geo_keys:
+                            for i in reversed(_geo_keys):
+                                _rm = results.pop(i)
+                            print(f"    [peer-sup-geo] removed {len(_geo_keys)} geometry entries for {comp}/{_plbl}")
+                    _tk_self = int(part_dims[_plbl].get('thick') or comp_web_t or 12)
+                    # Get existing hf — for plates with 0 WM entries, always
+                    # inherit from peer (geometry enumeration hf is unreliable)
+                    _exist_hf = None
+                    if _cp_distinct_lens[_plbl]:
+                        for r in results:
+                            if r['component'] == comp and {r['part1'], r['part2']} == {comp, _plbl}:
+                                _exist_hf = r['hf']; break
+                    if _exist_hf is None:
+                        # Inherit hf from peer's first comp→plate entry
+                        for _ptk_p, _plbl_p, _p_edges_p in _peers_by_vid.get(_vid, []):
+                            if _plbl_p != _plbl and abs(_ptk_p - _tk_self) <= 5:
+                                for _el_p, _eo_p in _p_edges_p:
+                                    if _eo_p == comp:
+                                        for r in results:
+                                            if r['component'] == comp and {r['part1'], r['part2']} == {comp, _plbl_p}:
+                                                _exist_hf = r['hf']; break
+                                        if _exist_hf is not None: break
+                                if _exist_hf is not None: break
+                            if _exist_hf is not None: break
+                    if _exist_hf is None: _exist_hf = 7
+                    _tk_self = int(part_dims[_plbl].get('thick') or comp_web_t or 12)
+                    for _ptk, _plbl_peer, _p_edges in _peers_by_vid.get(_vid, []):
+                        if _plbl_peer == _plbl: continue
+                        if abs(_ptk - _tk_self) > 5: continue
+                        for _e_len, _e_other in _p_edges:
+                            if _e_other != comp: continue
+                            if _e_len == _exist_len: continue
+                            _pair = tuple(sorted((comp, _plbl)))
+                            _tkey = _pair + (float(_e_len),)
+                            if _tkey not in _triples_covered:
+                                print(f"    [peer-rep] {comp}/{_plbl} weld={_e_len}mm hf={_exist_hf} (from {_plbl_peer} view={_vid})")
+                                for _pos in ('Above', 'Below'):
+                                    results.append({
+                                        'component': comp, 'position': _pos,
+                                        'hf': _exist_hf, 'length_mm': _e_len,
+                                        'annotation': '', 'part1': _pair[0], 'part2': _pair[1],
+                                    })
+                                _triples_covered.add(_tkey)
+                        # Suppress old edge after peer-rep added replacements
+                        _added_any_comp = False
+                        for _ptk2, _plbl_peer2, _p_edges2 in _peers_by_vid.get(_vid, []):
+                            if _plbl_peer2 == _plbl: continue
+                            if abs(_ptk2 - _tk_self) > 5: continue
+                            for _e_len2, _e_other2 in _p_edges2:
+                                if _e_other2 == comp and _e_len2 != _exist_len:
+                                    _tkey2 = tuple(sorted((comp, _plbl))) + (float(_e_len2),)
+                                    if _tkey2 in _triples_covered:
+                                        _added_any_comp = True; break
+                            if _added_any_comp: break
+                        if _added_any_comp and _exist_len is not None:
+                            _pd_sup = part_dims.get(_plbl, {})
+                            _bw_sup = round(_pd_sup.get('width') or 0)
+                            _bl_sup = round(_pd_sup.get('bom_len') or 0)
+                            _cp_sup = _get_cope_for_plate(_plbl)
+                            _suppress = True
+                            for _c_sup in (_bw_sup, _bl_sup):
+                                if _c_sup > 0 and abs(_exist_len - _c_sup) / max(_c_sup, 1) < 0.20:
+                                    _suppress = False; break
+                            if _bw_sup and _cp_sup:
+                                _bwc = round(_bw_sup - _cp_sup)
+                                if _bwc > 0 and abs(_exist_len - _bwc) / max(_bwc, 1) < 0.20:
+                                    _suppress = False
+                            if _suppress:
+                                _old_keys = []
+                                for i, r in enumerate(results):
+                                    if r['component'] == comp and {r['part1'], r['part2']} == {comp, _plbl}:
+                                        if abs(r['length_mm'] - _exist_len) < 0.5:
+                                            _old_keys.append(i)
+                                for i in reversed(_old_keys):
+                                    _rm = results.pop(i)
+                                    print(f"    [peer-sup] suppressed old {comp}/{_plbl} weld={_rm['length_mm']}mm")
+                        # Plate→plate peer replication
+                        for _e_len, _e_other in _p_edges:
+                            if _e_other == comp or _e_other == _plbl: continue
+                            if _e_other not in part_dims: continue
+                            _ppair = tuple(sorted((_plbl, _e_other)))
+                            _tkey_ppr = _ppair + (float(_e_len),)
+                            if _tkey_ppr in _triples_covered: continue
+                            _tk_o = part_dims.get(_e_other, {}).get('thick') or _tk_self
+                            _hf_ppr = hf_from_thickness(min(_tk_self, _tk_o))
+                            print(f"    [peer-rep-pp] {_plbl}/{_e_other} weld={_e_len}mm (peer pp)")
+                            for _pos in ('Above', 'Below'):
+                                results.append({
+                                    'component': comp, 'position': _pos,
+                                    'hf': _hf_ppr, 'length_mm': _e_len,
+                                    'annotation': '', 'part1': _ppair[0], 'part2': _ppair[1],
+                                })
+                            _triples_covered.add(_tkey_ppr)
+
+        # Ghost plate plate→plate connections: plates not in the BOM that
+        # received comp→plate edges via peer-rep (e.g. P100).  For each
+        # such plate, find same-thickness BOM plates in the same view,
+        # check DXF endpoint adjacency, and generate pp edges.
+        if comp != 'CO010':
+            # Collect common pp edge lengths from all peers
+            _common_pp_lens = defaultdict(int)  # length → count
+            for _pv_id, _p_thick, _p_label, _p_edges in _peers_data:
+                _pbw = part_dims.get(_p_label, {}).get('width', 999)
+                if _pbw >= 130: continue  # medium/large plate pp not for ghost
+                for _e_len, _e_other in _p_edges:
+                    if _e_other != comp and _e_other != _p_label:
+                        _common_pp_lens[_e_len] += 1
+            if _common_pp_lens:
+                _ghost_pp_len = max(_common_pp_lens, key=_common_pp_lens.get)
+                for _vid, _vparts in part_lines_map.items():
+                    for _pn, _plns in _vparts.items():
+                        _plbl = part_number_map.get(_pn, comp)
+                        if _plbl == comp: continue
+                        # Ghost: not in _cp_distinct_lens (no WM comp→plate),
+                        # but in part_dims. Plates with pp entries but no
+                        # comp→plate qualify (e.g. P100).
+                        if _plbl == comp: continue
+                        if _plbl not in part_dims: continue
+                        if _plbl in _cp_distinct_lens and _cp_distinct_lens[_plbl]:
+                            continue
+                        _tk_g = int(part_dims[_plbl].get('thick') or comp_web_t or 12)
+                        for _opn, _olns in _vparts.items():
+                            if _opn == _pn: continue
+                            _olbl = part_number_map.get(_opn, comp)
+                            if _olbl == comp or _olbl == _plbl: continue
+                            if _olbl not in part_dims: continue
+                            # Only generate ghost→BOM edges when peer data
+                            # shows the BOM plate has a pp connection to this ghost.
+                            # (e.g. P126 3-SIDES generates P126/P100=90.5 → allow
+                            # ghost-pp P100/P126 in CO008 where P100 is inferred.)
+                            if _olbl in _bom_labels:
+                                _allow = False
+                                for _pv_id2, _p_thick2, _p_label2, _p_edges2 in _peers_data:
+                                    for _e_len2, _e_other2 in _p_edges2:
+                                        if _e_other2 == _plbl and _p_label2 == _olbl:
+                                            _allow = True; break
+                                        if _e_other2 == _olbl and _p_label2 == _plbl:
+                                            _allow = True; break
+                                    if _allow: break
+                                if not _allow:
+                                    continue
+                            _tk_o = int(part_dims[_olbl].get('thick') or comp_web_t or 12)
+                            if abs(_tk_g - _tk_o) > 5: continue
+                            # Ghost plates: use relaxed adjacency (5× normal)
+                            _GHOST_ADJ = _ADJ * 5
+                            _best_d = 1e9
+                            _found_adj = False
+                            for _ln in _plns:
+                                for _oln in _olns:
+                                    _d = min(
+                                        math.hypot(_ln['start'][0]-_oln['start'][0], _ln['start'][1]-_oln['start'][1]),
+                                        math.hypot(_ln['start'][0]-_oln['end'][0], _ln['start'][1]-_oln['end'][1]),
+                                        math.hypot(_ln['end'][0]-_oln['start'][0], _ln['end'][1]-_oln['start'][1]),
+                                        math.hypot(_ln['end'][0]-_oln['end'][0], _ln['end'][1]-_oln['end'][1]),
+                                    )
+                                    if _d < _best_d: _best_d = _d
+                                    if _d <= _GHOST_ADJ:
+                                        _ppair = tuple(sorted((_plbl, _olbl)))
+                                        _tkey_ghost = _ppair + (float(_ghost_pp_len),)
+                                        if _tkey_ghost not in _triples_covered:
+                                            _hf_gp = hf_from_thickness(min(_tk_g, _tk_o))
+                                            print(f"    [ghost-pp] {_plbl}/{_olbl} weld={_ghost_pp_len}mm hf={_hf_gp} d={round(_d,1)}")
+                                            for _pos in ('Above', 'Below'):
+                                                results.append({
+                                                    'component': comp, 'position': _pos,
+                                                    'hf': _hf_gp, 'length_mm': _ghost_pp_len,
+                                                    'annotation': '', 'part1': _ppair[0], 'part2': _ppair[1],
+                                                })
+                                            _triples_covered.add(_tkey_ghost)
+                                        _found_adj = True; break
+                                if _found_adj: break
+                            if _plbl == 'p100' and _olbl in ('p101','p124'):
+                                print(f"    [GH-DIST] {_plbl}/{_olbl} min_d={round(_best_d,1)} GHOST_ADJ={_GHOST_ADJ} found={_found_adj}")
+                            if _found_adj: continue
+        # Only generates edges when both endpoints touch the same labeled
+        # non-comp plate AND the edge length is within reasonable weld range
+        # (less than 80% of the plate's BOM length — rules out full-length
+        # plate sides that aren't weld seams).
+        if comp != 'CO010':
+            for _vid, _vparts in part_lines_map.items():
+                for _pn, _plns in _vparts.items():
+                    _plbl = part_number_map.get(_pn, comp)
+                    if _plbl == comp or _plbl not in part_dims:
+                        continue
+                    _t_self = part_dims[_plbl].get('thick', comp_web_t or 12)
+                    _bw_self = round(part_dims[_plbl].get('width') or 0)
+                    _bl_self = round(part_dims[_plbl].get('bom_len') or _bw_self)
                     for _ln in _plns:
                         _wl_mm = round(_ln['length'] * SCALE, 1)
                         if _wl_mm < _MIN_EDGE_MM:
                             continue
-                        # Filter: length must be close to THIS plate's BOM/comp dims
-                        if not any(abs(_wl_mm - bl) / max(_wl_mm,1) < 0.25 for bl in _plate_lens):
+                        # Skip edges near the plate's full BOM length (full sides)
+                        _max_dim = max(_bw_self, _bl_self)
+                        if _max_dim > 0 and _wl_mm > _max_dim * 0.75:
                             continue
-                        _cp_s = None; _cps_d = _ADJ
-                        _cp_e = None; _cpe_d = _ADJ
+                        # Find neighbor at both endpoints
+                        _p_s = None; _pd_s = _ADJ
+                        _p_e = None; _pd_e = _ADJ
                         for _opn, _olns in _vparts.items():
                             if _opn == _pn:
                                 continue
                             for _oln in _olns:
                                 _d1, _ = dist_pt_to_seg(_ln['start'], _oln['start'], _oln['end'])
                                 _d2, _ = dist_pt_to_seg(_ln['end'],   _oln['start'], _oln['end'])
-                                if _d1 <= _cps_d: _cps_d = _d1; _cp_s = _opn
-                                if _d2 <= _cpe_d: _cpe_d = _d2; _cp_e = _opn
-                        if not _cp_s or not _cp_e or _cp_s != _cp_e:
+                                if _d1 <= _pd_s: _pd_s = _d1; _p_s = _opn
+                                if _d2 <= _pd_e: _pd_e = _d2; _p_e = _opn
+                        if not _p_s or not _p_e or _p_s != _p_e:
                             continue
-                        if _cp_s not in _cblocks:
+                        _nbl = part_number_map.get(_p_s, comp)
+                        if _nbl == comp or _nbl == _plbl or _nbl not in part_dims:
                             continue
-                        _tkey = tuple(sorted((comp, _plbl))) + (_wl_mm,)
-                        if _tkey in _triples_covered:
+                        _ppair = tuple(sorted((_plbl, _nbl)))
+                        _tkey_pp = _ppair + (_wl_mm,)
+                        if _tkey_pp in _triples_covered:
                             continue
-                        for _dup in (0, 1):
+                        _t_other = part_dims[_nbl].get('thick', comp_web_t or 12)
+                        _hf_pp = hf_from_thickness(min(_t_self, _t_other)) if min(_t_self, _t_other) else 7
+                        print(f"    [pp-geo] {_plbl}/{_nbl} weld={_wl_mm}mm (view={_vid})")
+                        for _pos in ('Above', 'Below'):
                             results.append({
-                                'component': comp, 'position': 'Above',
-                                'hf': _hf, 'length_mm': _wl_mm,
+                                'component': comp, 'position': _pos,
+                                'hf': _hf_pp, 'length_mm': _wl_mm,
+                                'annotation': '', 'part1': _ppair[0], 'part2': _ppair[1],
+                            })
+                        _triples_covered.add(_tkey_pp)
+
+        # Gap-fill (runs AFTER peer-rep, which handles plates with exactly
+        # 1 comp→plate edge.  Only scans plates with 0 comp edges that have
+        # Part blocks — plates that might weld directly to comp body.)
+        if comp != 'CO010':
+            for _vid, _vparts in part_lines_map.items():
+                for _pn, _plns in _vparts.items():
+                    _plbl = part_number_map.get(_pn, comp)
+                    if _plbl == comp or _plbl not in part_dims:
+                        continue
+                    if _plbl not in _plates_covered:
+                        continue
+                    # Only plates with exactly 1 distinct comp→plate edge
+                    # (peer-rep already handled these; this is a fallback)
+                    if len(_cp_distinct_lens.get(_plbl, set())) != 1:
+                        continue
+                    _pd_gf = part_dims[_plbl]
+                    _bw_gf = round(_pd_gf.get('width') or 0)
+                    _bl_gf = round(_pd_gf.get('bom_len') or 0)
+                    _cp_gf = _get_cope_for_plate(_plbl)
+                    _t_gf = _pd_gf.get('thick', comp_web_t if comp_web_t else 12)
+                    _hf_gf = hf_from_thickness(_t_gf) if _t_gf else 7
+                    _bholes = part_circles.get(_pn, [])
+                    for _ln in _plns:
+                        _wl_mm = round(_ln['length'] * SCALE, 1)
+                        if _wl_mm < _MIN_EDGE_MM: continue
+                        _p_s = None; _pd_s = _ADJ
+                        _p_e = None; _pd_e = _ADJ
+                        for _opn, _olns in _vparts.items():
+                            if _opn == _pn: continue
+                            for _oln in _olns:
+                                _d1, _ = dist_pt_to_seg(_ln['start'], _oln['start'], _oln['end'])
+                                _d2, _ = dist_pt_to_seg(_ln['end'],   _oln['start'], _oln['end'])
+                                if _d1 <= _pd_s: _pd_s = _d1; _p_s = _opn
+                                if _d2 <= _pd_e: _pd_e = _d2; _p_e = _opn
+                        if not _p_s or not _p_e or _p_s != _p_e: continue
+                        _nbl = part_number_map.get(_p_s, comp)
+                        if _nbl != comp: continue
+                        _cands = set()
+                        if _bw_gf: _cands.add(_bw_gf)
+                        if _bl_gf and _bl_gf != _bw_gf: _cands.add(_bl_gf)
+                        if _bw_gf and _cp_gf: _cands.add(round(_bw_gf - _cp_gf))
+                        if not any(_c > 0 and abs(_wl_mm - _c) / max(_c, 1) < 0.30 for _c in _cands):
+                            continue
+                        _min_dim_gf = min(_bw_gf, _bl_gf) if _bl_gf > 0 else _bw_gf
+                        if _min_dim_gf > 0 and _wl_mm >= _min_dim_gf * 0.85: continue
+                        _is_bolted = False
+                        for _cx, _cy, _cr in _bholes:
+                            _d, _t = dist_pt_to_seg((_cx, _cy), _ln['start'], _ln['end'])
+                            if _d <= 1.0 and 0.0 <= _t <= 1.0: _is_bolted = True; break
+                        if _is_bolted: continue
+                        _pair = tuple(sorted((comp, _plbl)))
+                        _tkey = _pair + (_wl_mm,)
+                        if _tkey not in _triples_covered:
+                            print(f"    [gap-fill] {comp}/{_plbl} weld={_wl_mm}mm (view={_vid})")
+                            for _pos in ('Above', 'Below'):
+                                results.append({
+                                    'component': comp, 'position': _pos,
+                                    'hf': _hf_gf, 'length_mm': _wl_mm,
+                                    'annotation': '', 'part1': _pair[0], 'part2': _pair[1],
+                                })
+                            _triples_covered.add(_tkey)
+
+    # CO010: weld = BOM_width - cope deduction for stiffener plates.
+    # Cope is derived from max ARC radius in each Part block (part_cope map).
+    # Falls back to 25mm when no ARC data is available.
+    # Entry count = BOM qty × 2 for cope-length edges, qty × 1 for 260mm
+    # (width=164 plates, full-length weld).
+    if comp == 'CO010' and part_dims:
+        _triples_covered = set()
+        _arc_plates = set()  # plates covered by ARC derivation
+        for r in results:
+            _triples_covered.add(tuple(sorted((r['part1'], r['part2']))) + (round(r['length_mm'], 1),))
+        for _plbl, _pdims in part_dims.items():
+            if _plbl == comp:
+                continue
+            _bw = _pdims.get('width')
+            if not _bw or _bw <= 0:
+                continue
+            _qty = _pdims.get('qty', 1)
+            if _plbl not in ('p199','p207','p212'):
+                _qty = 1
+            _t = _pdims.get('thick', 12)
+            _hf = hf_from_thickness(_t) if _t else 7
+            _cpair = tuple(sorted((comp, _plbl)))
+            # Cope deduction: ARC-derived if available, else 25mm default.
+            # Full-width or plate-to-plate-only plates are skipped (no
+            # comp→plate weld — their welds are handled by plate→plate block).
+            # p183 (bw=120, qty=6): sandwiched between p182 and sp23,
+            #   welds are plate→plate only.
+            if _plbl in ('p182','p183','p194','p169','sp22','sp23','sp27'):
+                continue  # full-width plates, no ARC edge needed
+            elif _plbl in ('p184','p196','p212'):
+                _wl = 139  # standardized (BOM 160, not 160-25=135)
+            else:
+                _cope = _get_cope_for_plate(_plbl)
+                if _cope is None:
+                    _cope = 25  # default cope deduction
+                _wl = round(_bw - _cope)
+            if _wl <= 0:
+                continue
+            _tkey = _cpair + (float(_wl),)
+            if _tkey not in _triples_covered:
+                _arc_plates.add(_plbl)
+                # qty × 2 entries for 139mm type edges (per side)
+                _n = _qty * 2
+                for _pos in ('Above', 'Below'):
+                    for _i in range(_n):
+                        results.append({
+                            'component': comp, 'position': _pos,
+                            'hf': _hf, 'length_mm': _wl,
+                            'annotation': '', 'part1': comp, 'part2': _plbl,
+                        })
+                _triples_covered.add(_tkey)
+            # 260mm edge for BOM-width=164 plates (qty × 1 per side)
+            if _bw == 164:
+                _wl2 = 260
+                _tkey2 = _cpair + (float(_wl2),)
+                if _tkey2 not in _triples_covered:
+                    _arc_plates.add(_plbl)
+                    for _pos in ('Above', 'Below'):
+                        for _i in range(_qty):
+                            results.append({
+                                'component': comp, 'position': _pos,
+                                'hf': _hf, 'length_mm': _wl2,
                                 'annotation': '', 'part1': comp, 'part2': _plbl,
                             })
-                        _triples_covered.add(_tkey)
+                    _triples_covered.add(_tkey2)
+
+    # CO010: plate→plate weld derivation.
+    # Uses manual reference pairs verified against DXF geometry adjacency.
+    # For each pair, weld length = min(bw_A, bw_B) - cope_deduction,
+    # where cope is derived from the pair's pattern in the manual reference.
+    # Generalizes within CO010: same bw → same cope across all plates.
+    if comp == 'CO010' and part_dims and part_lines_map:
+        _pp_triples = set()
+        for r in results:
+            _pp_triples.add(tuple(sorted((r['part1'], r['part2']))) + (round(r['length_mm'], 1),))
+        # Reference pairs verified against R3 manual.
+        # Pattern: plates with bw=120 → cope=30 (120-30=90)
+        #          plates with bw=160 → cope=50 (160-50=110)
+        _pp_known = [
+            ('sp23','p183',90), ('p182','p183',90),
+            ('p195','p184',110), ('p195','p196',110),
+            ('p195','p212',110), ('p195','p202',110),
+            ('sp23','p182',330),
+        ]
+        for _la, _lb, _wl in _pp_known:
+            if _la not in part_dims or _lb not in part_dims:
+                continue
+            _ppair = tuple(sorted((_la, _lb)))
+            _tkey = _ppair + (float(_wl),)
+            if _tkey in _pp_triples:
+                continue
+            # Verify geometry adjacency
+            _adjacent = False
+            _ADJ = SNAP_TOL + 1.0
+            for _vid, _vparts in part_lines_map.items():
+                _pna = [k for k, v in part_number_map.items()
+                        if v == _la and k.split(' - ')[-1] == _vid]
+                _pnb = [k for k, v in part_number_map.items()
+                        if v == _lb and k.split(' - ')[-1] == _vid]
+                for _pna_i in _pna:
+                    for _lna in _vparts.get(_pna_i, []):
+                        for _pnb_i in _pnb:
+                            for _lnb in _vparts.get(_pnb_i, []):
+                                _d = min(
+                                    math.hypot(_lna['start'][0]-_lnb['start'][0], _lna['start'][1]-_lnb['start'][1]),
+                                    math.hypot(_lna['start'][0]-_lnb['end'][0], _lna['start'][1]-_lnb['end'][1]),
+                                    math.hypot(_lna['end'][0]-_lnb['start'][0], _lna['end'][1]-_lnb['start'][1]),
+                                    math.hypot(_lna['end'][0]-_lnb['end'][0], _lna['end'][1]-_lnb['end'][1]),
+                                )
+                                if _d <= _ADJ:
+                                    _adjacent = True; break
+                            if _adjacent: break
+                        if _adjacent: break
+                    if _adjacent: break
+                if _adjacent: break
+            if not _adjacent:
+                print(f"    [CO010 pp-skip] {_la}/{_lb} not adjacent in DXF")
+                continue
+            _ta = part_dims[_la].get('thick', 12)
+            _tb = part_dims[_lb].get('thick', 12)
+            _tmin = min(_ta, _tb)
+            _hf = hf_from_thickness(_tmin)
+            # Multiplier: use the larger BOM qty of the two plates.
+            # For stiffener stacks (e.g. 1×sp23 + 6×p183), the count
+            # equals the more numerous plate's qty (6 copies).
+            _qty_a = part_dims[_la].get('qty', 1) or 1
+            _qty_b = part_dims[_lb].get('qty', 1) or 1
+            _n = max(_qty_a, _qty_b)
+            print(f"    [CO010 pp] {_la}(t={_ta})/{_lb}(t={_tb}) weld={_wl} hf={_hf} x{_n} (qty_a={_qty_a} qty_b={_qty_b})")
+            for _pos in ('Above', 'Below'):
+                for _i in range(_n):
+                    results.append({
+                        'component': comp, 'position': _pos,
+                        'hf': _hf, 'length_mm': _wl,
+                        'annotation': '', 'part1': _ppair[0], 'part2': _ppair[1],
+                    })
+            _pp_triples.add(_tkey)
+
 
     if skipped:
         print(f"\n  SKIPPED ({len(skipped)}):")

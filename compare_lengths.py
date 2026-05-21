@@ -3,7 +3,7 @@ import openpyxl
 from collections import defaultdict
 
 CORRECT_FILE = '焊缝统计R3_auto(1).xlsx'
-AUTO_FILE    = '焊缝统计_auto.xlsx'
+AUTO_FILE    = '焊缝统计_new.xlsx'
 
 def load_correct(path):
     wb = openpyxl.load_workbook(path, data_only=True)
