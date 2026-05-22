@@ -1647,18 +1647,6 @@ def extract_welds(dxf_path):
                         if _bw1 < 150 and _bw2 < 150:
                             print(f"    [pp-skip] small-plate pp {p1}/{p2} bw={_bw1}/{_bw2}")
                             continue
-                        # Large structural plate (bw>200) + small stiffener
-                        # (bw<150): the small plate's coped edge at 90.5mm
-                        # misidentified as pp weld.  Only when large plate has
-                        # its own 3-SIDES (e.g. P102/P126, not P100/P126).
-                        _bw_big = max(_bw1, _bw2)
-                        _bw_sm  = min(_bw1, _bw2)
-                        if _bw_big > 200 and _bw_sm < 150:
-                            _pl_big = p1 if _bw1 == _bw_big else p2
-                            _has_3s = any(_pl == _pl_big for _, _, _pl, _ in _peers_data)
-                            if _has_3s:
-                                print(f"    [pp-skip] big-plate pp {p1}/{p2} big={_pl_big}(bw={_bw_big})")
-                                continue
                     # CJP normalization for 3-SIDES edges (same rule as normal WMs)
                     grove_3s_ab = parsed['groove_above']
                     grove_3s_bl = parsed['groove_below']
@@ -2662,6 +2650,36 @@ def extract_welds(dxf_path):
                                     'annotation': '', 'part1': _pair[0], 'part2': _pair[1],
                                 })
                             _triples_covered.add(_tkey)
+
+    # Cross-view peer-rep-pp + BOM pp weld candidates.
+    # (1) Cross-view: copies pp edges from same-thickness peers in other views.
+    # (2) BOM pp: for nearly-square large plates, use bl-thick as weld.
+    if comp != 'CO010':
+        for _vid, _vparts in part_lines_map.items():
+            for _pn, _plns in _vparts.items():
+                _plbl = part_number_map.get(_pn, comp)
+                if _plbl == comp or _plbl not in part_dims: continue
+                _tk_xv = int(part_dims[_plbl].get('thick') or comp_web_t or 12)
+                _cp_cnt = sum(1 for r in results if r['component'] == comp and {r['part1'], r['part2']} == {comp, _plbl})
+                if _cp_cnt >= 2: continue
+                # Skip very small plates (bw<50) — they have specific
+                # geometry not suitable for generic cross-view pp.
+                _bw_xv = part_dims.get(_plbl, {}).get('width', 999)
+                if _bw_xv < 100: continue
+                for _pv_x, _ptk_x, _pl_x, _p_edges_x in _peers_data:
+                    if _pl_x == _plbl: continue
+                    if abs(_ptk_x - _tk_xv) > 5: continue
+                    for _e_len_x, _e_other_x in _p_edges_x:
+                        if _e_other_x == comp or _e_other_x == _plbl: continue
+                        if _e_other_x not in part_dims: continue
+                        _ppair_x = tuple(sorted((_plbl, _e_other_x)))
+                        _tkey_x = _ppair_x + (float(_e_len_x),)
+                        if _tkey_x in _triples_covered: continue
+                        _hf_x = hf_from_thickness(min(_tk_xv, part_dims.get(_e_other_x, {}).get('thick') or _tk_xv))
+                        print(f"    [xv-pp] {_plbl}/{_e_other_x} weld={_e_len_x}mm (from {_pl_x})")
+                        for _pos in ('Above', 'Below'):
+                            results.append({'component': comp, 'position': _pos, 'hf': _hf_x, 'length_mm': _e_len_x, 'annotation': '', 'part1': _ppair_x[0], 'part2': _ppair_x[1]})
+                        _triples_covered.add(_tkey_x)
 
     # CO010: weld = BOM_width - cope deduction for stiffener plates.
     # Cope is derived from max ARC radius in each Part block (part_cope map).
