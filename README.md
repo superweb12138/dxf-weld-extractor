@@ -84,13 +84,10 @@ CO006  CO007  CO008  CO009  CO010
 
 ## 快速开始
 
-### 第一步：转换 DWG（如 DXF 已存在可跳过）
+### 统计人员日常使用（只需 2 步）
 
-```bash
-python convert_dwg_to_dxf.py
-```
-
-### 第二步：提取焊缝
+1. 确保 `*.dxf` 文件在项目目录下
+2. 运行：
 
 ```bash
 python weld_extractor.py
@@ -98,13 +95,14 @@ python weld_extractor.py
 
 输出：`焊缝统计_auto.xlsx`
 
-### 第三步：与标准答案对比（可选）
+### 管理员初次配置（一次性）
 
-```bash
-python compare_lengths.py
-```
+| 步骤 | 命令 | 说明 |
+|------|------|------|
+| 1 | `python convert_dwg_to_dxf.py` | 批量将 DWG 图纸转为 DXF |
+| 2 | （可选）将 Tekla 导出的 `*.ifc` 放入 `ifc格式/` 子目录 | 提升板尺寸和邻接判断精度 |
 
-输出每行的状态：`OK` / `LEN-DIFF` / `MISSED` / `SCRIPT-ONLY`，并汇总精确匹配数。
+> **不需要**：IFC 文件缺失不影响脚本运行——程序会自动跳过，仅凭 DXF 即可完成统计。
 
 ---
 
@@ -346,21 +344,24 @@ DXF 文件（AutoCAD 导出的矢量图）
 | 几何箭头匹配 | 焊缝箭头的端点投影到最近的零件线，确定焊接边 |
 | BOM 尺寸修正 | 图纸几何长度 ≠ 实际焊缝长度时，按材料表宽度修正 |
 | 板宽-缺口公式 | `焊缝长 = 板宽 - 倒角半径`，从图纸倒角圆弧半径反推 |
-| IFC 3D 邻接 | Tekla 3D 模型确认两板是否实际接触（用于去假阳性） |
+| IFC 3D 邻接 | Tekla 3D 模型确认两板是否实际接触（可选，缺失时自动跳过） |
 | 跨视图去重 | 同一零件在多个剖面图出现时，去掉多余的投影边 |
 | ARC 补充模式 | 对配置的板按实例数补齐图纸未标注的焊接边 |
 
-**统计人员使用**：只需把 DXF 文件放到目录下，运行 `python weld_extractor.py`，输出 `焊缝统计_auto.xlsx`。
+**统计人员使用**：只需 DXF 文件 + 运行 `python weld_extractor.py`，无需 IFC，无需其他脚本。
 
 ---
 
-## IFC 集成 (ifc_reader.py)
+## IFC 集成 (ifc_reader.py) — 可选增强
 
-IFC 文件（Tekla 导出）提供：
+IFC 文件**不是必需的**。脚本仅凭 DXF 图纸即可完成焊缝统计。IFC 提供以下可选增强：
+
 - **板精确尺寸**：Height=bw, Width=厚度, Length=bl，覆盖 BOM 推断
 - **3D 包围盒邻接**：判断任意两板是否接触（容差 2mm）
 - **板类型**：GUSSET_PL / END_PL / STIFF_PL / FILLER_PL
 - **实例计数**：同一 label 的 3D 实例数
+
+> IFC 文件缺失时程序自动跳过，输出不受影响。要启用：将 Tekla 导出的 `*.ifc` 放入 `ifc格式/` 子目录。
 
 ## COMP_CONFIG 配置驱动
 
