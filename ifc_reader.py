@@ -117,13 +117,14 @@ def read_ifc(filepath):
     Parse an IFC file and return:
       plate_dims:  {label: {'thick': t, 'width': bw, 'bom_len': bl, 'ifc_profile': spec}}
       adjacency:   [(label_a, label_b, contact_length_mm), ...]
+      inst_count:  {label: instance_count}  # 3D instance multiplicity per label
 
     The main column/beam component is identified by its IFC entity type
     (IfcColumn or IfcBeam) and labeled with the component name.
     """
     if not os.path.exists(filepath):
         print(f"  [IFC] file not found: {filepath}")
-        return {}, []
+        return {}, [], {}
 
     comp = os.path.basename(filepath).replace('.ifc', '')
     f = ifcopenshell.open(filepath)
@@ -204,7 +205,10 @@ def read_ifc(filepath):
                     seen_pairs.add(pair)
                     adjacency.append((pair[0], pair[1], wl))
 
-    return plate_data, adjacency
+    instance_counts = {}
+    for ref, _ in plate_instances:
+        instance_counts[ref] = instance_counts.get(ref, 0) + 1
+    return plate_data, adjacency, instance_counts
 
 
 # For quick test
@@ -213,9 +217,9 @@ if __name__ == '__main__':
     folder = r'C:\Users\15297\Desktop\hanf\ifc格式'
     for fpath in sorted(glob.glob(os.path.join(folder, '*.ifc'))):
         comp = os.path.basename(fpath).replace('.ifc', '')
-        dims, adj = read_ifc(fpath)
+        dims, adj, inst = read_ifc(fpath)
         print(f"\n{comp}: {len(dims)} plates, {len(adj)} adjacency pairs")
         for lbl, d in dims.items():
-            print(f"  {lbl:<8} H={d['width']} W={d['thick']} L={d['bom_len']}")
+            print(f"  {lbl:<8} H={d['width']} W={d['thick']} L={d['bom_len']}  x{inst.get(lbl,1)}")
         for a, b, wl in adj:
             print(f"  ADJ: {a}/{b} contact={wl}mm")
