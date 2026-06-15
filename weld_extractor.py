@@ -2349,15 +2349,21 @@ def extract_welds(dxf_path):
                                 _touches = True; break
                         if _touches: break
                     if _touches: break
+                # Fallback: IFC-confirmed adjacency — even if 2D distance is large,
+                # the part is known to touch the comp body in 3D (section-view foreshortening).
+                if not _touches and _ifc_are_adjacent(_cplbl, comp):
+                    _touches = True
                 if not _touches:
                     continue
                 _t = part_dims.get(_cplbl, {}).get('thick', 12)
                 _hf = hf_from_thickness(_t) if _t else 8
+                # Relax endpoint tolerance for IFC-confirmed pairs
+                _eff_adj = _ADJ if not _ifc_are_adjacent(_cplbl, comp) else _ADJ * 3
                 for _cln in _cplns:
                     if _cln['length'] <= _MIN_EDGE_CAD:
                         continue
-                    _cp_s = None; _cps_d = _ADJ
-                    _cp_e = None; _cpe_d = _ADJ
+                    _cp_s = None; _cps_d = _eff_adj
+                    _cp_e = None; _cpe_d = _eff_adj
                     for _opn, _olns in _vparts.items():
                         if _opn == _cpn:
                             continue
