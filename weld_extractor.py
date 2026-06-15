@@ -3298,7 +3298,6 @@ def extract_welds(dxf_path):
             print(f"    [bl-weld] {_la}/{_lb} bl={_wl}mm hf={_hf} x{_qty}")
             for _rep in range(_qty):
                 results.append({'component': comp, 'position': 'Above', 'hf': None, 'length_mm': _wl, 'annotation': 'CJP', 'part1': _p1, 'part2': _p2})
-                results.append({'component': comp, 'position': 'Below', 'hf': _hf, 'length_mm': _wl, 'annotation': '', 'part1': _p1, 'part2': _p2})
             _triples_covered.add(_tkey)
     for _la, _lb, _wl, _hf, _qty in _pp_extras:
         _ppair = tuple(sorted((_la, _lb)))
