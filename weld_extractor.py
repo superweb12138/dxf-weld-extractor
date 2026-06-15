@@ -2349,16 +2349,15 @@ def extract_welds(dxf_path):
                                 _touches = True; break
                         if _touches: break
                     if _touches: break
-                # Fallback: IFC-confirmed adjacency — even if 2D distance is large,
-                # the part is known to touch the comp body in 3D (section-view foreshortening).
+                # Fallback: IFC-confirmed adjacency — skip geometry enumeration,
+                # the BE BOM enumeration will generate exact BOM-length edges.
                 if not _touches and _ifc_are_adjacent(_cplbl, comp):
-                    _touches = True
+                    continue  # skip — BE BOM handles this plate
                 if not _touches:
                     continue
                 _t = part_dims.get(_cplbl, {}).get('thick', 12)
                 _hf = hf_from_thickness(_t) if _t else 8
-                # Relax endpoint tolerance for IFC-confirmed pairs
-                _eff_adj = _ADJ if not _ifc_are_adjacent(_cplbl, comp) else _ADJ * 3
+                _eff_adj = _ADJ
                 for _cln in _cplns:
                     if _cln['length'] <= _MIN_EDGE_CAD:
                         continue
@@ -2398,6 +2397,26 @@ def extract_welds(dxf_path):
                             'hf': _hf, 'length_mm': _wlen,
                             'annotation': '', 'part1': p1, 'part2': p2,
                         })
+
+    # BE BOM enumeration: generate CP edges only for plates WITHOUT any CP coverage.
+    if not comp.startswith('CO') and part_dims:
+        _be_pairs = set(tuple(sorted((r['part1'], r['part2']))) for r in results if r['component'] == comp)
+        for _plbl, _pdims in part_dims.items():
+            if _plbl == comp: continue
+            _cpair = tuple(sorted((comp, _plbl)))
+            if _cpair in _be_pairs: continue
+            _bw = round(_pdims.get('width') or 0)
+            _bl = round(_pdims.get('bom_len') or 0)
+            _t = _pdims.get('thick', 12)
+            _hf = hf_from_thickness(_t) if _t else 7
+            if _bw > 0:
+                for _pos in ('Above', 'Below'):
+                    results.append({'component': comp, 'position': _pos, 'hf': _hf, 'length_mm': _bw, 'annotation': '', 'part1': comp, 'part2': _plbl})
+                print(f"    [BE-BOM] {comp}/{_plbl} bw={_bw}mm hf={_hf}")
+            if _bl > 0 and abs(_bl - _bw) / max(_bl, _bw, 1) > 0.1:
+                for _pos in ('Above', 'Below'):
+                    results.append({'component': comp, 'position': _pos, 'hf': _hf, 'length_mm': _bl, 'annotation': '', 'part1': comp, 'part2': _plbl})
+                print(f"    [BE-BOM] {comp}/{_plbl} bl={_bl}mm hf={_hf}")
 
     # Post-processing: BOM-based comp→plate enumeration for CO components.
     # Pair-level guard for uncovered plates.  Also fills missing BOM-length
@@ -3031,9 +3050,13 @@ def extract_welds(dxf_path):
                 if _n_supp > 0:
                     _arc_plates.add(_plbl)
                     print(f"    [arc-supp] {comp}/{_plbl} weld={_wl}mm qty={_qty} wm={_n_wm} supp={_n_supp}")
-                    for _pos in ('Above', 'Below'):
-                        for _i in range(_n_supp // 2):
-                            results.append({'component': comp, 'position': _pos, 'hf': _hf_fillet, 'length_mm': _wl, 'annotation': '', 'part1': comp, 'part2': _plbl})
+                    if _exist_cjp:
+                        for _i in range(_n_supp):
+                            results.append({'component': comp, 'position': 'Above', 'hf': None, 'length_mm': _wl, 'annotation': 'CJP', 'part1': comp, 'part2': _plbl})
+                    else:
+                        for _pos in ('Above', 'Below'):
+                            for _i in range(_n_supp // 2):
+                                results.append({'component': comp, 'position': _pos, 'hf': _hf_fillet, 'length_mm': _wl, 'annotation': '', 'part1': comp, 'part2': _plbl})
                     _triples_covered.add(_tkey)
             elif _tkey not in _triples_covered:
                 _arc_plates.add(_plbl)
