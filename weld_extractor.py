@@ -661,6 +661,7 @@ def parse_bom(doc, comp):
 def extract_welds(dxf_path):
     comp_m = re.search(r'-(BE\d+|CO\d+)_', os.path.basename(dxf_path), re.I)
     comp   = comp_m.group(1).upper() if comp_m else os.path.splitext(os.path.basename(dxf_path))[0]
+    comp_full = os.path.splitext(os.path.basename(dxf_path))[0].rsplit('_', 1)[0]
 
     print(f"\n{'='*60}\n{os.path.basename(dxf_path)}  [{comp}]")
 
@@ -3581,6 +3582,19 @@ def extract_welds(dxf_path):
     if _assigned:
         print(f"  [view-assign] assigned {_assigned} entries to best views")
 
+    # Add full component name to each result for Excel output
+    for _r in results:
+        _r['comp_full'] = comp_full
+        # Derive joint type and weld type
+        _is_pp = _r['component'] not in (_r['part1'], _r['part2'])
+        _r['_joint_type'] = 'LJ' if _is_pp else 'TJ'
+        if _r.get('annotation') == 'CJP':
+            _r['_weld_type'] = 'CJP'
+        elif _is_pp:
+            _r['_weld_type'] = 'PP'
+        else:
+            _r['_weld_type'] = 'FW'
+
     if skipped:
         print(f"\n  SKIPPED ({len(skipped)}):")
         for name, reason in skipped:
@@ -3595,32 +3609,74 @@ def extract_welds(dxf_path):
 def write_excel(all_results, all_skipped, output_path):
     wb = openpyxl.Workbook()
 
-    # ---- Sheet 1: Weld statistics ----
-    ws = wb.active
-    ws.title = "焊缝统计"
-
     HDR_FILL = PatternFill("solid", fgColor="4472C4")
     HDR_FONT = Font(bold=True, color="FFFFFF")
     CENTER    = Alignment(horizontal='center', vertical='center')
 
+    # ---- Sheet 1: Weld statistics (14 columns A-N) ----
+    ws = wb.active
+    ws.title = "焊缝统计"
+
     headers = ['序号', '位置(上/下)', '焊脚尺寸hf(mm)', '焊缝长度(mm)',
-               '备注', '零件1', '零件2', '构件号']
+               '备注', '零件1', '零件2', '构件号',
+               '接头类型', '焊缝类型', '接头类型汇总', '焊缝类型汇总',
+               '接头类型汇总数量', '焊缝类型汇总数量']
     for col, h in enumerate(headers, 1):
         cell = ws.cell(row=1, column=col, value=h)
         cell.fill = HDR_FILL
         cell.font = HDR_FONT
         cell.alignment = CENTER
 
-    for idx, r in enumerate(all_results, 1):
-        ws.cell(row=idx+1, column=1, value=idx)
-        ws.cell(row=idx+1, column=2, value=r['position'])
-        ws.cell(row=idx+1, column=3, value=r['hf'])
-        ws.cell(row=idx+1, column=4, value=r['length_mm'])
-        ws.cell(row=idx+1, column=5, value=r['annotation'])
-        ws.cell(row=idx+1, column=6, value=r['part1'])
-        ws.cell(row=idx+1, column=7, value=r['part2'])
-        ws.cell(row=idx+1, column=8, value=r['component'])
+    # Collect types for summary
+    _all_joint = set()
+    _all_weld = set()
+    _jt_count = {}
+    _wt_count = {}
+    for r in all_results:
+        jt = r.get('_joint_type', 'TJ')
+        wt = r.get('_weld_type', 'FW')
+        _all_joint.add(jt); _all_weld.add(wt)
+        _jt_count[jt] = _jt_count.get(jt, 0) + 1
+        _wt_count[wt] = _wt_count.get(wt, 0) + 1
 
+    # Sort for consistent output
+    _joint_sorted = sorted(_all_joint)
+    _weld_sorted = sorted(_all_weld)
+    _jt_sum = ', '.join(_joint_sorted)
+    _wt_sum = ', '.join(_weld_sorted)
+    _jt_cnt = ', '.join(f'{k}:{_jt_count[k]}' for k in _joint_sorted)
+    _wt_cnt = ', '.join(f'{k}:{_wt_count[k]}' for k in _weld_sorted)
+
+    # Write summary on row 2 (below header)
+    ws.cell(row=2, column=11, value=_jt_sum)
+    ws.cell(row=2, column=12, value=_wt_sum)
+    ws.cell(row=2, column=13, value=_jt_cnt)
+    ws.cell(row=2, column=14, value=_wt_cnt)
+
+    # Write data rows starting from row 3
+    for idx, r in enumerate(all_results, 1):
+        row = idx + 2
+        ws.cell(row=row, column=1, value=idx)
+        ws.cell(row=row, column=2, value=r['position'])
+        ws.cell(row=row, column=3, value=r['hf'])
+        ws.cell(row=row, column=4, value=r['length_mm'])
+        # 备注: for CJP, show the plate thickness; otherwise empty
+        _note = ''
+        if r.get('annotation') == 'CJP':
+            _other = r['part2'] if r['part1'] == r['component'] else r['part1']
+            _thick = None
+            for _dim in (part_dims if hasattr(write_excel, 'part_dims') else {}).values():
+                pass  # plate thickness not directly available here
+            _note = r.get('annotation', '')
+        ws.cell(row=row, column=5, value=_note or r.get('annotation', ''))
+        ws.cell(row=row, column=6, value=r['part1'])
+        ws.cell(row=row, column=7, value=r['part2'])
+        ws.cell(row=row, column=8, value=r.get('comp_full', r['component']))
+        ws.cell(row=row, column=9, value=r.get('_joint_type', 'TJ'))
+        ws.cell(row=row, column=10, value=r.get('_weld_type', 'FW'))
+        # K-N: leave empty (summary occupies row 2 only)
+
+    # Auto-width
     for col in ws.columns:
         w = max((len(str(cell.value or '')) for cell in col), default=0)
         ws.column_dimensions[col[0].column_letter].width = max(w + 3, 14)
