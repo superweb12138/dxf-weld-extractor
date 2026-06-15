@@ -1865,6 +1865,7 @@ def extract_welds(dxf_path):
                             'hf': None, 'length_mm': final_edge_mm,
                             'annotation': 'CJP', 'part1': p1, 'part2': p2,
                             'dxf_pos': arrow, 'view_id': view_id,
+                            '_no_refine': True,
                         })
                     else:
                         for s3 in s3_data:
@@ -1882,6 +1883,7 @@ def extract_welds(dxf_path):
                                 'hf': _hf_fb, 'length_mm': final_edge_mm,
                                 'annotation': '', 'part1': p1, 'part2': p2,
                                 'dxf_pos': arrow, 'view_id': view_id,
+                                '_no_refine': True,
                             })
                 # Record peer data for post-processing replication
                 if lbl_g != comp and lbl_g in part_dims and not _synth:
@@ -2259,7 +2261,7 @@ def extract_welds(dxf_path):
                         'annotation': 'CJP',
                         'part1':      lbl1,
                         'part2':      lbl2,
-                        'dxf_pos': arrow, 'view_id': view_id,
+                        'dxf_pos': arrow, 'view_id': view_id, '_no_refine': True,
                     })
                 if fillet_sides and comp == 'CO008':
                     f = fillet_sides[0]
@@ -2280,7 +2282,7 @@ def extract_welds(dxf_path):
                             'annotation': '',
                             'part1':      lbl1,
                             'part2':      lbl2,
-                            'dxf_pos': arrow, 'view_id': view_id,
+                            'dxf_pos': arrow, 'view_id': view_id, '_no_refine': True,
                         })
             else:
                 # Normal fillet: output each side as-is
@@ -2307,7 +2309,7 @@ def extract_welds(dxf_path):
                             'annotation': '',
                             'part1':      lbl1,
                             'part2':      lbl2,
-                            'dxf_pos': arrow, 'view_id': view_id,
+                            'dxf_pos': arrow, 'view_id': view_id, '_no_refine': True,
                         })
 
     # Post-processing: connected-part enumeration for 3-SIDES views
@@ -3419,8 +3421,21 @@ def extract_welds(dxf_path):
                     _t_c = _pdims_c.get('thick') or _p_thick
                     _hf_pb = hf_from_thickness(min(_p_thick, _t_c))
                     print(f"    [pp-bridge] {_e_other}/{_plbl_c} weld={_e_len}mm hf={_hf_pb} (from {_pl_a})")
+                    # Compute position from _e_other's bbox center in peer view
+                    _pb_pos = None
+                    for _pn, _plns in part_lines_map.get(_pv_id, {}).items():
+                        if part_number_map.get(_pn) == _e_other:
+                            _xs, _ys = [], []
+                            for ln in _plns:
+                                if ln['length'] > 0.5:
+                                    _xs.extend([ln['start'][0], ln['end'][0]])
+                                    _ys.extend([ln['start'][1], ln['end'][1]])
+                            if _xs and _ys:
+                                _gy_range = max(_ys) - min(_ys)
+                                _pb_pos = ((min(_xs)+max(_xs))/2, max(_ys) - _gy_range * 0.25)
+                            break
                     for _pos in ('Above','Below'):
-                        results.append({'component':comp,'position':_pos,'hf':_hf_pb,'length_mm':_e_len,'annotation':'','part1':_ppair[0],'part2':_ppair[1],'view_id':_pv_id})
+                        results.append({'component':comp,'position':_pos,'hf':_hf_pb,'length_mm':_e_len,'annotation':'','part1':_ppair[0],'part2':_ppair[1],'dxf_pos':_pb_pos,'view_id':_pv_id})
                     _triples_covered.add(_tkey)
 
     # CO007 bl-side: plates with bw edge but missing bl long-side weld
@@ -3510,47 +3525,60 @@ def extract_welds(dxf_path):
             if _rm_swap:
                 print(f"    [co008-swap] removed {len(_rm_swap)} old p102/128.7mm edges from A-A")
 
-    # General PP position verification: find best view and contact edge for PP entries.
+    # PP position verification: fill missing dxf_pos from the entry's own view only.
     _verified = 0
     for _r in results:
         if _r['component'] in (_r['part1'], _r['part2']):
             continue
         _vid = _r.get('view_id')
         if not _vid:
-            for _try_v in list(part_lines_map.keys()):
-                _try_wl = _find_weld_line_for_pair(_r['part1'], _r['part2'], _try_v)
-                if _try_wl or _find_weld_pos_for_pair(_r['part1'], _r['part2'], _try_v):
-                    _vid = _try_v
-                    _r['view_id'] = _try_v
-                    break
-        if not _vid:
             continue
-        _current = _r.get('dxf_pos')
+        if _r.get('dxf_pos') is not None:
+            continue
         _wl = _find_weld_line_for_pair(_r['part1'], _r['part2'], _vid)
-        _newpos = None
         if _wl:
-            _too_far = True
-            if _current is not None:
-                for _ce in _wl:
-                    if dist2d(_current, _ce[2]) < 10.0:
-                        _too_far = False
-                        break
-            if _too_far:
-                _newpos = _wl[0][2]
+            _r['dxf_pos'] = _wl[0][2]
+            _r['_no_refine'] = True
+            _verified += 1
         else:
             _pos = _find_weld_pos_for_pair(_r['part1'], _r['part2'], _vid)
             if _pos is not None:
-                if _current is None or dist2d(_current, _pos) >= 10.0:
-                    _newpos = _pos
-        if _newpos is not None:
-            if _current is None or _current != _newpos:
-                _r['view_id'] = _vid
-                print(f"    [pos-verify] {_r['part1']}/{_r['part2']} vid={_vid}: {_current} -> {_newpos}")
-                _r['dxf_pos'] = _newpos
+                _r['dxf_pos'] = _pos
                 _r['_no_refine'] = True
                 _verified += 1
     if _verified:
-        print(f"  [pos-verify] verified {_verified} PP positions from DXF geometry")
+        print(f"  [pos-verify] filled {_verified} PP positions from DXF geometry")
+
+    # NO_VIEW 条目分配视图：对无 view_id 的 PP 条目搜索最佳视图
+    _assigned = 0
+    for _r in results:
+        if _r['component'] in (_r['part1'], _r['part2']):
+            continue
+        if _r.get('view_id'):
+            continue
+        _candidates = []
+        for _try_v in part_lines_map:
+            _has_a = any(part_number_map.get(pn) == _r['part1'] for pn in part_lines_map[_try_v])
+            _has_b = any(part_number_map.get(pn) == _r['part2'] for pn in part_lines_map[_try_v])
+            if _has_a and _has_b:
+                _candidates.append((len(part_lines_map[_try_v]), _try_v))
+        if not _candidates:
+            continue
+        _candidates.sort(key=lambda x: x[0])
+        _best_vid = _candidates[0][1]
+        _r['view_id'] = _best_vid
+        _assigned += 1
+        # Fill dxf_pos if missing
+        if _r.get('dxf_pos') is None:
+            _wl = _find_weld_line_for_pair(_r['part1'], _r['part2'], _best_vid)
+            if _wl:
+                _r['dxf_pos'] = _wl[0][2]
+            else:
+                _pos = _find_weld_pos_for_pair(_r['part1'], _r['part2'], _best_vid)
+                if _pos is not None:
+                    _r['dxf_pos'] = _pos
+    if _assigned:
+        print(f"  [view-assign] assigned {_assigned} PP entries to best views")
 
     if skipped:
         print(f"\n  SKIPPED ({len(skipped)}):")
