@@ -3549,36 +3549,37 @@ def extract_welds(dxf_path):
     if _verified:
         print(f"  [pos-verify] filled {_verified} PP positions from DXF geometry")
 
-    # NO_VIEW 条目分配视图：对无 view_id 的 PP 条目搜索最佳视图
+    # 无视图条目分配：对所有缺 view_id 的条目搜索最佳视图
+    _wm_views = set(wm_by_view)
     _assigned = 0
     for _r in results:
-        if _r['component'] in (_r['part1'], _r['part2']):
-            continue
         if _r.get('view_id'):
             continue
+        _p1, _p2 = _r['part1'], _r['part2']
         _candidates = []
         for _try_v in part_lines_map:
-            _has_a = any(part_number_map.get(pn) == _r['part1'] for pn in part_lines_map[_try_v])
-            _has_b = any(part_number_map.get(pn) == _r['part2'] for pn in part_lines_map[_try_v])
-            if _has_a and _has_b:
-                _candidates.append((len(part_lines_map[_try_v]), _try_v))
+            _has1 = any(part_number_map.get(pn) == _p1 for pn in part_lines_map[_try_v])
+            _has2 = any(part_number_map.get(pn) == _p2 for pn in part_lines_map[_try_v])
+            if _has1 and _has2:
+                _bonus = 100 if _try_v in _wm_views else 0
+                _score = _bonus - len(part_lines_map[_try_v])
+                _candidates.append((_score, _try_v))
         if not _candidates:
             continue
-        _candidates.sort(key=lambda x: x[0])
+        _candidates.sort(key=lambda x: -x[0])
         _best_vid = _candidates[0][1]
         _r['view_id'] = _best_vid
         _assigned += 1
-        # Fill dxf_pos if missing
         if _r.get('dxf_pos') is None:
-            _wl = _find_weld_line_for_pair(_r['part1'], _r['part2'], _best_vid)
+            _wl = _find_weld_line_for_pair(_p1, _p2, _best_vid)
             if _wl:
                 _r['dxf_pos'] = _wl[0][2]
             else:
-                _pos = _find_weld_pos_for_pair(_r['part1'], _r['part2'], _best_vid)
+                _pos = _find_weld_pos_for_pair(_p1, _p2, _best_vid)
                 if _pos is not None:
                     _r['dxf_pos'] = _pos
     if _assigned:
-        print(f"  [view-assign] assigned {_assigned} PP entries to best views")
+        print(f"  [view-assign] assigned {_assigned} entries to best views")
 
     if skipped:
         print(f"\n  SKIPPED ({len(skipped)}):")
