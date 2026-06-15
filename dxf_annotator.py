@@ -422,8 +422,7 @@ def _paired_bbox(weld_pos, dname, diag_len, angle_deg):
 
 
 def _next_label(w, f_counter, w_counter):
-    weld_type = w.get('weld_type', 'FW')
-    if weld_type == 'CJP':
+    if w.get('annotation') == 'CJP':
         w_counter[0] += 1
         return f'W{w_counter[0]}'
     else:
