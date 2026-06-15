@@ -2398,7 +2398,8 @@ def extract_welds(dxf_path):
                             'annotation': '', 'part1': p1, 'part2': p2,
                         })
 
-    # BE BOM enumeration: generate CP edges only for plates WITHOUT any CP coverage.
+    # BE BOM enumeration: generate CP edges for uncovered plates only.
+    # Multiplied by BOM qty for plates with multiple instances.
     if not comp.startswith('CO') and part_dims:
         _be_pairs = set(tuple(sorted((r['part1'], r['part2']))) for r in results if r['component'] == comp)
         for _plbl, _pdims in part_dims.items():
@@ -2409,14 +2410,17 @@ def extract_welds(dxf_path):
             _bl = round(_pdims.get('bom_len') or 0)
             _t = _pdims.get('thick', 12)
             _hf = hf_from_thickness(_t) if _t else 7
+            _qty = _pdims.get('qty', 1)
             if _bw > 0:
-                for _pos in ('Above', 'Below'):
-                    results.append({'component': comp, 'position': _pos, 'hf': _hf, 'length_mm': _bw, 'annotation': '', 'part1': comp, 'part2': _plbl})
-                print(f"    [BE-BOM] {comp}/{_plbl} bw={_bw}mm hf={_hf}")
+                for _rep in range(_qty):
+                    for _pos in ('Above', 'Below'):
+                        results.append({'component': comp, 'position': _pos, 'hf': _hf, 'length_mm': _bw, 'annotation': '', 'part1': comp, 'part2': _plbl})
+                print(f"    [BE-BOM] {comp}/{_plbl} bw={_bw}mm hf={_hf} x{_qty}")
             if _bl > 0 and abs(_bl - _bw) / max(_bl, _bw, 1) > 0.1:
-                for _pos in ('Above', 'Below'):
-                    results.append({'component': comp, 'position': _pos, 'hf': _hf, 'length_mm': _bl, 'annotation': '', 'part1': comp, 'part2': _plbl})
-                print(f"    [BE-BOM] {comp}/{_plbl} bl={_bl}mm hf={_hf}")
+                for _rep in range(_qty):
+                    for _pos in ('Above', 'Below'):
+                        results.append({'component': comp, 'position': _pos, 'hf': _hf, 'length_mm': _bl, 'annotation': '', 'part1': comp, 'part2': _plbl})
+                print(f"    [BE-BOM] {comp}/{_plbl} bl={_bl}mm hf={_hf} x{_qty}")
 
     # Post-processing: BOM-based comp→plate enumeration for CO components.
     # Pair-level guard for uncovered plates.  Also fills missing BOM-length
