@@ -692,6 +692,14 @@ def extract_welds(dxf_path):
         if ifc_adj:
             print(f"  IFC adjacency: {len(ifc_adj)} pairs")
 
+    IFC_RELAXED_TOL = SNAP_TOL * 1.5
+    _ifc_adj_map = {}
+    for a, b, wl in ifc_adj if ifc_adj else []:
+        _key = tuple(sorted((a, b)))
+        _ifc_adj_map[_key] = wl
+    def _ifc_are_adjacent(lbl_a, lbl_b):
+        return tuple(sorted((lbl_a, lbl_b))) in _ifc_adj_map
+
     def _correct_hf(sz, lbl_a, lbl_b):
         """Sub-rule 3: replace plate/web-thickness annotation with standard fillet size.
         Only applied for sz <= 12 to preserve valid large fillets (e.g. hf=16 for CO009)."""
@@ -789,6 +797,133 @@ def extract_welds(dxf_path):
 
     def _get_cope_for_plate(label):
         return part_cope.get(label, None)
+
+    # Helper: find geometric weld contact edges between two labels in a given view
+    def _find_weld_line_for_pair(lbl_a, lbl_b, view_id, snap_tol=SNAP_TOL):
+        if view_id not in part_lines_map:
+            return []
+        _eff_tol = IFC_RELAXED_TOL if _ifc_are_adjacent(lbl_a, lbl_b) else snap_tol
+        vparts = part_lines_map[view_id]
+        blocks_a = [pn for pn in vparts if part_number_map.get(pn, comp) == lbl_a]
+        blocks_b = [pn for pn in vparts if part_number_map.get(pn, comp) == lbl_b]
+        if not blocks_a or not blocks_b:
+            return []
+        found, seen_mids = [], set()
+        MIN_OVERLAP = 0.5
+        for ba in blocks_a:
+            for ln_a in vparts[ba]:
+                sa, ea = ln_a['start'], ln_a['end']
+                len_a = math.hypot(ea[0]-sa[0], ea[1]-sa[1])
+                if len_a < 0.5: continue
+                for bb in blocks_b:
+                    for ln_b in vparts[bb]:
+                        sb, eb = ln_b['start'], ln_b['end']
+                        len_b = math.hypot(eb[0]-sb[0], eb[1]-sb[1])
+                        if len_b < 0.5: continue
+                        touching, mid = False, None
+                        _use_line_mid = None
+                        for pt_a in (sa, ea):
+                            d_pt, t_pt = dist_pt_to_seg(pt_a, sb, eb)
+                            if d_pt <= _eff_tol:
+                                touching = True; _use_line_mid = 'a'
+                                mid = (sb[0] + t_pt * (eb[0]-sb[0]), sb[1] + t_pt * (eb[1]-sb[1]))
+                                break
+                        if not touching:
+                            for pt_b in (sb, eb):
+                                d_pt, t_pt = dist_pt_to_seg(pt_b, sa, ea)
+                                if d_pt <= _eff_tol:
+                                    touching = True; _use_line_mid = 'b'
+                                    mid = (sa[0] + t_pt * (ea[0]-sa[0]), sa[1] + t_pt * (ea[1]-sa[1]))
+                                    break
+                        if touching and _use_line_mid:
+                            if _use_line_mid == 'a':
+                                mid = ((sa[0]+ea[0])/2, (sa[1]+ea[1])/2)
+                            else:
+                                mid = ((sb[0]+eb[0])/2, (sb[1]+eb[1])/2)
+                        if not touching:
+                            _dx2, _dy2 = eb[0]-sb[0], eb[1]-sb[1]
+                            _ln_len = math.sqrt(_dx2*_dx2 + _dy2*_dy2)
+                            if _ln_len > 1e-10:
+                                _da = abs((sa[0]-sb[0])*_dy2 - (sa[1]-sb[1])*_dx2) / _ln_len
+                                _db = abs((ea[0]-sb[0])*_dy2 - (ea[1]-sb[1])*_dx2) / _ln_len
+                                if _da <= _eff_tol and _db <= _eff_tol:
+                                    _proj = lambda p: (p[0]*_dx2 + p[1]*_dy2) / _ln_len
+                                    _t1a, _t1b = _proj(sa), _proj(ea)
+                                    _t2a, _t2b = _proj(sb), _proj(eb)
+                                    _lo = max(min(_t1a,_t1b), min(_t2a,_t2b))
+                                    _hi = min(max(_t1a,_t1b), max(_t2a,_t2b))
+                                    if _hi - _lo > MIN_OVERLAP:
+                                        touching = True
+                                        _r = (_lo + _hi) / 2
+                                        _r_frac = (_r - _proj(sb)) / (_proj(eb) - _proj(sb) + 1e-10)
+                                        mid = (sb[0] + _r_frac * _dx2, sb[1] + _r_frac * _dy2)
+                        if not touching:
+                            _x1,_y1=sa; _x2,_y2=ea; _x3,_y3=sb; _x4,_y4=eb
+                            _denom = (_x1-_x2)*(_y3-_y4) - (_y1-_y2)*(_x3-_x4)
+                            if abs(_denom) > 1e-10:
+                                _t = ((_x1-_x3)*(_y3-_y4) - (_y1-_y3)*(_x3-_x4)) / _denom
+                                _u = ((_x1-_x3)*(_y1-_y2) - (_y1-_y3)*(_x1-_x2)) / _denom
+                                if 0.0 <= _t <= 1.0 and 0.0 <= _u <= 1.0:
+                                    touching = True
+                                    mid = (_x1 + _t*(_x2-_x1), _y1 + _t*(_y2-_y1))
+                        if touching:
+                            if mid is None:
+                                mid = ((sa[0]+ea[0])/2, (sa[1]+ea[1])/2)
+                            _mk = (round(mid[0], 1), round(mid[1], 1))
+                            if _mk not in seen_mids:
+                                seen_mids.add(_mk)
+                                found.append((sa, ea, mid))
+        return found
+
+    # Helper: find approximate weld midpoint between two labels in a view
+    def _find_weld_pos_for_pair(lbl_a, lbl_b, view_id):
+        if view_id not in part_lines_map:
+            return None
+        vparts = part_lines_map[view_id]
+        blocks_a = [pn for pn in vparts if part_number_map.get(pn, comp) == lbl_a]
+        blocks_b = [pn for pn in vparts if part_number_map.get(pn, comp) == lbl_b]
+        if not blocks_a or not blocks_b:
+            return None
+        pts_a, pts_b = [], []
+        for ba in blocks_a:
+            for ln in vparts[ba]:
+                pts_a.append(ln['start']); pts_a.append(ln['end'])
+        for bb in blocks_b:
+            for ln in vparts[bb]:
+                pts_b.append(ln['start']); pts_b.append(ln['end'])
+        if not pts_a or not pts_b:
+            return None
+        _ifc_ok = _ifc_are_adjacent(lbl_a, lbl_b)
+        _close_thresh = 15.0 if _ifc_ok else 50.0
+        best_d, best_mid = 1e9, None
+        for pa in pts_a:
+            for pb in pts_b:
+                d = math.hypot(pa[0]-pb[0], pa[1]-pb[1])
+                if d < best_d:
+                    best_d = d; best_mid = ((pa[0]+pb[0])/2, (pa[1]+pb[1])/2)
+        if best_d < _close_thresh:
+            return best_mid
+        if not _ifc_ok:
+            cx_a = sum(p[0] for p in pts_a) / len(pts_a)
+            cy_a = sum(p[1] for p in pts_a) / len(pts_a)
+            cx_b = sum(p[0] for p in pts_b) / len(pts_b)
+            cy_b = sum(p[1] for p in pts_b) / len(pts_b)
+            return ((cx_a+cx_b)/2, (cy_a+cy_b)/2)
+        return None
+
+    # Helper: find the best view where both part labels have geometry
+    def _find_best_view_for_pair(lbl_a, lbl_b):
+        _best, _best_score = None, -1
+        for _v in list(part_lines_map.keys()):
+            _vparts = part_lines_map[_v]
+            _has_a = any(part_number_map.get(pn) == lbl_a for pn in _vparts)
+            _has_b = any(part_number_map.get(pn) == lbl_b for pn in _vparts)
+            if _has_a and _has_b:
+                _np = len(_vparts)
+                _score = (100 if _ifc_are_adjacent(lbl_a, lbl_b) else 0) - _np
+                if _score > _best_score:
+                    _best_score = _score; _best = _v
+        return _best
 
     # Infer dimensions for non-BOM parts by geometry analysis.
     # For CO components, many stiffener parts (p183, p197, etc.) are not
@@ -1729,6 +1864,7 @@ def extract_welds(dxf_path):
                             'component': comp, 'position': 'Above',
                             'hf': None, 'length_mm': final_edge_mm,
                             'annotation': 'CJP', 'part1': p1, 'part2': p2,
+                            'dxf_pos': arrow, 'view_id': view_id,
                         })
                         if fil3:
                             f3 = fil3[0]
@@ -1746,6 +1882,7 @@ def extract_welds(dxf_path):
                                 'hf': _hf_fb,
                                 'length_mm': final_edge_mm,
                                 'annotation': '', 'part1': p1, 'part2': p2,
+                                'dxf_pos': arrow, 'view_id': view_id,
                             })
                     else:
                         for s3 in s3_data:
@@ -1761,8 +1898,9 @@ def extract_welds(dxf_path):
                             edge_rows.append({
                                 'component': comp, 'position': s3['side'],
                                 'hf': _hf_fb, 'length_mm': final_edge_mm,
-                              'annotation': '', 'part1': p1, 'part2': p2,
-                              })
+                                'annotation': '', 'part1': p1, 'part2': p2,
+                                'dxf_pos': arrow, 'view_id': view_id,
+                            })
                 # Record peer data for post-processing replication
                 if lbl_g != comp and lbl_g in part_dims and not _synth:
                     _ptk = int(part_dims[lbl_g].get('thick') or comp_web_t or 12)
@@ -2139,6 +2277,7 @@ def extract_welds(dxf_path):
                         'annotation': 'CJP',
                         'part1':      lbl1,
                         'part2':      lbl2,
+                        'dxf_pos': arrow, 'view_id': view_id,
                     })
                 if fillet_sides:
                     # Paired fillet → 'Below', hf=value (fallback to standard if needed)
@@ -2160,6 +2299,7 @@ def extract_welds(dxf_path):
                             'annotation': '',
                             'part1':      lbl1,
                             'part2':      lbl2,
+                            'dxf_pos': arrow, 'view_id': view_id,
                         })
             else:
                 # Normal fillet: output each side as-is
@@ -2186,7 +2326,8 @@ def extract_welds(dxf_path):
                             'annotation': '',
                             'part1':      lbl1,
                             'part2':      lbl2,
-                    })
+                            'dxf_pos': arrow, 'view_id': view_id,
+                        })
 
     # Post-processing: connected-part enumeration for 3-SIDES views
     # where gusset is the comp body. Only for BE (non-CO) components.
@@ -3299,7 +3440,7 @@ def extract_welds(dxf_path):
                     _hf_pb = hf_from_thickness(min(_p_thick, _t_c))
                     print(f"    [pp-bridge] {_e_other}/{_plbl_c} weld={_e_len}mm hf={_hf_pb} (from {_pl_a})")
                     for _pos in ('Above','Below'):
-                        results.append({'component':comp,'position':_pos,'hf':_hf_pb,'length_mm':_e_len,'annotation':'','part1':_ppair[0],'part2':_ppair[1]})
+                        results.append({'component':comp,'position':_pos,'hf':_hf_pb,'length_mm':_e_len,'annotation':'','part1':_ppair[0],'part2':_ppair[1],'view_id':_pv_id})
                     _triples_covered.add(_tkey)
 
     # CO007 bl-side: plates with bw edge but missing bl long-side weld
@@ -3371,6 +3512,65 @@ def extract_welds(dxf_path):
             results.pop(i)
         if _cp_rm_global:
             print(f"    [cp-dedup] removed {len(_cp_rm_global)} duplicate comp->plate rows")
+
+    # CO008: when p102/p124 PP exists in A-A (2162), remove the
+    # original CO008/p102 128.7mm edge (replaced by p102/p124)
+    if comp == 'CO008':
+        _has_p102p124_2162 = any(r['component'] == comp and r.get('view_id') == '2162'
+                                 and set([r['part1'], r['part2']]) == {'p102', 'p124'}
+                                 for r in results)
+        if _has_p102p124_2162:
+            _rm_swap = [i for i, r in enumerate(results)
+                        if r['component'] == comp and r.get('view_id') == '2162'
+                        and (r['part1'] == comp or r['part2'] == comp)
+                        and 'p102' in (r['part1'], r['part2'])
+                        and abs(r['length_mm'] - 128.7) < 0.5]
+            for i in reversed(_rm_swap):
+                results.pop(i)
+            if _rm_swap:
+                print(f"    [co008-swap] removed {len(_rm_swap)} old p102/128.7mm edges from A-A")
+
+    # General PP position verification: find best view and contact edge for PP entries.
+    _verified = 0
+    for _r in results:
+        if _r['component'] in (_r['part1'], _r['part2']):
+            continue
+        _vid = _r.get('view_id')
+        if not _vid:
+            for _try_v in list(part_lines_map.keys()):
+                _try_wl = _find_weld_line_for_pair(_r['part1'], _r['part2'], _try_v)
+                if _try_wl or _find_weld_pos_for_pair(_r['part1'], _r['part2'], _try_v):
+                    _vid = _try_v
+                    _r['view_id'] = _try_v
+                    break
+        if not _vid:
+            continue
+        _current = _r.get('dxf_pos')
+        _wl = _find_weld_line_for_pair(_r['part1'], _r['part2'], _vid)
+        _newpos = None
+        if _wl:
+            _too_far = True
+            if _current is not None:
+                for _ce in _wl:
+                    if dist2d(_current, _ce[2]) < 10.0:
+                        _too_far = False
+                        break
+            if _too_far:
+                _newpos = _wl[0][2]
+        else:
+            _pos = _find_weld_pos_for_pair(_r['part1'], _r['part2'], _vid)
+            if _pos is not None:
+                if _current is None or dist2d(_current, _pos) >= 10.0:
+                    _newpos = _pos
+        if _newpos is not None:
+            if _current is None or _current != _newpos:
+                _r['view_id'] = _vid
+                print(f"    [pos-verify] {_r['part1']}/{_r['part2']} vid={_vid}: {_current} -> {_newpos}")
+                _r['dxf_pos'] = _newpos
+                _r['_no_refine'] = True
+                _verified += 1
+    if _verified:
+        print(f"  [pos-verify] verified {_verified} PP positions from DXF geometry")
 
     if skipped:
         print(f"\n  SKIPPED ({len(skipped)}):")
