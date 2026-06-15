@@ -2315,8 +2315,9 @@ def extract_welds(dxf_path):
 
     # Post-processing: connected-part enumeration for 3-SIDES views
     # where gusset is the comp body. Only for BE (non-CO) components.
+    # Use relaxed tolerance for section-view foreshortening.
     if not comp.startswith('CO') and part_lines_map and part_dims:
-        _ADJ = SNAP_TOL + 0.5
+        _ADJ = SNAP_TOL * 3.0
         _MIN_EDGE_CAD = 1.5
         _plates_done = set()
         for r in results:
@@ -3034,7 +3035,6 @@ def extract_welds(dxf_path):
                 if _exist_cjp:
                     for _i in range(_n):
                         results.append({'component': comp, 'position': 'Above', 'hf': None, 'length_mm': _wl, 'annotation': 'CJP', 'part1': comp, 'part2': _plbl})
-                        results.append({'component': comp, 'position': 'Below', 'hf': _hf_fillet, 'length_mm': _wl, 'annotation': '', 'part1': comp, 'part2': _plbl})
                 else:
                     for _pos in ('Above', 'Below'):
                         for _i in range(_n):
@@ -3049,7 +3049,6 @@ def extract_welds(dxf_path):
                     if _exist_cjp:
                         for _i in range(_n2):
                             results.append({'component': comp, 'position': 'Above', 'hf': None, 'length_mm': _wl2_add, 'annotation': 'CJP', 'part1': comp, 'part2': _plbl})
-                            results.append({'component': comp, 'position': 'Below', 'hf': _hf_fillet, 'length_mm': _wl2_add, 'annotation': '', 'part1': comp, 'part2': _plbl})
                     else:
                         for _pos in ('Above', 'Below'):
                             for _i in range(_n2):
@@ -3063,7 +3062,6 @@ def extract_welds(dxf_path):
                     if _exist_cjp:
                         for _i in range(_qty):
                             results.append({'component': comp, 'position': 'Above', 'hf': None, 'length_mm': _wl260, 'annotation': 'CJP', 'part1': comp, 'part2': _plbl})
-                            results.append({'component': comp, 'position': 'Below', 'hf': _hf_fillet, 'length_mm': _wl260, 'annotation': '', 'part1': comp, 'part2': _plbl})
                     else:
                         for _pos in ('Above', 'Below'):
                             for _i in range(_qty):
