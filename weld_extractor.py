@@ -1866,24 +1866,6 @@ def extract_welds(dxf_path):
                             'annotation': 'CJP', 'part1': p1, 'part2': p2,
                             'dxf_pos': arrow, 'view_id': view_id,
                         })
-                        if fil3:
-                            f3 = fil3[0]
-                            _hf_fb = 0
-                            if f3['sz'] is not None:
-                                _hf_fb = f3['sz']
-                            elif lbl_g in part_dims:
-                                _hf_fb = hf_from_thickness(part_dims[lbl_g]['thick'])
-                            elif comp_web_t:
-                                _hf_fb = hf_from_thickness(comp_web_t)
-                            else:
-                                _hf_fb = 6  # default minimum fillet
-                            edge_rows.append({
-                                'component': comp, 'position': 'Below',
-                                'hf': _hf_fb,
-                                'length_mm': final_edge_mm,
-                                'annotation': '', 'part1': p1, 'part2': p2,
-                                'dxf_pos': arrow, 'view_id': view_id,
-                            })
                     else:
                         for s3 in s3_data:
                             _hf_fb = 0
@@ -2279,8 +2261,7 @@ def extract_welds(dxf_path):
                         'part2':      lbl2,
                         'dxf_pos': arrow, 'view_id': view_id,
                     })
-                if fillet_sides:
-                    # Paired fillet → 'Below', hf=value (fallback to standard if needed)
+                if fillet_sides and comp == 'CO008':
                     f = fillet_sides[0]
                     _hf_fb = f['sz'] if f['sz'] is not None else 0
                     if _hf_fb == 0:
@@ -2402,12 +2383,11 @@ def extract_welds(dxf_path):
                     if p1 == p2:
                         continue
                     for _pos in ('Above', 'Below'):
-                        for _dup in (0, 1):  # ×2 for symmetric plate faces
-                            results.append({
-                                'component': comp, 'position': _pos,
-                                'hf': _hf, 'length_mm': _wlen,
-                                'annotation': '', 'part1': p1, 'part2': p2,
-                            })
+                        results.append({
+                            'component': comp, 'position': _pos,
+                            'hf': _hf, 'length_mm': _wlen,
+                            'annotation': '', 'part1': p1, 'part2': p2,
+                        })
 
     # Post-processing: BOM-based comp→plate enumeration for CO components.
     # Pair-level guard for uncovered plates.  Also fills missing BOM-length
@@ -2439,9 +2419,9 @@ def extract_welds(dxf_path):
             if _bw and _bw > 0:
                 _bwr = round(_bw)
                 if not _covered and (_cpair + (_bwr,)) not in _triples_covered:
-                    for _dup in (0, 1):
+                    for _pos in ('Above', 'Below'):
                         results.append({
-                            'component': comp, 'position': 'Above',
+                            'component': comp, 'position': _pos,
                             'hf': _hf, 'length_mm': _bwr,
                             'annotation': '', 'part1': comp, 'part2': _plbl,
                         })
@@ -2449,9 +2429,9 @@ def extract_welds(dxf_path):
             if _bl and _bl > 0 and abs(_bl - _bw) / max(_bl, _bw, 1) > 0.1:
                 _blr = round(_bl)
                 if not _covered and (_cpair + (_blr,)) not in _triples_covered:
-                    for _dup in (0, 1):
+                    for _pos in ('Above', 'Below'):
                         results.append({
-                            'component': comp, 'position': 'Above',
+                            'component': comp, 'position': _pos,
                             'hf': _hf, 'length_mm': _blr,
                             'annotation': '', 'part1': comp, 'part2': _plbl,
                         })
@@ -2461,9 +2441,9 @@ def extract_welds(dxf_path):
             if _covered and _bw and _bw > 0 and _bl and _bl > 0 and abs(_bl - _bw) / max(_bl, _bw, 1) > 0.1:
                 _blr, _bwr = round(_bl), round(_bw)
                 if (_cpair + (_bwr,)) in _triples_covered and (_cpair + (_blr,)) not in _triples_covered:
-                    for _dup in (0, 1):
+                    for _pos in ('Above', 'Below'):
                         results.append({
-                            'component': comp, 'position': 'Above',
+                            'component': comp, 'position': _pos,
                             'hf': _hf, 'length_mm': _blr,
                             'annotation': '', 'part1': comp, 'part2': _plbl,
                         })
