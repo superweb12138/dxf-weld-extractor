@@ -1,5 +1,5 @@
 """Compare script output against R3_auto(1) manual (11 DXF components)."""
-import openpyxl
+import openpyxl, re
 from collections import Counter, defaultdict
 
 def load(path, sheet=None):
@@ -7,10 +7,14 @@ def load(path, sheet=None):
     ws = wb[sheet] if sheet else wb.active
     rows = []
     for r in ws.iter_rows(min_row=2, values_only=True):
-        if r[1] is None:
+        if r[1] is None or r[1] == '位置(上/下)':
             continue
+        _c = str(r[7] or '')
+        _m = re.search(r'(BE\d+|CO\d+)', _c)
+        if _m:
+            _c = _m.group(1)
         rows.append({'pos': r[1], 'hf': r[2] or 0, 'len': round(float(r[3] or 0), 1),
-                     'ann': r[4] or '', 'p1': r[5], 'p2': r[6], 'comp': r[7]})
+                     'ann': r[4] or '', 'p1': r[5], 'p2': r[6], 'comp': _c})
     return rows
 
 manual = load(r'C:\Users\15297\Desktop\hanf\焊缝统计R3_auto(1).xlsx')
@@ -29,7 +33,7 @@ print(f"{'TOTAL':<8} {sum(mc.values()):>5} {sum(sc.values()):>5}")
 print()
 
 def loose_key(r):
-    p = tuple(sorted((str(r['p1'] or ''), str(r['p2'] or ''))))
+    p = tuple(sorted((str(r['p1'] or '').lower(), str(r['p2'] or '').lower())))
     return (r['comp'], r['pos'], r['hf'], p)
 
 ml = Counter(loose_key(r) for r in manual)

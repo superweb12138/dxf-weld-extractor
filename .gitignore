@@ -1,0 +1,19 @@
+# Temp files
+*.dwl
+*.dwl2
+*.pkl
+~$*
+_bak_*
+_tmp_*
+__pycache__/
+*.pyc
+# Debug scripts (deleted)
+investigate_*.py
+simulate_*.py
+trace_*.py
+run_all.py
+# Annotated PDFs are generated outputs
+annotated/*.PDF
+annotated/*.pdf
+# External tools
+AcmeCAD_*.exe
