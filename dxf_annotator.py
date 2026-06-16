@@ -22,7 +22,7 @@ ANNOTATED_DIR = os.path.join(FOLDER, "annotated")
 SCALE = 10          # 1 CAD unit = 10 mm
 LABEL_HEIGHT = 2.5  # text height in CAD units
 LAYER_NAME = "WELD_LABELS"
-LABEL_COLOR = 5       # blue
+LABEL_COLOR = 1       # red (ACI 1)
 LABEL_OFFSET = 38.0   # fallback offset for no-coordinate labels
 
 # Two-segment leader line: diagonal + horizontal landing
