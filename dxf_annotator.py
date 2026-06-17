@@ -655,18 +655,32 @@ def _search_placement(weld_pos, cx, cy, lines, text_bboxes, circles, placed_bbox
     """两阶段搜索最佳标注位置。"""
     wx, wy = weld_pos
 
+    # 空间索引：将几何线分到 50×50 网格，加速近邻查询
+    _GRID = 50
+    _line_grid = {}
+    for _s, _e in lines:
+        _gx0 = int(min(_s[0], _e[0]) / _GRID)
+        _gx1 = int(max(_s[0], _e[0]) / _GRID)
+        _gy0 = int(min(_s[1], _e[1]) / _GRID)
+        _gy1 = int(max(_s[1], _e[1]) / _GRID)
+        for _gx in range(_gx0, _gx1 + 1):
+            for _gy in range(_gy0, _gy1 + 1):
+                _line_grid.setdefault((_gx, _gy), []).append((_s, _e))
+
     def _fine_tune(dist, angle, _draw_bbox):
         """在给定角度附近以1°步长精调，返回更优结果。"""
         _best = (angle, _score_placement(wx, wy, angle, dist, lines, text_bboxes,
                                          circles, placed_bboxes, placed_text_bboxes,
                                          vx0, vy0, vx1, vy1,
-                                         _draw_bbox, is_pair=is_pair))
+                                         _draw_bbox, is_pair=is_pair, min_score=-999999999,
+                                         line_grid=_line_grid))
         for d_angle in [-3, -2, -1, 1, 2, 3]:
             a = angle + d_angle
             s = _score_placement(wx, wy, a, dist, lines, text_bboxes,
                                  circles, placed_bboxes, placed_text_bboxes,
                                  vx0, vy0, vx1, vy1,
-                                 _draw_bbox, is_pair=is_pair)
+                                 _draw_bbox, is_pair=is_pair, min_score=_best[1],
+                                 line_grid=_line_grid)
             if s > _best[1]:
                 _best = (a, s)
         return _best[0], _best[1]
@@ -708,7 +722,8 @@ def _search_placement(weld_pos, cx, cy, lines, text_bboxes, circles, placed_bbox
                     score = _score_placement(wx, wy, angle_deg, dist, lines, text_bboxes,
                                              circles, placed_bboxes, placed_text_bboxes,
                                              vx0, vy0, vx1, vy1,
-                                             _draw_bbox, is_pair=is_pair)
+                                             _draw_bbox, is_pair=is_pair, min_score=_best_score,
+                                             line_grid=_line_grid)
                     _hp = _hemi_penalty(angle_deg)
                     if score >= 0:
                         return score, (dname, dist, angle_deg)
@@ -726,7 +741,8 @@ def _search_placement(weld_pos, cx, cy, lines, text_bboxes, circles, placed_bbox
                     score = _score_placement(wx, wy, angle_deg, dist, lines, text_bboxes,
                                              circles, placed_bboxes, placed_text_bboxes,
                                              vx0, vy0, vx1, vy1,
-                                             _draw_bbox, is_pair=is_pair)
+                                             _draw_bbox, is_pair=is_pair, min_score=_best_score,
+                                             line_grid=_line_grid)
                     _hp = _hemi_penalty(angle_deg)
                     if score >= 0:
                         # 无冲突：精调后立即返回
@@ -750,7 +766,8 @@ def _search_placement(weld_pos, cx, cy, lines, text_bboxes, circles, placed_bbox
 
 
 def _score_placement(wx, wy, angle_deg, dist, lines, text_bboxes, circles,
-                     placed_bboxes, placed_text_bboxes, vx0, vy0, vx1, vy1, draw_bbox=None, is_pair=False):
+                     placed_bboxes, placed_text_bboxes, vx0, vy0, vx1, vy1,
+                     draw_bbox=None, is_pair=False, min_score=None, line_grid=None):
     """对 (角度, 距离) 位置评分。分值越高越推荐，正分表示无冲突，负分表示冲突严重。"""
     score = 0
     rad = math.radians(angle_deg)
@@ -778,11 +795,26 @@ def _score_placement(wx, wy, angle_deg, dist, lines, text_bboxes, circles,
     _cand_y0 = min(wy, ey, hy, by0)
     _cand_y1 = max(wy, ey, hy, by1)
     _PROX_MARGIN = 15
-    _near_lines = [(s, e) for (s, e) in lines
-                   if not (max(s[0], e[0]) < _cand_x0 - _PROX_MARGIN or
-                           min(s[0], e[0]) > _cand_x1 + _PROX_MARGIN or
-                           max(s[1], e[1]) < _cand_y0 - _PROX_MARGIN or
-                           min(s[1], e[1]) > _cand_y1 + _PROX_MARGIN)]
+    if line_grid is not None:
+        _gx0 = int((_cand_x0 - _PROX_MARGIN) / 50)
+        _gx1 = int((_cand_x1 + _PROX_MARGIN) / 50)
+        _gy0 = int((_cand_y0 - _PROX_MARGIN) / 50)
+        _gy1 = int((_cand_y1 + _PROX_MARGIN) / 50)
+        _cand = []
+        for _gx in range(_gx0, _gx1 + 1):
+            for _gy in range(_gy0, _gy1 + 1):
+                _cand.extend(line_grid.get((_gx, _gy), []))
+        _near_lines = [(s, e) for (s, e) in _cand
+                       if not (max(s[0], e[0]) < _cand_x0 - _PROX_MARGIN or
+                               min(s[0], e[0]) > _cand_x1 + _PROX_MARGIN or
+                               max(s[1], e[1]) < _cand_y0 - _PROX_MARGIN or
+                               min(s[1], e[1]) > _cand_y1 + _PROX_MARGIN)]
+    else:
+        _near_lines = [(s, e) for (s, e) in lines
+                       if not (max(s[0], e[0]) < _cand_x0 - _PROX_MARGIN or
+                               min(s[0], e[0]) > _cand_x1 + _PROX_MARGIN or
+                               max(s[1], e[1]) < _cand_y0 - _PROX_MARGIN or
+                               min(s[1], e[1]) > _cand_y1 + _PROX_MARGIN)]
 
     # 超出视图/图纸边界：渐进重惩罚（超出越多扣越多，确保图内位置永远优先）
     # margin 80 给标注留缓冲空间
@@ -818,7 +850,7 @@ def _score_placement(wx, wy, angle_deg, dist, lines, text_bboxes, circles,
     for (pbx0, pbx1, pby0, pby1) in placed_bboxes:
         if _seg_cross_rect((ex, ey), (hx, hy), pbx0, pbx1, pby0, pby1):
             score -= 80
-  
+
     # 斜引线穿过文字框：扣60
     for (tx0, tx1, ty0, ty1) in text_bboxes:
         if _seg_cross_rect((wx, wy), (ex, ey), tx0, tx1, ty0, ty1):
@@ -828,7 +860,7 @@ def _score_placement(wx, wy, angle_deg, dist, lines, text_bboxes, circles,
     for (pbx0, pbx1, pby0, pby1) in placed_bboxes:
         if _seg_cross_rect((wx, wy), (ex, ey), pbx0, pbx1, pby0, pby1):
             score -= 40
-  
+
     # 斜引线靠近文字框但不穿过：扣30
     _DIAG_PROX_MARGIN = 3.0
     for (tx0, tx1, ty0, ty1) in text_bboxes:
