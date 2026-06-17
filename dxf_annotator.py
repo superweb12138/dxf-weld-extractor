@@ -117,11 +117,27 @@ def _collect_all_obstacles(doc, view_id):
                 th = 2.0
                 tw = th * len(str(getattr(e.dxf, 'text', ''))) * 0.7
                 mrg = 1.5
-                text_bboxes.append((tx - mrg, tx + max(tw, 8) + mrg, ty - mrg, ty + th + mrg))
+                text_bboxes.append((tx - mrg, tx + max(tw, 12) + mrg, ty - mrg, ty + th + mrg))
             except Exception:
                 pass
         elif t == 'HATCH':
-            pass
+            try:
+                for path in e.paths:
+                    for v in path.vertices:
+                        circles.append((float(v[0]), float(v[1]), 0.5))
+            except Exception:
+                pass
+        elif t == 'LEADER':
+            try:
+                txt = str(getattr(e.dxf, 'text', '')) or ''
+                if txt:
+                    tx, ty = e.dxf.insert.x, e.dxf.insert.y
+                    th = 2.0
+                    tw = th * len(txt) * 0.7
+                    mrg = 1.5
+                    text_bboxes.append((tx - mrg, tx + tw + mrg, ty - mrg, ty + th + mrg))
+            except Exception:
+                pass
         elif t in ('ATTDEF', 'ATTRIB'):
             try:
                 tx, ty = e.dxf.insert.x, e.dxf.insert.y
@@ -693,13 +709,13 @@ def _search_placement(weld_pos, cx, cy, lines, text_bboxes, circles, placed_bbox
         _vcy = (vy0 + vy1) / 2
         p = 0
         if wx < _vcx and ca >= -0.05:
-            p += 80
+            p += 160
         elif wx >= _vcx and ca < -0.05:
-            p += 80
+            p += 160
         if wy > _vcy and sa < -0.05:
-            p += 40
+            p += 80
         elif wy < _vcy and sa > 0.05:
-            p += 40
+            p += 80
         return p
 
     def _search_pass(_draw_bbox):
@@ -882,9 +898,11 @@ def _score_placement(wx, wy, angle_deg, dist, lines, text_bboxes, circles,
         if bx1 > pbx0 - _OVERLAP_MARGIN and bx0 < pbx1 + _OVERLAP_MARGIN and by1 > pby0 - _OVERLAP_MARGIN and by0 < pby1 + _OVERLAP_MARGIN:
             score -= 120
  
-    # 文字与几何线过近：扣30（检测4个角点）
+    # 文字与几何线过近：扣30（检测4个角点+4条边中点）
     _LINE_MARGIN = 4.0
-    _txt_sample_pts = [(bx0, by0), (bx1, by0), (bx0, by1), (bx1, by1)]
+    _txt_sample_pts = [(bx0, by0), (bx1, by0), (bx0, by1), (bx1, by1),
+                       ((bx0+bx1)/2, by0), ((bx0+bx1)/2, by1),
+                       (bx0, (by0+by1)/2), (bx1, (by0+by1)/2)]
     for (sx, sy), (ex2, ey2) in _near_lines:
         if bx1 < min(sx, ex2) - _LINE_MARGIN: continue
         if bx0 > max(sx, ex2) + _LINE_MARGIN: continue
@@ -1004,7 +1022,7 @@ def _resolve_label_conflicts(msp, lines, text_bboxes, circles,
                     continue
                 # 有重叠：微调距离
                 _fixed = False
-                for d_dist in [2, -2, 4, -4]:
+                for d_dist in [2, -2, 4, -4, 8, -8, 12, -12]:
                     nd = ds_j + d_dist
                     if nd < 8 or nd > 55:
                         continue
