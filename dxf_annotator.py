@@ -614,10 +614,10 @@ def _draw_weld_label(msp, label, weld_pos, dname, diag_len, angle_deg):
                  dxfattribs={'layer': LAYER_NAME, 'color': LABEL_COLOR})
 
     if h_land >= 0:
-        ap = MT_BOTTOM_LEFT
+        ap = MT_BOTTOM_RIGHT
         lx = hx
     else:
-        ap = MT_BOTTOM_RIGHT
+        ap = MT_BOTTOM_LEFT
         lx = hx
     msp.add_mtext(label, dxfattribs={
         'layer': LAYER_NAME, 'color': LABEL_COLOR,
