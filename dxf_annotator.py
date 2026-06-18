@@ -745,30 +745,46 @@ def _search_placement(weld_pos, lines, text_bboxes, circles, placed_bboxes,
                 _line_grid.setdefault((_gx, _gy), []).append((_s, _e))
 
     def _fine_tune(dist, angle, _draw_bbox):
-        """在给定角度附近以2°步长精调，返回更优结果。"""
-        _best = (angle, _score_placement(wx, wy, angle, dist, lines, text_bboxes,
-                                         circles, placed_bboxes, placed_text_bboxes,
-                                         vx0, vy0, vx1, vy1,
-                                         _draw_bbox, is_pair=is_pair, min_score=-999999999,
-                                         line_grid=_line_grid))
+        """精调角度和距离组合，优先选短距离。"""
+        _best_ang = angle
+        _best_dist = dist
+        _best_s = _score_placement(wx, wy, angle, dist, lines, text_bboxes,
+                                   circles, placed_bboxes, placed_text_bboxes,
+                                   vx0, vy0, vx1, vy1,
+                                   _draw_bbox, is_pair=is_pair, min_score=-999999999,
+                                   line_grid=_line_grid)
         for d_angle in [-10, -8, -6, -4, -2, 2, 4, 6, 8, 10]:
-            a = angle + d_angle
-            s = _score_placement(wx, wy, a, dist, lines, text_bboxes,
+            na = angle + d_angle
+            s = _score_placement(wx, wy, na, dist, lines, text_bboxes,
                                  circles, placed_bboxes, placed_text_bboxes,
                                  vx0, vy0, vx1, vy1,
-                                 _draw_bbox, is_pair=is_pair, min_score=_best[1],
+                                 _draw_bbox, is_pair=is_pair, min_score=_best_s,
                                  line_grid=_line_grid)
-            if s > _best[1]:
-                _best = (a, s)
-        return _best[0], _best[1]
+            if s > _best_s:
+                _best_ang, _best_s = na, s
+        for nd_off in range(-2, -(dist - 7), -2):
+            nd = dist + nd_off
+            if nd < 8: continue
+            for na_off in range(-8, 9, 2):
+                na = _best_ang + na_off
+                s = _score_placement(wx, wy, na, nd, lines, text_bboxes,
+                                     circles, placed_bboxes, placed_text_bboxes,
+                                     vx0, vy0, vx1, vy1,
+                                     _draw_bbox, is_pair=is_pair, min_score=_best_s,
+                                     line_grid=_line_grid)
+                if s > _best_s:
+                    _best_ang, _best_dist, _best_s = na, nd, s
+        return _best_ang, _best_dist, _best_s
 
     def _angle_outward_penalty(angle_deg, wx, wy, vcx, vcy):
-        """渐进惩罚：偏离理想朝外方向越远扣分越多。"""
+        """分区惩罚：±60°自由区，≥90°跨半球硬性阻止。"""
         ideal = math.degrees(math.atan2(wy - vcy, wx - vcx)) % 360
         diff = abs((angle_deg - ideal + 180) % 360 - 180)
-        if diff <= 45:
+        if diff <= 60:
             return 0
-        return (diff - 45) * 3
+        if diff >= 90:
+            return 2000
+        return (diff - 60) * 66
 
     def _search_pass(_draw_bbox):
         """360°连续扫描：36角度 × 27距离，选最高分。"""
@@ -798,8 +814,8 @@ def _search_placement(weld_pos, lines, text_bboxes, circles, placed_bboxes,
                     _best_result = (angle_deg, dist, 0)
 
         _bd, _bdst, _ = _best_result
-        _fa, _fs = _fine_tune(_bdst, _bd, _draw_bbox)
-        return _fs, (_fa, _bdst, 0)
+        _fa, _fd, _fs = _fine_tune(_bdst, _bd, _draw_bbox)
+        return _fs, (_fa, _fd, 0)
 
     score, result = _search_pass(draw_bbox)
     return 0, result[1], result[0]
@@ -901,6 +917,11 @@ def _score_placement(wx, wy, angle_deg, dist, lines, text_bboxes, circles,
         if _seg_cross_rect((wx, wy), (ex, ey), pbx0, pbx1, pby0, pby1):
             score -= 200
 
+    # 斜引线穿过已放置标注文字：扣2000（硬性惩罚）
+    for k, otb in enumerate(placed_text_bboxes):
+        if _seg_cross_rect((wx, wy), (ex, ey), otb[0], otb[1], otb[2], otb[3]):
+            score -= 2000
+
     # 斜引线靠近文字框但不穿过：扣30
     _DIAG_PROX_MARGIN = 3.0
     for (tx0, tx1, ty0, ty1) in text_bboxes:
@@ -956,7 +977,7 @@ def _score_placement(wx, wy, angle_deg, dist, lines, text_bboxes, circles,
 
     # 距离惩罚：越远越不推荐（避免延伸出图）
     if dist > 30:
-        score -= (dist - 30) * 1.5
+        score -= (dist - 30) * 3
 
     return score
 
@@ -1080,6 +1101,12 @@ def _resolve_label_conflicts(msp, lines, text_bboxes, circles,
         # 斜引线与图纸文字框交叉
         for (tx0, tx1, ty0, ty1) in text_bboxes:
             if _seg_cross_rect((wx, wy), (ex, ey), tx0, tx1, ty0, ty1):
+                return None
+
+        # 斜引线与已放置标注文字框交叉
+        for k, otb in enumerate(placed_text_bboxes):
+            if k == skip_idx: continue
+            if _seg_cross_rect((wx, wy), (ex, ey), otb[0], otb[1], otb[2], otb[3]):
                 return None
 
         # 文字与圆/弧重叠
