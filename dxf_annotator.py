@@ -744,78 +744,106 @@ def _search_placement(weld_pos, lines, text_bboxes, circles, placed_bboxes,
             for _gy in range(_gy0, _gy1 + 1):
                 _line_grid.setdefault((_gx, _gy), []).append((_s, _e))
 
-    def _fine_tune(dist, angle, _draw_bbox):
-        """精调角度和距离组合，优先选短距离。"""
-        _best_ang = angle
-        _best_dist = dist
-        _best_s = _score_placement(wx, wy, angle, dist, lines, text_bboxes,
-                                   circles, placed_bboxes, placed_text_bboxes,
-                                   vx0, vy0, vx1, vy1,
-                                   _draw_bbox, is_pair=is_pair, min_score=-999999999,
-                                   line_grid=_line_grid)
-        for d_angle in [-10, -8, -6, -4, -2, 2, 4, 6, 8, 10]:
-            na = angle + d_angle
-            s = _score_placement(wx, wy, na, dist, lines, text_bboxes,
-                                 circles, placed_bboxes, placed_text_bboxes,
-                                 vx0, vy0, vx1, vy1,
-                                 _draw_bbox, is_pair=is_pair, min_score=_best_s,
-                                 line_grid=_line_grid)
-            if s > _best_s:
-                _best_ang, _best_s = na, s
-        for nd_off in range(-2, -(dist - 7), -2):
-            nd = dist + nd_off
+    def _has_conflict(angle_deg, dist, _db):
+        """True if position has any critical conflict (text overlap, line cross, boundary)."""
+        rad = math.radians(angle_deg)
+        cos_a, sin_a = math.cos(rad), math.sin(rad)
+        ex = wx + dist * cos_a
+        ey = wy + dist * sin_a
+        h_len = PAIR_HORIZ_LAND if is_pair else HORIZ_LAND
+        h_land = h_len if cos_a >= -0.05 else -h_len
+        hx = ex + h_land; hy = ey
+        lw = LABEL_HEIGHT * (6.5 if is_pair else 3.2)
+        bx0 = hx if h_land >= 0 else hx - lw
+        bx1 = hx + lw if h_land >= 0 else hx
+        by0, by1 = hy, hy + LABEL_HEIGHT
+        nbb = (min(wx, ex, bx0), max(wx, ex, bx1),
+               min(wy, ey, by0), max(wy, ey, by1))
+        if not _bbox_in_boundary(nbb, vx0, vy0, vx1, vy1, _db):
+            return True
+        for otb in placed_text_bboxes:
+            if not (bx1 < otb[0] - 8 or bx0 > otb[1] + 8 or by1 < otb[2] - 8 or by0 > otb[3] + 8):
+                return True
+        for (tx0, tx1, ty0, ty1) in text_bboxes:
+            if not (bx1 < tx0 - 8 or bx0 > tx1 + 8 or by1 < ty0 - 8 or by0 > ty1 + 8):
+                return True
+        for (tx0, tx1, ty0, ty1) in text_bboxes:
+            if _seg_cross_rect((wx, wy), (ex, ey), tx0, tx1, ty0, ty1):
+                return True
+        for otb in placed_text_bboxes:
+            if _seg_cross_rect((wx, wy), (ex, ey), otb[0], otb[1], otb[2], otb[3]):
+                return True
+        for otb in placed_text_bboxes:
+            if _seg_cross_rect((ex, ey), (hx, hy), otb[0], otb[1], otb[2], otb[3]):
+                return True
+        _min_x = min(wx, ex, hx, bx0); _max_x = max(wx, ex, hx, bx1)
+        _min_y = min(wy, ey, hy, by0); _max_y = max(wy, ey, hy, by1)
+        _mrg = 15
+        _gx0 = int((_min_x - _mrg) / 50); _gx1 = int((_max_x + _mrg) / 50)
+        _gy0 = int((_min_y - _mrg) / 50); _gy1 = int((_max_y + _mrg) / 50)
+        _near = []
+        for _gx in range(_gx0, _gx1 + 1):
+            for _gy in range(_gy0, _gy1 + 1):
+                _near.extend(_line_grid.get((_gx, _gy), []))
+        for (sx, sy), (ex2, ey2) in _near:
+            if not (max(sx, ex2) < _min_x - _mrg or min(sx, ex2) > _max_x + _mrg or
+                    max(sy, ey2) < _min_y - _mrg or min(sy, ey2) > _max_y + _mrg):
+                if _segments_cross_((ex, ey), (hx, hy), (sx, sy), (ex2, ey2)):
+                    return True
+                if _segments_cross_((wx, wy), (ex, ey), (sx, sy), (ex2, ey2)):
+                    return True
+        for (ccx, ccy, cr) in circles:
+            if not (bx1 < ccx - cr or bx0 > ccx + cr or by1 < ccy - cr or by0 > ccy + cr):
+                return True
+        return False
+
+    def _fine_tune(dist, angle, _db):
+        """Find shorter clean position near the given one."""
+        _ang, _dst = angle, dist
+        for da in [-8, -6, -4, -2, 2, 4, 6, 8]:
+            if not _has_conflict(angle + da, dist, _db):
+                _ang = angle + da; break
+        for nd in range(dist - 2, 7, -2):
             if nd < 8: continue
-            for na_off in range(-8, 9, 2):
-                na = _best_ang + na_off
-                s = _score_placement(wx, wy, na, nd, lines, text_bboxes,
-                                     circles, placed_bboxes, placed_text_bboxes,
-                                     vx0, vy0, vx1, vy1,
-                                     _draw_bbox, is_pair=is_pair, min_score=_best_s,
-                                     line_grid=_line_grid)
-                if s > _best_s:
-                    _best_ang, _best_dist, _best_s = na, nd, s
-        return _best_ang, _best_dist, _best_s
+            for na_off in range(-6, 7, 2):
+                if not _has_conflict(_ang + na_off, nd, _db):
+                    _ang, _dst = _ang + na_off, nd; break
+        return _ang, _dst, 0
 
-    def _angle_outward_penalty(angle_deg, wx, wy, vcx, vcy):
-        """分区惩罚：±60°自由区，≥90°跨半球硬性阻止。"""
-        ideal = math.degrees(math.atan2(wy - vcy, wx - vcx)) % 360
-        diff = abs((angle_deg - ideal + 180) % 360 - 180)
-        if diff <= 60:
-            return 0
-        if diff >= 90:
-            return 2000
-        return (diff - 60) * 66
-
-    def _search_pass(_draw_bbox):
-        """360°连续扫描：36角度 × 27距离，选最高分。"""
+    def _search_pass(_db):
+        """推挤式搜索：从最短距离开始，有冲突才扩展。"""
         distances = list(range(8, 56, 2)) + [60, 72, 96]
         if is_pair:
             distances = [d + 4 for d in distances]
-
         _vcx = (vx0 + vx1) / 2
         _vcy = (vy0 + vy1) / 2
         _ideal_ang = math.degrees(math.atan2(wy - _vcy, wx - _vcx)) % 360
-
+        for dist in distances:
+            if not _has_conflict(_ideal_ang, dist, _db):
+                _fa, _fd, _fs = _fine_tune(dist, _ideal_ang, _db)
+                return _fs, (_fa, _fd, 0)
+        for step in range(1, 19):
+            for sign in (1, -1):
+                angle = (_ideal_ang + sign * step * 10) % 360
+                for dist in distances:
+                    if not _has_conflict(angle, dist, _db):
+                        _fa, _fd, _fs = _fine_tune(dist, angle, _db)
+                        return _fs, (_fa, _fd, 0)
         _best_score = -999999999
         _best_result = (_ideal_ang, min(distances), 0)
-
         for dist in distances:
-            for _off in range(0, 360, 8):
-                angle_deg = (_ideal_ang + _off) % 360
-                score = _score_placement(wx, wy, angle_deg, dist, lines, text_bboxes,
+            for _off in range(0, 360, 10):
+                angle = (_ideal_ang + _off) % 360
+                score = _score_placement(wx, wy, angle, dist, lines, text_bboxes,
                                          circles, placed_bboxes, placed_text_bboxes,
                                          vx0, vy0, vx1, vy1,
-                                         _draw_bbox, is_pair=is_pair, min_score=_best_score,
+                                         _db, is_pair=is_pair, min_score=_best_score,
                                          line_grid=_line_grid)
-                _ap = _angle_outward_penalty(angle_deg, wx, wy, _vcx, _vcy)
-                _bonus = max(0, 30 - dist) * 3
-                _adj_score = score - _ap - dist * 0.5 + _bonus
-                if _adj_score > _best_score:
-                    _best_score = _adj_score
-                    _best_result = (angle_deg, dist, 0)
-
+                if score > _best_score:
+                    _best_score = score
+                    _best_result = (angle, dist, 0)
         _bd, _bdst, _ = _best_result
-        _fa, _fd, _fs = _fine_tune(_bdst, _bd, _draw_bbox)
+        _fa, _fd, _fs = _fine_tune(_bdst, _bd, _db)
         return _fs, (_fa, _fd, 0)
 
     score, result = _search_pass(draw_bbox)
