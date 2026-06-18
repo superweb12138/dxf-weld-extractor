@@ -856,7 +856,7 @@ def _search_placement(weld_pos, cx, cy, lines, text_bboxes, circles, placed_bbox
         return p
 
     def _search_pass(_draw_bbox):
-        """搜索：短距离优先，找到无冲突后尽早退出。"""
+        """搜索：遍历所有候选，选最高分（而非第一个无冲突即退出）。"""
         priority = _direction_priority(wx, wy, cx, cy) if force_direction is None else force_direction
         distances = [10, 14, 18, 22, 26, 30, 36, 48, 60, 72, 96]
         if is_pair:
@@ -881,9 +881,8 @@ def _search_placement(weld_pos, cx, cy, lines, text_bboxes, circles, placed_bbox
                     _hp = _hemi_penalty(angle_deg)
                     if force_direction is not None and dname in force_direction:
                         _hp = 0
+                    # 记录无冲突跨半球候选
                     if score >= 0:
-                        if _hp == 0:
-                            return score, (dname, dist, angle_deg)
                         if _cross_fallback is None:
                             _cross_fallback = (score, (dname, dist, angle_deg))
                     _dr = _dir_rank.get(dname, 99)
@@ -906,9 +905,6 @@ def _search_placement(weld_pos, cx, cy, lines, text_bboxes, circles, placed_bbox
                     if force_direction is not None and dname in force_direction:
                         _hp = 0
                     if score >= 0:
-                        if _hp == 0:
-                            _fa, _fs = _fine_tune(dist, angle_deg, _draw_bbox)
-                            return _fs, (dname, dist, _fa)
                         if _cross_fallback is None:
                             _cross_fallback = (score, (dname, dist, angle_deg))
                     _dr = _dir_rank.get(dname, 99)
@@ -922,25 +918,26 @@ def _search_placement(weld_pos, cx, cy, lines, text_bboxes, circles, placed_bbox
                     _cf_score, _cf_result = _cross_fallback
                     # 无冲突跨半球位置（score>=0）始终优于有冲突的同半球位置
                     if _cf_score >= 0:
-                        return _cf_score, _cf_result
+                        # 对跨半球最佳候选做精调
+                        _fa, _fs = _fine_tune(_cf_result[1], _cf_result[2], _draw_bbox)
+                        return _fs, (_cf_result[0], _cf_result[1], _fa)
                     _cf_hp = _hemi_penalty(_cf_result[2])
                     _cf_dr = _dir_rank.get(_cf_result[0], 99)
                     _cf_adj = _cf_score - _cf_hp - _cf_result[1] * 0.5 - _cf_dr * 0.1
                     if _cf_adj > _best_score:
-                        return _cf_score, _cf_result
+                        _fa, _fs = _fine_tune(_cf_result[1], _cf_result[2], _draw_bbox)
+                        return _fs, (_cf_result[0], _cf_result[1], _fa)
                 return _best_score, _best_result
 
+        # 所有距离遍历完毕，对最优候选做精调并返回
+        _bd, _bdst, _bda = _best_result
+        _fa, _fs = _fine_tune(_bdst, _bda, _draw_bbox)
         if _cross_fallback is not None:
             _cf_score, _cf_result = _cross_fallback
-            # 无冲突跨半球位置始终优于有冲突位置
-            if _cf_score >= 0:
-                return _cf_score, _cf_result
-            _cf_hp = _hemi_penalty(_cf_result[2])
-            _cf_dr = _dir_rank.get(_cf_result[0], 99)
-            _cf_adj = _cf_score - _cf_hp - _cf_result[1] * 0.5 - _cf_dr * 0.1
-            if _cf_adj > _best_score:
-                return _cf_score, _cf_result
-        return _best_score, _best_result
+            _cf_fa, _cf_fs = _fine_tune(_cf_result[1], _cf_result[2], _draw_bbox)
+            if _cf_fs > _fs:
+                return _cf_fs, (_cf_result[0], _cf_result[1], _cf_fa)
+        return _fs, (_bd, _bdst, _fa)
 
     score, result = _search_pass(draw_bbox)
     # 若所有候选均无冲突正分，选最优负分返回（二级回退已不需要）
@@ -1038,10 +1035,10 @@ def _score_placement(wx, wy, angle_deg, dist, lines, text_bboxes, circles,
         if _seg_cross_rect((wx, wy), (ex, ey), tx0, tx1, ty0, ty1):
             score -= 60
   
-    # 斜引线穿过已放置标注：扣40
+    # 斜引线穿过已放置标注：扣200（防止引线与文字交错）
     for (pbx0, pbx1, pby0, pby1) in placed_bboxes:
         if _seg_cross_rect((wx, wy), (ex, ey), pbx0, pbx1, pby0, pby1):
-            score -= 40
+            score -= 200
 
     # 斜引线靠近文字框但不穿过：扣30
     _DIAG_PROX_MARGIN = 3.0
