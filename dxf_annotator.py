@@ -792,6 +792,15 @@ def _search_placement(weld_pos, lines, text_bboxes, circles, placed_bboxes,
                     return True
                 if _segments_cross_((wx, wy), (ex, ey), (sx, sy), (ex2, ey2)):
                     return True
+        # 文字与几何线过近
+        _line_mrg = 3.0
+        _txt_pts = [(bx0, by0), (bx1, by0), (bx0, by1), (bx1, by1),
+                    ((bx0+bx1)/2, by0), ((bx0+bx1)/2, by1),
+                    (bx0, (by0+by1)/2), (bx1, (by0+by1)/2)]
+        for (sx, sy), (ex2, ey2) in _near:
+            for (cx, cy) in _txt_pts:
+                if _dist_pt_to_seg((cx, cy), (sx, sy), (ex2, ey2))[0] < _line_mrg:
+                    return True
         for (ccx, ccy, cr) in circles:
             if not (bx1 < ccx - cr or bx0 > ccx + cr or by1 < ccy - cr or by0 > ccy + cr):
                 return True
