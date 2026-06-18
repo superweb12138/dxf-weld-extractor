@@ -568,7 +568,7 @@ def _annotate_view(msp, welds, view_id, bbox, part_centroids, f_counter, w_count
                       _next_label(ww_b, f_counter, w_counter)]
             _force_dir = None
             for _pp in placed_positions:
-                if abs(wp_a[0] - _pp[0][0]) < 2.5 and abs(wp_a[1] - _pp[0][1]) < 30.0:
+                if (wp_a[0] < cx) == (_pp[0][0] < cx) and abs(wp_a[1] - _pp[0][1]) < 30.0:
                     _force_dir = _force_opposite_dir(_pp[1])
                     break
             _use_cx_pair = cx
@@ -596,7 +596,7 @@ def _annotate_view(msp, welds, view_id, bbox, part_centroids, f_counter, w_count
                 _use_cx = wp[0] + (wp[0] - cx)
             _force_dir = None
             for _pp in placed_positions:
-                if abs(wp[0] - _pp[0][0]) < 2.5 and abs(wp[1] - _pp[0][1]) < 30.0:
+                if (wp[0] < cx) == (_pp[0][0] < cx) and abs(wp[1] - _pp[0][1]) < 30.0:
                     _force_dir = _force_opposite_dir(_pp[1])
                     break
             if _force_dir is not None:
@@ -1297,6 +1297,21 @@ def _resolve_label_conflicts(msp, lines, text_bboxes, circles,
                                     break
                             if _fixed: break
                     if _fixed: break
+
+                    # --- 全局重新搜索（兜底）---
+                    _cx = (vx0 + vx1) / 2
+                    _cy = (vy0 + vy1) / 2
+                    _dn, _ds, _ag = _search_placement(
+                        pos, _cx, _cy, lines, text_bboxes, circles,
+                        [p[7] for p in placements], placed_text_bboxes,
+                        vx0, vy0, vx1, vy1, draw_bbox,
+                        is_pair=(g == 'pair'), force_direction=None)
+                    _re_result = _adjust_safe(target, pos, _dn, _ds, _ag, g, target)
+                    if _re_result:
+                        _nbb, _tbb = _re_result
+                        placements[target] = (g, it, lb, pos, _dn, _ds, _ag, _nbb)
+                        placed_text_bboxes[target] = _tbb
+                        _fixed = True
 
                 if _fixed:
                     _any_fix = True
