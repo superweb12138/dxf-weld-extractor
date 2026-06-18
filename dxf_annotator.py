@@ -800,7 +800,7 @@ def _search_placement(weld_pos, lines, text_bboxes, circles, placed_bboxes,
         _best_result = (_ideal_ang, min(distances), 0)
 
         for dist in distances:
-            for _off in range(0, 360, 5):
+            for _off in range(0, 360, 8):
                 angle_deg = (_ideal_ang + _off) % 360
                 score = _score_placement(wx, wy, angle_deg, dist, lines, text_bboxes,
                                          circles, placed_bboxes, placed_text_bboxes,
@@ -808,7 +808,8 @@ def _search_placement(weld_pos, lines, text_bboxes, circles, placed_bboxes,
                                          _draw_bbox, is_pair=is_pair, min_score=_best_score,
                                          line_grid=_line_grid)
                 _ap = _angle_outward_penalty(angle_deg, wx, wy, _vcx, _vcy)
-                _adj_score = score - _ap - dist * 0.5
+                _bonus = max(0, 30 - dist) * 3
+                _adj_score = score - _ap - dist * 0.5 + _bonus
                 if _adj_score > _best_score:
                     _best_score = _adj_score
                     _best_result = (angle_deg, dist, 0)
