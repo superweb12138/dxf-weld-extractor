@@ -933,16 +933,16 @@ def _score_placement(wx, wy, angle_deg, dist, lines, text_bboxes, circles,
             if not _seg_cross_rect((wx, wy), (ex, ey), tx0, tx1, ty0, ty1):
                 score -= 30
 
-    # 文字与已有文字框重叠：扣120（间距8.0）
+    # 文字与已有文字框重叠：扣2000（不可接受）
     _OVERLAP_MARGIN = 8.0
     for (tx0, tx1, ty0, ty1) in text_bboxes:
         if bx1 > tx0 - _OVERLAP_MARGIN and bx0 < tx1 + _OVERLAP_MARGIN and by1 > ty0 - _OVERLAP_MARGIN and by0 < ty1 + _OVERLAP_MARGIN:
-            score -= 120
- 
-    # 文字与已放置标注文字重叠：扣120（只检测纯文字框，不含引线）
+            score -= 2000
+
+    # 文字与已放置标注文字重叠：扣2000（不可接受）
     for (pbx0, pbx1, pby0, pby1) in placed_text_bboxes:
         if bx1 > pbx0 - _OVERLAP_MARGIN and bx0 < pbx1 + _OVERLAP_MARGIN and by1 > pby0 - _OVERLAP_MARGIN and by0 < pby1 + _OVERLAP_MARGIN:
-            score -= 120
+            score -= 2000
  
     # 文字与几何线过近：扣30（检测4个角点+4条边中点）
     _LINE_MARGIN = 4.0
