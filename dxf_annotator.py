@@ -814,6 +814,22 @@ def _search_placement(weld_pos, lines, text_bboxes, circles, placed_bboxes,
                     _best_result = (angle_deg, dist, 0)
 
         _bd, _bdst, _ = _best_result
+        # 短距离宽角扫描：为短距离寻找不同角度
+        for nd in range(_bdst - 2, 7, -2):
+            if nd < 8: continue
+            for na_off in range(-20, 21, 5):
+                na = _bd + na_off
+                score = _score_placement(wx, wy, na, nd, lines, text_bboxes,
+                                         circles, placed_bboxes, placed_text_bboxes,
+                                         vx0, vy0, vx1, vy1,
+                                         _draw_bbox, is_pair=is_pair, min_score=_best_score,
+                                         line_grid=_line_grid)
+                _ap = _angle_outward_penalty(na, wx, wy, _vcx, _vcy)
+                _adj_score = score - _ap - nd * 0.5
+                if _adj_score > _best_score:
+                    _best_score = _adj_score
+                    _best_result = (na, nd, 0)
+        _bd, _bdst, _ = _best_result
         _fa, _fd, _fs = _fine_tune(_bdst, _bd, _draw_bbox)
         return _fs, (_fa, _fd, 0)
 
