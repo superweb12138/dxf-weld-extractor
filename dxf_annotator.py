@@ -800,7 +800,7 @@ def _search_placement(weld_pos, lines, text_bboxes, circles, placed_bboxes,
         _best_result = (_ideal_ang, min(distances), 0)
 
         for dist in distances:
-            for _off in range(0, 360, 10):
+            for _off in range(0, 360, 5):
                 angle_deg = (_ideal_ang + _off) % 360
                 score = _score_placement(wx, wy, angle_deg, dist, lines, text_bboxes,
                                          circles, placed_bboxes, placed_text_bboxes,
@@ -813,22 +813,6 @@ def _search_placement(weld_pos, lines, text_bboxes, circles, placed_bboxes,
                     _best_score = _adj_score
                     _best_result = (angle_deg, dist, 0)
 
-        _bd, _bdst, _ = _best_result
-        # 短距离宽角扫描：为短距离寻找不同角度
-        for nd in range(_bdst - 2, 7, -2):
-            if nd < 8: continue
-            for na_off in range(-20, 21, 5):
-                na = _bd + na_off
-                score = _score_placement(wx, wy, na, nd, lines, text_bboxes,
-                                         circles, placed_bboxes, placed_text_bboxes,
-                                         vx0, vy0, vx1, vy1,
-                                         _draw_bbox, is_pair=is_pair, min_score=_best_score,
-                                         line_grid=_line_grid)
-                _ap = _angle_outward_penalty(na, wx, wy, _vcx, _vcy)
-                _adj_score = score - _ap - nd * 0.5
-                if _adj_score > _best_score:
-                    _best_score = _adj_score
-                    _best_result = (na, nd, 0)
         _bd, _bdst, _ = _best_result
         _fa, _fd, _fs = _fine_tune(_bdst, _bd, _draw_bbox)
         return _fs, (_fa, _fd, 0)
@@ -1068,6 +1052,21 @@ def _resolve_label_conflicts(msp, lines, text_bboxes, circles,
     """全局后处理：检测标注间的文字重叠并进行综合微调（距离/角度/方向翻转/双向调整）。"""
     _OVERLAP_MARGIN = 8.0
 
+    def _leader_crosses_text(pos, dist, angle, gtype, tb):
+        """检查斜引线或水平接地线是否穿过文字框 tb。"""
+        rad = math.radians(angle)
+        ex = pos[0] + dist * math.cos(rad)
+        ey = pos[1] + dist * math.sin(rad)
+        h_len = PAIR_HORIZ_LAND if gtype == 'pair' else HORIZ_LAND
+        h_land = h_len if math.cos(rad) >= -0.05 else -h_len
+        hx = ex + h_land
+        hy = ey
+        if _seg_cross_rect(pos, (ex, ey), tb[0], tb[1], tb[2], tb[3]):
+            return True
+        if _seg_cross_rect((ex, ey), (hx, hy), tb[0], tb[1], tb[2], tb[3]):
+            return True
+        return False
+
     def _adjust_safe(idx, pos, dname, dist, angle, gtype, skip_idx):
         """检查调整后的位置是否安全（文字无重叠、引线不穿几何线/文字）。"""
         if gtype == 'pair':
@@ -1125,6 +1124,12 @@ def _resolve_label_conflicts(msp, lines, text_bboxes, circles,
             if _seg_cross_rect((wx, wy), (ex, ey), otb[0], otb[1], otb[2], otb[3]):
                 return None
 
+        # 水平接地线与已放置标注文字框交叉
+        for k, otb in enumerate(placed_text_bboxes):
+            if k == skip_idx: continue
+            if _seg_cross_rect((ex, ey), (hx, hy), otb[0], otb[1], otb[2], otb[3]):
+                return None
+
         # 文字与圆/弧重叠
         for (ccx, ccy, cr) in circles:
             if not (_tbb[1] < ccx - cr or _tbb[0] > ccx + cr or
@@ -1146,7 +1151,10 @@ def _resolve_label_conflicts(msp, lines, text_bboxes, circles,
                     tbb_i[0] > tbb_j[1] + _OVERLAP_MARGIN or
                     tbb_i[3] < tbb_j[2] - _OVERLAP_MARGIN or
                     tbb_i[2] > tbb_j[3] + _OVERLAP_MARGIN):
-                    continue
+                    # 文字不重叠，检查引线是否穿过对方文字
+                    if not (_leader_crosses_text(pos_i, ds_i, ag_i, gi, tbb_j) or
+                            _leader_crosses_text(pos_j, ds_j, ag_j, gj, tbb_i)):
+                        continue
 
                 _fixed = False
 
