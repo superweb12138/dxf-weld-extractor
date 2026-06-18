@@ -802,7 +802,7 @@ def _search_placement(weld_pos, lines, text_bboxes, circles, placed_bboxes,
         return _fs, (_fa, _bdst, 0)
 
     score, result = _search_pass(draw_bbox)
-    return result[0], result[1], result[2]
+    return 0, result[1], result[0]
 
 
 def _score_placement(wx, wy, angle_deg, dist, lines, text_bboxes, circles,
