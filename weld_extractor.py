@@ -71,12 +71,15 @@ COMP_CONFIG = {
     },
     'CO009': {
         'x2_instances': {'p15','p144'},
+        'x2_mirror_axis': {'p144': 'y'},
     },
     'CO007': {
+        'allow_synthetic': True,
         'pp_bridge_exclude': {'p125'},
     },
     'CO006': {},
     'CO008': {
+        'allow_synthetic': True,
         'pp_bridge_exclude': {'p125'},
         'relabel_cp_to_pp': [('p102','p124',308)],
     },
@@ -877,14 +880,21 @@ def extract_welds(dxf_path):
 
     # Helper: compute midpoint of merged edge fragments (proper centroid of all fragments)
     def _merged_edge_mid(frags):
-        all_xs = []
-        all_ys = []
+        total_w = 0.0
+        cx = 0.0
+        cy = 0.0
         for gf in frags:
-            all_xs.extend([gf['start'][0], gf['end'][0]])
-            all_ys.extend([gf['start'][1], gf['end'][1]])
-        if not all_xs:
+            dx = gf['end'][0] - gf['start'][0]
+            dy = gf['end'][1] - gf['start'][1]
+            length = math.hypot(dx, dy)
+            if length < 1e-12:
+                continue
+            cx += (gf['start'][0] + gf['end'][0]) / 2 * length
+            cy += (gf['start'][1] + gf['end'][1]) / 2 * length
+            total_w += length
+        if total_w < 1e-12:
             return (0, 0)
-        return ((min(all_xs) + max(all_xs)) / 2, (min(all_ys) + max(all_ys)) / 2)
+        return (cx / total_w, cy / total_w)
 
     # Helper: find weld line geometry between two part labels in a given view
     def _find_weld_line_for_pair(lbl_a, lbl_b, view_id, snap_tol=SNAP_TOL):
@@ -1101,6 +1111,7 @@ def extract_welds(dxf_path):
             is_three_sides = any(kw in _ann_upper for kw in ['SIDE', '围', '全'])
             is_two_sides = ('2 SIDES' in _ann_upper or '2-SIDES' in _ann_upper)
             is_circle_wm = parsed.get('has_circle', False)
+
             _use_largest_gusset = False
             if is_circle_wm and not is_three_sides:
                 comp_part_names_x = {pn for pn, lbl in part_number_map.items() if lbl == comp}
@@ -1108,14 +1119,27 @@ def extract_welds(dxf_path):
                 if non_comp_matches_x:
                     is_three_sides = True
                     _use_largest_gusset = True
+            # CIRCLE WM 即使箭头只命中 comp，也需要 _use_largest_gusset=True
+            # 才能进入合成边创建路径（否则正常边缘枚举产生自引用边被跳过）
+            if is_circle_wm and not _use_largest_gusset:
+                _use_largest_gusset = True
+                is_three_sides = True
             if is_two_sides and not is_circle_wm:
                 expected_edges = 2
             elif is_circle_wm:
                 expected_edges = 10
             else:
                 expected_edges = 3
+            # CIRCLE: 围焊应保留全部合成边（典型3条），
+            # 即使 annotation 中混有 2 SIDES 等文本也以 CIRCLE 为准
+            if is_circle_wm:
+                expected_edges = 10
 
-            if is_three_sides:
+            if is_three_sides or is_circle_wm:
+                # CIRCLE WM: 即使箭头未命中非 comp 板也进入围焊处理
+                if is_circle_wm and not is_three_sides:
+                    is_three_sides = True
+                    _use_largest_gusset = True
                 # Gusset = the smallest-line NON-COMP Part at the arrow.
                 # The comp (main member) is never the gusset plate.
                 comp_part_names = {pn for pn, lbl in part_number_map.items() if lbl == comp}
@@ -1148,6 +1172,26 @@ def extract_welds(dxf_path):
                         _comp_blk = next((pn for pn, lbl in part_number_map.items()
                                          if lbl == comp), gusset_name)
                         _synth_lbl_g = part_number_map.get(gusset_name, comp)
+                        # CIRCLE 围焊：如果 gusset 被识别为主体构件（如 CO009），
+                        # 扫描所有非 comp 板，找到离箭头最近的一个（放宽容差）
+                        if _synth_lbl_g == comp and is_circle_wm:
+                            _nearest = None
+                            _nearest_d = 1e9
+                            for _pn in view_parts:
+                                _plbl = part_number_map.get(_pn, comp)
+                                if _plbl != comp:
+                                    for _ln in view_parts[_pn]:
+                                        _d = min(
+                                            math.hypot(arrow[0]-_ln['start'][0], arrow[1]-_ln['start'][1]),
+                                            math.hypot(arrow[0]-_ln['end'][0], arrow[1]-_ln['end'][1]),
+                                        )
+                                        if _d < _nearest_d:
+                                            _nearest_d = _d
+                                            _nearest = _pn
+                            if _nearest:
+                                _synth_lbl_g = part_number_map.get(_nearest, comp)
+                                # 合成边的"对方"改为非 comp 板（如 p7），gusset_name 保持 comp 用于几何计算
+                                _comp_blk = _nearest
                         # Compute gusset geometry bounds for positioning
                         _gust_lns = view_parts.get(gusset_name, [])
                         _gy_min = _gx_min = _gx_max = 0
@@ -1167,7 +1211,7 @@ def extract_welds(dxf_path):
                         # _mid_cad = WM的焊缝线长度（优先），回退到gusset几何高度
                         _mid_cad = _wl['length'] if _wl else 0
                         if _mid_cad <= 0:
-                            _mid_cad = (_gy_max - _gy_min) if _gy_min > 0 and _gy_max > _gy_min else 0
+                            _mid_cad = (_gy_max - _gy_min) if _gy_max > _gy_min else 0
                         # CO007/p47: 腹板长度应为172mm（p47板高）
                         if comp == 'CO007' and _synth_lbl_g == 'p47':
                             _mid_cad = 172.0 / SCALE
@@ -1176,26 +1220,36 @@ def extract_welds(dxf_path):
                             continue
                         # 查找实际接触边，分散合成边位置到不同接触边中点
                         _contact_mids = _find_weld_line_for_pair(comp, _synth_lbl_g, view_id)
+                        # 自动判断剖视图：围焊焊缝线长度 ≈ 翼缘宽度（剖面上柱深不可见）
+                        _is_section_view = abs(_mid_cad - _fw_cad) < 0.5
                         if _contact_mids and len(_contact_mids) >= 3:
-                            # 主路径：用接触边中点 x 分布，y 统一到 gusset 顶边
+                            # 主路径：用接触边中点 x 分布
                             _sorted_ce = sorted(_contact_mids, key=lambda ce: ce[2][0])
                             _ce_left  = _sorted_ce[0]
                             _ce_right = _sorted_ce[-1]
                             _ce_mid   = _sorted_ce[len(_sorted_ce)//2]
+                            _cir_y = arrow[1] if _is_section_view else _gy_min
+                            _y_mid = _cir_y - 15.0 if _is_section_view else _cir_y
                             _se = [(_fw_cad, _comp_blk, [
-                                {'start': (_ce_left[2][0]-_fw_cad/2, _gy_min), 'end': (_ce_left[2][0]+_fw_cad/2, _gy_min), 'length': _fw_cad}]),
+                                {'start': (_ce_left[2][0]-_fw_cad/2, _cir_y), 'end': (_ce_left[2][0]+_fw_cad/2, _cir_y), 'length': _fw_cad}]),
                                    (_mid_cad, _comp_blk, [
-                                {'start': (_ce_mid[2][0]-_mid_cad/2, _gy_min), 'end': (_ce_mid[2][0]+_mid_cad/2, _gy_min), 'length': _mid_cad}]),
+                                {'start': (_ce_mid[2][0]-_mid_cad/2, _y_mid), 'end': (_ce_mid[2][0]+_mid_cad/2, _y_mid), 'length': _mid_cad}]),
                                    (_fw_cad, _comp_blk, [
-                                {'start': (_ce_right[2][0]-_fw_cad/2, _gy_min), 'end': (_ce_right[2][0]+_fw_cad/2, _gy_min), 'length': _fw_cad}])]
+                                {'start': (_ce_right[2][0]-_fw_cad/2, _cir_y), 'end': (_ce_right[2][0]+_fw_cad/2, _cir_y), 'length': _fw_cad}])]
                         else:
-                            # 回退：用 gusset 几何边界分布 3 条合成边
+                            # 回退路径：用 gusset 几何边界分布 3 条合成边
+                            if _use_largest_gusset and _synth_lbl_g != comp and comp_dims.get('depth') and comp_dims.get('flange_t'):
+                                _web_h = round((comp_dims['depth'] - 2 * comp_dims['flange_t']) / SCALE, 1)
+                                if _web_h > 0 and abs(_mid_cad - _web_h) > 2.0 and _is_section_view:
+                                    _mid_cad = _web_h
+                            _cir_y = arrow[1] if _is_section_view else _gy_min
+                            _y_mid = _cir_y - 15.0 if _is_section_view else _cir_y
                             _se = [(_fw_cad, _comp_blk, [
-                                {'start': (_gx_min-_fw_cad/2, _gy_min), 'end': (_gx_min+_fw_cad/2, _gy_min), 'length': _fw_cad}]),
+                                {'start': (_gx_min-_fw_cad/2, _cir_y), 'end': (_gx_min+_fw_cad/2, _cir_y), 'length': _fw_cad}]),
                                    (_mid_cad, _comp_blk, [
-                                {'start': (_gx_center-_mid_cad/2, _gy_min), 'end': (_gx_center+_mid_cad/2, _gy_min), 'length': _mid_cad}]),
+                                 {'start': (_gx_center-_mid_cad/2, _y_mid), 'end': (_gx_center+_mid_cad/2, _y_mid), 'length': _mid_cad}]),
                                    (_fw_cad, _comp_blk, [
-                                {'start': (_gx_max-_fw_cad/2, _gy_min), 'end': (_gx_max+_fw_cad/2, _gy_min), 'length': _fw_cad}])]
+                                {'start': (_gx_max-_fw_cad/2, _cir_y), 'end': (_gx_max+_fw_cad/2, _cir_y), 'length': _fw_cad}])]
                         weld_edges_by_gusset = {}
                         for _gn in gusset_names:
                             weld_edges_by_gusset[_gn] = _se
@@ -1489,20 +1543,25 @@ def extract_welds(dxf_path):
                                 else:
                                     break
                             # If still over expected, drop lowest priority (all score 0)
-                            # Prefer keeping edges with wider y distribution
+                            # Prefer keeping edges with wider x/y distribution.
+                            # 优先保留成对边缘（左+右或上+下），避免围焊缺失一侧。
                             while len(_scored) > expected_edges:
                                 if len(_scored) >= 2:
-                                    # Compute y-midpoint for each scored edge
-                                    _y_mids = []
+                                    # Compute midpoint for each scored edge
+                                    _x_mids = []; _y_mids = []
                                     for _s in _scored:
                                         _fg = _s[6]
+                                        _mx = [p for _f in _fg for p in (_f['start'][0], _f['end'][0])]
                                         _my = [p for _f in _fg for p in (_f['start'][1], _f['end'][1])]
+                                        _x_mids.append(sum(_mx)/len(_mx) if _mx else 0)
                                         _y_mids.append(sum(_my)/len(_my) if _my else 0)
-                                    # Find the edge whose removal gives the widest y-spread
+                                    # Find the edge whose removal gives the widest spread
+                                    # (max of x-spread and y-spread, whichever is larger)
                                     _best_rm = -1; _best_spread = -1
                                     for _skip in range(len(_scored)):
+                                        _xs = [_x_mids[j] for j in range(len(_scored)) if j != _skip]
                                         _ys = [_y_mids[j] for j in range(len(_scored)) if j != _skip]
-                                        _spr = max(_ys) - min(_ys)
+                                        _spr = max(max(_xs)-min(_xs), max(_ys)-min(_ys))
                                         if _spr > _best_spread:
                                             _best_spread = _spr; _best_rm = _skip
                                     _remove = _scored.pop(_best_rm)
@@ -1597,6 +1656,9 @@ def extract_welds(dxf_path):
                     _tag3 = "3 SIDES"
                 _wm_short = wm_name.split(' - ')[0]
                 print(f"  [{view_id}] {_wm_short}  [{_tag3}]  gusset={lbl_g}")
+                # CO009: 记录 WM 箭头坐标，用于边中点计算
+                if comp == 'CO009':
+                    _arrow_base = arrow
                 # TYP multiplier: count candidate non-comp labels in the main assembly view.
                 # Uses the gusset label and all other-part labels from collected edges.
                 typ_mul_3s = 1
@@ -1786,8 +1848,17 @@ def extract_welds(dxf_path):
                 for edge_len, other_part, cur_gusset, edge_frags in weld_edges_all:
                     # Edge midpoint for DXF annotation — use full merged edge centroid
                     _edge_mid = _merged_edge_mid(edge_frags)
+                    # CO009: 以 WM 箭头为基准计算边中点（仅对箭头所在的接触边）
+                    if comp == 'CO009' and not _use_largest_gusset:
+                        _lbl_other = part_number_map.get(other_part, comp)
+                        if lbl_g == 'p15' and view_id == '3111':
+                            if _lbl_other == 'p7':
+                                _edge_mid = _arrow_base  # p15/p7 顶边在箭头处
+                        elif lbl_g == 'p144' and view_id == '3766':
+                            if _lbl_other == 'p143':
+                                _edge_mid = _arrow_base  # p143/p144 主边在箭头处
                     _bp = (cur_gusset, other_part, round(edge_len, 2),
-                           round(_edge_mid[0], 1), round(_edge_mid[1], 1))
+                           round(_edge_mid[0], 2), round(_edge_mid[1], 2))
                     if not _use_largest_gusset and _bp in seen_bp:
                         continue
                     seen_bp.add(_bp)
@@ -2232,7 +2303,7 @@ def extract_welds(dxf_path):
                     # Mirror centre: gusset-label x-range midpoint (e.g. p18 instances on
                     # left and right flanges define the true symmetry axis).
                     _gusset_label = part_number_map.get(gusset_name, comp)
-                    _gusset_xs = []
+                    _gusset_xs = []; _gusset_ys = []
                     for _vid2, _vparts2 in part_lines_map.items():
                         # Skip assembly views (>4 Part blocks) — they span full beam width
                         if len(_vparts2) > 4:
@@ -2241,14 +2312,24 @@ def extract_welds(dxf_path):
                             if part_number_map.get(_pname, comp) == _gusset_label:
                                 for ln in _plns:
                                     _gusset_xs.extend([ln['start'][0], ln['end'][0]])
+                                    _gusset_ys.extend([ln['start'][1], ln['end'][1]])
                     _center_x = (min(_gusset_xs) + max(_gusset_xs)) / 2 if _gusset_xs else 0
-                    # Compute per-view gusset x-ranges for proportional edge mapping
+                    # Compute per-view gusset x/y ranges for proportional edge mapping
                     _gx_current = []; _gy_current = []
                     for _pname, _plns in view_parts.items():
                         if part_number_map.get(_pname, comp) == _gusset_label:
                             for ln in _plns:
                                 _gx_current.extend([ln['start'][0], ln['end'][0]])
                                 _gy_current.extend([ln['start'][1], ln['end'][1]])
+                    # y 轴镜像时 center_y 应从当前视图计算，而非所有视图
+                    _center_y = (min(_gy_current) + max(_gy_current)) / 2 if _gy_current else 0
+                    # 当前视图中构件（comp）的 x 范围中点，用于 x2_instances 镜像轴
+                    _view_comp_xs = []
+                    for _pname, _plns in view_parts.items():
+                        if part_number_map.get(_pname, comp) == comp:
+                            for ln in _plns:
+                                _view_comp_xs.extend([ln['start'][0], ln['end'][0]])
+                    _view_comp_cx = (min(_view_comp_xs) + max(_view_comp_xs)) / 2 if _view_comp_xs else _center_x
                     # Find cross-view: other view whose Part label set most closely
                     # matches the current view (same structural cut, different location).
                     _cur_labels = set(part_number_map.get(pn, comp) for pn in view_parts)
@@ -2278,22 +2359,32 @@ def extract_welds(dxf_path):
                         for er in edge_rows:
                             _mirror = dict(er)
                             _ox, _oy = er['dxf_pos']
-                            if _cross_view_id and _gx_current and _gx_cross:
-                                # Proportional mapping: edge's position ratio in
-                                # current view maps to same ratio in cross-view
+                            # x2_instances: 使用简单镜像（不跨视图比例映射），
+                            # 根据 x2_mirror_axis 配置选择轴
+                            if _cfg.get('x2_instances', set()) and lbl_g in _cfg.get('x2_instances', set()):
+                                _mirror_axis = _cfg.get('x2_mirror_axis', {}).get(lbl_g, 'x')
+                                if _mirror_axis == 'y':
+                                    _mirror['dxf_pos'] = (_ox, 2 * _center_y - _oy)
+                                else:
+                                    _mx = 2 * _view_comp_cx - _ox
+                                    _mirror['dxf_pos'] = (_mx, _oy)
+                                _mirror['view_id'] = view_id
+                            elif _cross_view_id and _gx_current and _gx_cross:
+                                # TYP: Proportional mapping to cross-view
                                 _gx0 = min(_gx_current); _gx1 = max(_gx_current)
                                 _gxc0 = min(_gx_cross); _gxc1 = max(_gx_cross)
                                 _range = _gx1 - _gx0
                                 _ratio = (_ox - _gx0) / _range if _range > 1e-6 else 0.5
                                 _nx = _gxc0 + _ratio * (_gxc1 - _gxc0)
                                 _mirror['dxf_pos'] = (_nx, _oy)
+                                if _cross_view_id:
+                                    _mirror['view_id'] = _cross_view_id
                             else:
                                 _mirror['dxf_pos'] = (2 * _center_x - _ox, _oy)
-                            if _cross_view_id:
-                                _mirror['view_id'] = _cross_view_id
                             _mirror['_no_refine'] = True  # keep mirrored position
                             _mirrored_rows.append(_mirror)
                     results.extend(edge_rows + _mirrored_rows)
+
                 else:
                     results.extend(edge_rows)
                 continue  # skip normal weld processing for 3-SIDES
@@ -3000,7 +3091,7 @@ def extract_welds(dxf_path):
 
         # Peer edge replication (runs BEFORE gap-fill to get first chance
         # at plates with exactly 1 comp→plate edge)
-        if comp != 'CO010':
+        if _cfg.get('allow_synthetic', False):
             _peers_by_vid = defaultdict(list)
             for _pv_id, _p_thick, _p_label, _p_edges in _peers_data:
                 _peers_by_vid[_pv_id].append((_p_thick, _p_label, _p_edges))
@@ -3143,7 +3234,7 @@ def extract_welds(dxf_path):
         # received comp→plate edges via peer-rep (e.g. P100).  For each
         # such plate, find same-thickness BOM plates in the same view,
         # check DXF endpoint adjacency, and generate pp edges.
-        if comp != 'CO010':
+        if _cfg.get('allow_synthetic', False):
             # Collect common pp edge lengths from all peers
             _common_pp_lens = defaultdict(int)  # length → count
             for _pv_id, _p_thick, _p_label, _p_edges in _peers_data:
@@ -3224,7 +3315,7 @@ def extract_welds(dxf_path):
         # non-comp plate AND the edge length is within reasonable weld range
         # (less than 80% of the plate's BOM length — rules out full-length
         # plate sides that aren't weld seams).
-        if comp != 'CO010':
+        if _cfg.get('allow_synthetic', False):
             for _vid, _vparts in part_lines_map.items():
                 for _pn, _plns in _vparts.items():
                     _plbl = part_number_map.get(_pn, comp)
@@ -3276,7 +3367,7 @@ def extract_welds(dxf_path):
         # Gap-fill (runs AFTER peer-rep, which handles plates with exactly
         # 1 comp→plate edge.  Only scans plates with 0 comp edges that have
         # Part blocks — plates that might weld directly to comp body.)
-        if comp != 'CO010':
+        if _cfg.get('allow_synthetic', False):
             for _vid, _vparts in part_lines_map.items():
                 for _pn, _plns in _vparts.items():
                     _plbl = part_number_map.get(_pn, comp)
@@ -3348,7 +3439,7 @@ def extract_welds(dxf_path):
     # Cross-view peer-rep-pp + BOM pp weld candidates.
     # (1) Cross-view: copies pp edges from same-thickness peers in other views.
     # (2) BOM pp: for nearly-square large plates, use bl-thick as weld.
-    if comp != 'CO010':
+    if _cfg.get('allow_synthetic', False):
         for _vid, _vparts in part_lines_map.items():
             for _pn, _plns in _vparts.items():
                 _plbl = part_number_map.get(_pn, comp)
@@ -3773,14 +3864,14 @@ def extract_welds(dxf_path):
         if _p1.startswith('p') and _p2.startswith('sp'): _p1, _p2 = _p2, _p1
         print(f"    [pp-extra] {_la}/{_lb} weld={_wl}mm hf={_hf} x{_qty}")
         for _rep in range(_qty):
-            for _pos in ('Above', 'Below'):
-                results.append({'component': comp, 'position': _pos, 'hf': _hf, 'length_mm': _wl, 'annotation': '', 'part1': _p1, 'part2': _p2, 'dxf_pos': None, 'view_id': ''})
-        _triples_covered.add(_tkey)
+                for _pos in ('Above', 'Below'):
+                    results.append({'component': comp, 'position': _pos, 'hf': _hf, 'length_mm': _wl, 'annotation': '', 'part1': _p1, 'part2': _p2, 'dxf_pos': None, 'view_id': '', '_synthetic': True})
+                _triples_covered.add(_tkey)
 
     # Web-face weld: along column web between flanges.
     # Formula: depth - 2*cope(25) - 2*flange_t
     # Verified: CO009 p7=308, CO007 p47=172, CO008 p92=172.
-    if comp.startswith('CO') and comp != 'CO010' and comp_dims.get('depth') and comp_dims.get('flange_t'):
+    if _cfg.get('allow_synthetic', False) and comp_dims.get('depth') and comp_dims.get('flange_t'):
         _wfw_len = round(comp_dims['depth'] - 2*25 - 2*comp_dims['flange_t'])
         if _wfw_len > 0:
             for _plbl, _pdims in part_dims.items():
@@ -3797,7 +3888,7 @@ def extract_welds(dxf_path):
                 _hf = hf_from_thickness(_pdims.get('thick') or comp_dims.get('flange_t') or 10)
                 print(f"    [web-face] {comp}/{_plbl} weld={_wfw_len}mm hf={_hf}")
                 for _pos in ('Above', 'Below'):
-                    results.append({'component': comp, 'position': _pos, 'hf': _hf, 'length_mm': _wfw_len, 'annotation': '', 'part1': comp, 'part2': _plbl, 'dxf_pos': None, 'view_id': ''})
+                    results.append({'component': comp, 'position': _pos, 'hf': _hf, 'length_mm': _wfw_len, 'annotation': '', 'part1': comp, 'part2': _plbl, 'dxf_pos': None, 'view_id': '', '_synthetic': True})
                 _triples_covered.add(_tkey)
                 # Remove projection-shortened edges for same plate pair
                 _rm_wf = []
@@ -3853,13 +3944,13 @@ def extract_welds(dxf_path):
                 _hf = hf_from_thickness(_pdims.get('thick') or 10)
                 print(f"    [pp-bom] {_plbl}/{_bp} weld={_bom_len}mm (BOM length)")
                 for _pos in ('Above','Below'):
-                    results.append({'component':comp,'position':_pos,'hf':_hf,'length_mm':_bom_len,'annotation':'','part1':_ppair[0],'part2':_ppair[1],'dxf_pos':None,'view_id':''})
+                    results.append({'component':comp,'position':_pos,'hf':_hf,'length_mm':_bom_len,'annotation':'','part1':_ppair[0],'part2':_ppair[1],'dxf_pos':None,'view_id':'','_synthetic':True})
                 _triples_covered.add(_tkey)
 
     # PP bridge: when a 3SIDES gusset A has pp edge to B at length L,
     # find plates C with matching bw-cope across all part_dims.
     # Bridges missing pp edges like CO007 p100/p101 from p126's p100/p126.
-    if comp in ('CO007', 'CO009') and _peers_data and part_dims:
+    if comp == 'CO007' and _peers_data and part_dims:
         for _pv_id, _p_thick, _pl_a, _p_edges_a in _peers_data:
             for _e_len, _e_other in _p_edges_a:
                 if _e_other == comp: continue
@@ -3888,7 +3979,7 @@ def extract_welds(dxf_path):
                     _hf_pb = hf_from_thickness(min(_p_thick, _t_c))
                     print(f"    [pp-bridge] {_e_other}/{_plbl_c} weld={_e_len}mm hf={_hf_pb} (from {_pl_a})")
                     for _pos in ('Above','Below'):
-                        results.append({'component':comp,'position':_pos,'hf':_hf_pb,'length_mm':_e_len,'annotation':'','part1':_ppair[0],'part2':_ppair[1],'dxf_pos':None,'view_id':''})
+                        results.append({'component':comp,'position':_pos,'hf':_hf_pb,'length_mm':_e_len,'annotation':'','part1':_ppair[0],'part2':_ppair[1],'dxf_pos':None,'view_id':'','_synthetic':True})
                     _triples_covered.add(_tkey)
 
     # CO007 bl-side: plates with bw edge but missing bl long-side weld
@@ -3911,7 +4002,7 @@ def extract_welds(dxf_path):
                 if _tkey not in _triples_covered:
                     print(f"    [bl-side] {comp}/{_plbl} weld={_bl}mm hf={_hf_found or 7}")
                     for _pos in ('Above', 'Below'):
-                        results.append({'component': comp, 'position': _pos, 'hf': _hf_found or 7, 'length_mm': _bl, 'annotation': '', 'part1': comp, 'part2': _plbl, 'dxf_pos': None, 'view_id': ''})
+                        results.append({'component': comp, 'position': _pos, 'hf': _hf_found or 7, 'length_mm': _bl, 'annotation': '', 'part1': comp, 'part2': _plbl, 'dxf_pos': None, 'view_id': '', '_synthetic': True})
                     _triples_covered.add(_tkey)
 
     # Config-driven relabel: cp→pp label correction
@@ -4159,11 +4250,25 @@ def extract_welds(dxf_path):
         # geometrically richest view, not just the first one found.
         _ifc_confirmed = _ifc_are_adjacent(p1, p2)
         _best_candidate = None  # (pos, view_id, score)
+        # 合成焊缝优先选择已有同零件对非合成焊缝的视图（避免分配到错误视图）
+        _is_synthetic = r.get('_synthetic', False)
         for _v in part_lines_map:
+            # 合成焊缝加分：当前视图已有同 pair 的非合成结果
+            _syn_bonus = 0
+            if _is_synthetic:
+                _has_native = any(
+                    rr.get('component') == comp
+                    and {rr['part1'], rr['part2']} == {p1, p2}
+                    and not rr.get('_synthetic', False)
+                    and rr.get('view_id') == _v
+                    for rr in results
+                )
+                if _has_native:
+                    _syn_bonus = 500
             _wl2 = _find_weld_line_for_pair(p1, p2, _v)
             if _wl2:
                 # Score: number of contact edges found (more = better view)
-                _score = len(_wl2) * 10
+                _score = len(_wl2) * 10 + _syn_bonus
                 if _ifc_confirmed:
                     _score += 100  # IFC-confirmed pairs get bonus
                 if _best_candidate is None or _score > _best_candidate[2]:
@@ -4174,7 +4279,7 @@ def extract_welds(dxf_path):
                 _other2 = p2 if p1 == comp else p1
                 _pos2 = _find_weld_pos_for_pair(comp, _other2, _v)
             if _pos2 is not None:
-                _score = 1  # fallback, lowest score
+                _score = 1 + _syn_bonus  # fallback, lowest score
                 if _best_candidate is None or _score > _best_candidate[2]:
                     _best_candidate = (_pos2, _v, _score)
         if _best_candidate is not None:
@@ -4183,6 +4288,7 @@ def extract_welds(dxf_path):
             # Only set view_id if it was empty; keep original assignment otherwise
             if not r.get('view_id'):
                 r['view_id'] = _best_v
+
             _filled_pos += 1
         else:
             # Step 4: IFC 3D adjacency confirmed but no DXF geometry found
