@@ -858,7 +858,7 @@ def _search_placement(weld_pos, cx, cy, lines, text_bboxes, circles, placed_bbox
     def _search_pass(_draw_bbox):
         """搜索：遍历所有候选，选最高分（而非第一个无冲突即退出）。"""
         priority = _direction_priority(wx, wy, cx, cy) if force_direction is None else force_direction
-        distances = [10, 14, 18, 22, 26, 30, 36, 48, 60, 72, 96]
+        distances = list(range(8, 56, 2)) + [60, 72, 96]
         if is_pair:
             distances = [d + 4 for d in distances]
 
