@@ -568,7 +568,7 @@ def _annotate_view(msp, welds, view_id, bbox, part_centroids, f_counter, w_count
                       _next_label(ww_b, f_counter, w_counter)]
             _force_dir = None
             for _pp in placed_positions:
-                if abs(wp_a[0] - _pp[0][0]) < 2.5 and abs(wp_a[1] - _pp[0][1]) < 2.5:
+                if abs(wp_a[0] - _pp[0][0]) < 2.5 and abs(wp_a[1] - _pp[0][1]) < 30.0:
                     _force_dir = _force_opposite_dir(_pp[1])
                     break
             _use_cx_pair = cx
@@ -596,7 +596,7 @@ def _annotate_view(msp, welds, view_id, bbox, part_centroids, f_counter, w_count
                 _use_cx = wp[0] + (wp[0] - cx)
             _force_dir = None
             for _pp in placed_positions:
-                if abs(wp[0] - _pp[0][0]) < 2.5 and abs(wp[1] - _pp[0][1]) < 2.5:
+                if abs(wp[0] - _pp[0][0]) < 2.5 and abs(wp[1] - _pp[0][1]) < 30.0:
                     _force_dir = _force_opposite_dir(_pp[1])
                     break
             if _force_dir is not None:
@@ -1256,9 +1256,9 @@ def _resolve_label_conflicts(msp, lines, text_bboxes, circles,
                     (i, gi, it_i, lb_i, pos_i, dn_i, ds_i, ag_i),
                 ]:
                     # --- 距离微调 ---
-                    for d_dist in [1, -1, 2, -2, 4, -4, 8, -8, 12, -12, 16, -16, 20, -20]:
+                    for d_dist in [1, -1, 2, -2, 4, -4, 8, -8, 12, -12, 16, -16, 20, -20, 24]:
                         nd = ds + d_dist
-                        if nd < 8 or nd > 55: continue
+                        if nd < 8 or nd > 60: continue
                         result = _adjust_safe(target, pos, dn, nd, ag, g, target)
                         if result:
                             nbb, tbb = result
