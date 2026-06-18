@@ -272,6 +272,98 @@ def _compute_drawing_bbox(doc):
     return [min(xs), min(ys), max(xs), max(ys)]
 
 
+def _detect_drawing_frames(doc):
+    """
+    扫描文档中所有 LINE 实体，检测图纸的外框和内框。
+    返回 (outer_bbox, inner_bbox) 其中 bbox = [x0, y0, x1, y1]。
+    如未检测到则返回 (None, None)。
+
+    原理：框线是图纸中最长的水平线和垂直线，构成外矩形和内矩形。
+    找所有最长水平线的 y 范围（上下边界），和最长垂直线的 x 范围（左右边界）。
+    """
+    from collections import defaultdict
+    import math
+
+    min_len = 100
+    h_segs = defaultdict(list)  # y -> [(x_start, x_end)]
+    v_segs = defaultdict(list)  # x -> [(y_start, y_end)]
+
+    def _scan(e):
+        if e.dxftype() != 'LINE':
+            return
+        s, ep = e.dxf.start, e.dxf.end
+        dx = abs(s.x - ep.x)
+        dy = abs(s.y - ep.y)
+        length = math.hypot(dx, dy)
+        if length < min_len:
+            return
+        if dx > dy and dx > length * 0.9:
+            y_rounded = round(s.y, 1)
+            h_segs[y_rounded].append((s.y, min(s.x, ep.x), max(s.x, ep.x)))
+        elif dy > dx and dy > length * 0.9:
+            x_rounded = round(s.x, 1)
+            v_segs[x_rounded].append((s.x, min(s.y, ep.y), max(s.y, ep.y)))
+
+    for blk in doc.blocks:
+        for e in blk:
+            _scan(e)
+    for e in doc.modelspace():
+        _scan(e)
+
+    if len(h_segs) < 4 or len(v_segs) < 4:
+        return None, None
+
+    # 合并聚类：每组取最大覆盖范围
+    h_final = {}
+    for y_key, segs in h_segs.items():
+        x0 = min(s[1] for s in segs)
+        x1 = max(s[2] for s in segs)
+        h_final[y_key] = (x0, x1, x1 - x0)
+
+    v_final = {}
+    for x_key, segs in v_segs.items():
+        y0 = min(s[1] for s in segs)
+        y1 = max(s[2] for s in segs)
+        v_final[x_key] = (y0, y1, y1 - y0)
+
+    # 按范围降序
+    h_sorted = sorted(h_final.items(), key=lambda kv: -kv[1][2])  # [(y_key, (x0,x1,w))]
+    v_sorted = sorted(v_final.items(), key=lambda kv: -kv[1][2])
+
+    h_max_w = h_sorted[0][1][2]  # 最大水平线宽度
+    v_max_h = v_sorted[0][1][2]  # 最大垂直线高度
+
+    # 找外框：所有宽度/高度 ≈ h_max_w/v_max_h 的线
+    outer_h = [(k, v) for k, v in h_sorted if abs(v[2] - h_max_w) < 5]
+    outer_v = [(k, v) for k, v in v_sorted if abs(v[2] - v_max_h) < 5]
+
+    if len(outer_h) < 2 or len(outer_v) < 2:
+        return None, None
+
+    # 外框：取最左/最右/最下/最上
+    ox0 = min(k for k, v in outer_v)
+    ox1 = max(k for k, v in outer_v)
+    oy0 = min(k for k, v in outer_h)
+    oy1 = max(k for k, v in outer_h)
+    outer = [ox0, oy0, ox1, oy1]
+
+    # 内框：宽度 ≈ 85-95% 外框且在外框内部
+    inner = None
+    inner_h = [kv for kv in h_sorted if kv[1][2] > h_max_w * 0.8 and kv[1][2] < h_max_w * 0.99
+               and kv[0] > oy0 + 5 and kv[0] < oy1 - 5]
+    inner_v = [kv for kv in v_sorted if kv[1][2] > v_max_h * 0.8 and kv[1][2] < v_max_h * 0.99
+               and kv[0] > ox0 + 5 and kv[0] < ox1 - 5]
+
+    if len(inner_h) >= 2 and len(inner_v) >= 2:
+        ix0 = min(k for k, v in inner_v)
+        ix1 = max(k for k, v in inner_v)
+        iy0 = min(k for k, v in inner_h)
+        iy1 = max(k for k, v in inner_h)
+        inner = [ix0, iy0, ix1, iy1]
+
+    return outer, inner
+
+
 def _annotate_one(doc, welds):
     """Annotate a single DXF with weld labels."""
     msp = doc.modelspace()
@@ -291,6 +383,16 @@ def _annotate_one(doc, welds):
                      max(_all_xs) + _DRAW_MARGIN, max(_all_ys) + _DRAW_MARGIN]
     else:
         draw_bbox = _compute_drawing_bbox(doc)
+
+    # 检测图纸内框，将标注范围缩放到内框内
+    _outer_frame, _inner_frame = _detect_drawing_frames(doc)
+    if _inner_frame:
+        ix0, iy0, ix1, iy1 = _inner_frame
+        if draw_bbox is None:
+            draw_bbox = [ix0, iy0, ix1, iy1]
+        else:
+            draw_bbox = [max(draw_bbox[0], ix0), max(draw_bbox[1], iy0),
+                         min(draw_bbox[2], ix1), min(draw_bbox[3], iy1)]
 
     # Group welds by view_id
     welds_by_view = defaultdict(list)
