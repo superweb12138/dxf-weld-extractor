@@ -862,6 +862,17 @@ def _search_placement(weld_pos, lines, text_bboxes, circles, placed_bboxes,
         for (sx, sy), (ex2, ey2) in _near:
             if _dist_pt_to_seg((_cx_txt, _cy_txt), (sx, sy), (ex2, ey2))[0] < 1.5:
                 return True
+        # 射线法：检查文字中心是否在几何线围成的封闭形状内
+        _rays = [(_cx_txt + 99999, _cy_txt), (_cx_txt - 99999, _cy_txt),
+                 (_cx_txt, _cy_txt + 99999), (_cx_txt, _cy_txt - 99999)]
+        _odd = 0
+        for _rx, _ry in _rays:
+            _cnt = sum(1 for (sx, sy), (ex2, ey2) in _near
+                       if _segments_cross_((_cx_txt, _cy_txt), (_rx, _ry), (sx, sy), (ex2, ey2)))
+            if _cnt % 2 == 1:
+                _odd += 1
+        if _odd >= 3:
+            return True
         _txt_edges = [((bx0, by0), (bx1, by0)), ((bx1, by0), (bx1, by1)),
                       ((bx1, by1), (bx0, by1)), ((bx0, by1), (bx0, by0))]
         for (sx, sy), (ex2, ey2) in _near:
