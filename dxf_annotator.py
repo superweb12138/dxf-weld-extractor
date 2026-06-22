@@ -806,6 +806,12 @@ def _search_placement(weld_pos, lines, text_bboxes, circles, placed_bboxes,
         for (sx, sy), (ex2, ey2) in _near:
             if _dist_pt_to_seg((_cx_txt, _cy_txt), (sx, sy), (ex2, ey2))[0] < 1.5:
                 return True
+        _txt_edges = [((bx0, by0), (bx1, by0)), ((bx1, by0), (bx1, by1)),
+                      ((bx1, by1), (bx0, by1)), ((bx0, by1), (bx0, by0))]
+        for (sx, sy), (ex2, ey2) in _near:
+            for (_s, _e) in _txt_edges:
+                if _segments_cross_(_s, _e, (sx, sy), (ex2, ey2)):
+                    return True
         for (ccx, ccy, cr) in circles:
             if not (bx1 < ccx - cr or bx0 > ccx + cr or by1 < ccy - cr or by0 > ccy + cr):
                 return True
