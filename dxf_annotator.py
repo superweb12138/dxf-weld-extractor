@@ -890,9 +890,25 @@ def _search_placement(weld_pos, lines, text_bboxes, circles, placed_bboxes,
             if not _has_conflict(_ideal_ang, dist, _db):
                 _fa, _fd, _fs = _fine_tune(dist, _ideal_ang, _db)
                 return _fs, (_fa, _fd, 0)
-        for step in range(1, 19):
+        # Phase 2a: near-ideal angles (±10°, ±20°)
+        for step in [1, 2]:
             for sign in (1, -1):
                 angle = (_ideal_ang + sign * step * 10) % 360
+                for dist in distances:
+                    if not _has_conflict(angle, dist, _db):
+                        _fa, _fd, _fs = _fine_tune(dist, angle, _db)
+                        return _fs, (_fa, _fd, 0)
+        # Phase 2b: opposite hemisphere early
+        _opposite = (_ideal_ang + 180) % 360
+        for dist in distances:
+            if not _has_conflict(_opposite, dist, _db):
+                _fa, _fd, _fs = _fine_tune(dist, _opposite, _db)
+                return _fs, (_fa, _fd, 0)
+        # Phase 2c: remaining angles (±30° to ±170°)
+        for step in range(3, 19):
+            for sign in (1, -1):
+                angle = (_ideal_ang + sign * step * 10) % 360
+                if angle == _opposite: continue
                 for dist in distances:
                     if not _has_conflict(angle, dist, _db):
                         _fa, _fd, _fs = _fine_tune(dist, angle, _db)
