@@ -126,6 +126,34 @@ def _collect_all_obstacles(doc, view_id):
                 text_bboxes.append((tx - mrg, tx + tw + mrg, ty - mrg, ty + th + mrg))
             except Exception:
                 pass
+        elif t == 'LWPOLYLINE':
+            try:
+                pts = list(e.get_points())
+                for i in range(len(pts)):
+                    j = (i + 1) % len(pts)
+                    lines.append(((pts[i][0], pts[i][1]), (pts[j][0], pts[j][1])))
+            except Exception:
+                pass
+        elif t == 'POLYLINE':
+            try:
+                pts = [(v.dxf.location.x, v.dxf.location.y) for v in e.vertices]
+                for i in range(len(pts)):
+                    j = (i + 1) % len(pts)
+                    lines.append((pts[i], pts[j]))
+            except Exception:
+                pass
+        elif t == 'SOLID':
+            try:
+                pts = [(e.dxf.vch1.x, e.dxf.vch1.y),
+                       (e.dxf.vch2.x, e.dxf.vch2.y),
+                       (e.dxf.vch3.x, e.dxf.vch3.y),
+                       (e.dxf.vch4.x, e.dxf.vch4.y)]
+                xs = [p[0] for p in pts if p[0] is not None]
+                ys = [p[1] for p in pts if p[1] is not None]
+                if xs and ys:
+                    hatch_bboxes.append((min(xs), max(xs), min(ys), max(ys)))
+            except Exception:
+                pass
         elif t == 'MLEADER':
             try:
                 from ezdxf.math import Vec2
