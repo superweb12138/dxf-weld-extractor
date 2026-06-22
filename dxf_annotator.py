@@ -1003,9 +1003,9 @@ def _search_placement(weld_pos, lines, text_bboxes, circles, placed_bboxes,
 
         _best_score = -999999999
         _best_result = (_ideal_ang, min(distances), 0)
-        _short_dists = [d for d in distances if d <= 30]
-        for dist in _short_dists:
-            for _off in range(0, 360, 30):
+        _p3_dists = [d for d in distances if d <= 54]
+        for dist in _p3_dists:
+            for _off in range(0, 360, 10):
                 angle = (_ideal_ang + _off) % 360
                 score = _score_candidate(angle, dist)
                 if score > _best_score:
@@ -1096,22 +1096,27 @@ def _score_placement(wx, wy, angle_deg, dist, lines, text_bboxes, circles,
         if _segments_cross_((ex, ey), (hx, hy), (sx, sy), (ex2, ey2)):
             score -= 30
   
-    # 水平接地线穿过文字框：扣100
+    # 水平接地线穿过文字框：扣20000（硬性惩罚）
     for (tx0, tx1, ty0, ty1) in text_bboxes:
         if _seg_cross_rect((ex, ey), (hx, hy), tx0, tx1, ty0, ty1):
-            score -= 100
+            score -= 20000
   
-    # 水平接地线穿过已放置标注：扣80
+    # 水平接地线穿过已放置标注文字：扣20000（硬性惩罚）
+    for k, otb in enumerate(placed_text_bboxes):
+        if _seg_cross_rect((ex, ey), (hx, hy), otb[0], otb[1], otb[2], otb[3]):
+            score -= 20000
+
+    # 水平接地线穿过已放置整体包围盒：扣80
     for (pbx0, pbx1, pby0, pby1) in placed_bboxes:
         if _seg_cross_rect((ex, ey), (hx, hy), pbx0, pbx1, pby0, pby1):
             score -= 80
 
-    # 斜引线穿过文字框：扣60
+    # 斜引线穿过文字框：扣20000（硬性惩罚）
     for (tx0, tx1, ty0, ty1) in text_bboxes:
         if _seg_cross_rect((wx, wy), (ex, ey), tx0, tx1, ty0, ty1):
-            score -= 60
+            score -= 20000
   
-    # 斜引线穿过已放置标注：扣200（防止引线与文字交错）
+    # 斜引线穿过已放置整体包围盒：扣200
     for (pbx0, pbx1, pby0, pby1) in placed_bboxes:
         if _seg_cross_rect((wx, wy), (ex, ey), pbx0, pbx1, pby0, pby1):
             score -= 200
