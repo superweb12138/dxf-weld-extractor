@@ -776,6 +776,11 @@ def _search_placement(weld_pos, lines, text_bboxes, circles, placed_bboxes,
         for otb in placed_text_bboxes:
             if _seg_cross_rect((ex, ey), (hx, hy), otb[0], otb[1], otb[2], otb[3]):
                 return True
+        for (pbx0, pbx1, pby0, pby1) in placed_bboxes:
+            if _seg_cross_rect((wx, wy), (ex, ey), pbx0, pbx1, pby0, pby1):
+                return True
+            if _seg_cross_rect((ex, ey), (hx, hy), pbx0, pbx1, pby0, pby1):
+                return True
         _min_x = min(wx, ex, hx, bx0); _max_x = max(wx, ex, hx, bx1)
         _min_y = min(wy, ey, hy, by0); _max_y = max(wy, ey, hy, by1)
         _mrg = 15
