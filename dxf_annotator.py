@@ -860,8 +860,6 @@ def _search_placement(weld_pos, lines, text_bboxes, circles, placed_bboxes,
                     max(sy, ey2) < _min_y - _mrg or min(sy, ey2) > _max_y + _mrg):
                 if _segments_cross_((ex, ey), (hx, hy), (sx, sy), (ex2, ey2)):
                     return True
-                if _segments_cross_((wx, wy), (ex, ey), (sx, sy), (ex2, ey2)):
-                    return True
         # 文字与几何线过近
         _line_mrg = 3.0
         _txt_pts = [(bx0, by0), (bx1, by0), (bx0, by1), (bx1, by1),
