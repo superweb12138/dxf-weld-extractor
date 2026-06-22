@@ -84,6 +84,20 @@ def _collect_all_obstacles(doc, view_id):
         elif t == 'ARC':
             circles.append((e.dxf.center.x, e.dxf.center.y,
                             getattr(e.dxf, 'radius', 1.0)))
+            try:
+                cx, cy = e.dxf.center.x, e.dxf.center.y
+                r = getattr(e.dxf, 'radius', 1.0)
+                sa = math.radians(e.dxf.start_angle)
+                ea = math.radians(e.dxf.end_angle)
+                if ea < sa: ea += math.pi * 2
+                n_seg = max(4, int((ea - sa) / (math.pi / 8)))
+                for i in range(n_seg):
+                    a1 = sa + (ea - sa) * i / n_seg
+                    a2 = sa + (ea - sa) * (i + 1) / n_seg
+                    lines.append(((cx + r * math.cos(a1), cy + r * math.sin(a1)),
+                                  (cx + r * math.cos(a2), cy + r * math.sin(a2))))
+            except Exception:
+                pass
         elif t == 'DIMENSION':
             try:
                 tx, ty = e.dxf.text_midpoint.x, e.dxf.text_midpoint.y
