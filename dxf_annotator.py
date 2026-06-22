@@ -154,6 +154,18 @@ def _collect_all_obstacles(doc, view_id):
                     hatch_bboxes.append((min(xs), max(xs), min(ys), max(ys)))
             except Exception:
                 pass
+        elif t == '3DFACE':
+            try:
+                pts = [(e.dxf.vch1.x, e.dxf.vch1.y),
+                       (e.dxf.vch2.x, e.dxf.vch2.y),
+                       (e.dxf.vch3.x, e.dxf.vch3.y),
+                       (e.dxf.vch4.x, e.dxf.vch4.y)]
+                xs = [p[0] for p in pts if p[0] is not None]
+                ys = [p[1] for p in pts if p[1] is not None]
+                if xs and ys:
+                    hatch_bboxes.append((min(xs), max(xs), min(ys), max(ys)))
+            except Exception:
+                pass
         elif t == 'MLEADER':
             try:
                 from ezdxf.math import Vec2
@@ -922,7 +934,8 @@ def _search_placement(weld_pos, lines, text_bboxes, circles, placed_bboxes,
                                          circles, placed_bboxes, placed_text_bboxes,
                                          vx0, vy0, vx1, vy1,
                                          _db, is_pair=is_pair, min_score=_best_score,
-                                         line_grid=_line_grid)
+                                         line_grid=_line_grid,
+                                         hatch_bboxes=hatch_bboxes)
                 if score > _best_score:
                     _best_score = score
                     _best_result = (angle, dist, 0)
@@ -936,7 +949,8 @@ def _search_placement(weld_pos, lines, text_bboxes, circles, placed_bboxes,
 
 def _score_placement(wx, wy, angle_deg, dist, lines, text_bboxes, circles,
                      placed_bboxes, placed_text_bboxes, vx0, vy0, vx1, vy1,
-                     draw_bbox=None, is_pair=False, min_score=None, line_grid=None):
+                     draw_bbox=None, is_pair=False, min_score=None, line_grid=None,
+                     hatch_bboxes=None):
     """对 (角度, 距离) 位置评分。分值越高越推荐，正分表示无冲突，负分表示冲突严重。"""
     score = 0
     rad = math.radians(angle_deg)
@@ -1087,6 +1101,12 @@ def _score_placement(wx, wy, angle_deg, dist, lines, text_bboxes, circles,
     for (ccx, ccy, cr) in circles:
         if bx1 > ccx - cr and bx0 < ccx + cr and by1 > ccy - cr and by0 < ccy + cr:
             score -= 30
+
+    # 文字与 HATCH/SOLID 填充区重叠：扣2000
+    if hatch_bboxes:
+        for (hx0, hx1, hy0, hy1) in hatch_bboxes:
+            if bx1 > hx0 - 8 and bx0 < hx1 + 8 and by1 > hy0 - 8 and by0 < hy1 + 8:
+                score -= 2000
 
     # 距离惩罚：越远越不推荐（避免延伸出图）
     if dist > 30:
