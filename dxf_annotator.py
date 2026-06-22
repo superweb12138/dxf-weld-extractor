@@ -53,8 +53,8 @@ MT_BOTTOM_RIGHT = 9
 
 
 def _collect_all_obstacles(doc, view_id):
-    """Collect all visual obstacles in a view: lines, text bboxes, circles/arcs."""
-    lines, text_bboxes, circles = [], [], []
+    """Collect all visual obstacles in a view: lines, text bboxes, circles/arcs, hatch bboxes."""
+    lines, text_bboxes, circles, hatch_bboxes = [], [], [], []
 
     def add_entity(e):
         t = e.dxftype()
@@ -95,9 +95,14 @@ def _collect_all_obstacles(doc, view_id):
                 pass
         elif t == 'HATCH':
             try:
+                all_pts = []
                 for path in e.paths:
                     for v in path.vertices:
-                        circles.append((float(v[0]), float(v[1]), 0.5))
+                        all_pts.append((float(v[0]), float(v[1])))
+                if all_pts:
+                    xs = [p[0] for p in all_pts]
+                    ys = [p[1] for p in all_pts]
+                    hatch_bboxes.append((min(xs), max(xs), min(ys), max(ys)))
             except Exception:
                 pass
         elif t == 'LEADER':
@@ -170,7 +175,7 @@ def _collect_all_obstacles(doc, view_id):
         else:
             add_entity(e)
 
-    return lines, text_bboxes, circles
+    return lines, text_bboxes, circles, hatch_bboxes
 
 
 def annotate(results, dxf_paths=None):
@@ -386,8 +391,10 @@ def _annotate_one(doc, welds):
         vw = welds_by_view[view_id]
         bbox = view_bboxes.get(view_id)
         centroids = part_centroids.get(view_id, [])
-        part_lines = _collect_all_obstacles(doc, view_id)
-        _annotate_view(msp, vw, view_id, bbox, centroids, f_counter, w_counter, part_lines, draw_bbox)
+        obs_result = _collect_all_obstacles(doc, view_id)
+        part_lines = obs_result[:3]
+        hatch_bboxes = obs_result[3] if len(obs_result) > 3 else None
+        _annotate_view(msp, vw, view_id, bbox, centroids, f_counter, w_counter, part_lines, draw_bbox, hatch_bboxes=hatch_bboxes)
 
     # Handle welds without view_id
     if welds_no_view:
@@ -438,7 +445,7 @@ def _compute_view_bboxes(doc):
     return view_bboxes, dict(view_part_centroids)
 
 
-def _annotate_view(msp, welds, view_id, bbox, part_centroids, f_counter, w_counter, obstacles, draw_bbox=None):
+def _annotate_view(msp, welds, view_id, bbox, part_centroids, f_counter, w_counter, obstacles, draw_bbox=None, hatch_bboxes=None):
     """Annotate all welds in a single view.
     相同位置的 Above+Below 焊缝对共用一根引线，标号并排在横线末端。CJP(W*) 和 FW(F*) 不混合。"""
     lines, text_bboxes, circles = obstacles
@@ -525,7 +532,8 @@ def _annotate_view(msp, welds, view_id, bbox, part_centroids, f_counter, w_count
                       _next_label(ww_b, f_counter, w_counter)]
             dname, diag_len, angle = _search_placement(
                 wp_a, lines, text_bboxes, circles, placed_bboxes,
-                placed_text_bboxes, vx0, vy0, vx1, vy1, draw_bbox, is_pair=True)
+                placed_text_bboxes, vx0, vy0, vx1, vy1, draw_bbox, is_pair=True,
+                hatch_bboxes=hatch_bboxes)
             bx0, bx1, by0, by1 = _paired_bbox(wp_a, dname, diag_len, angle)
             bbox = (min(bx0, wp_a[0])-1, max(bx1, wp_a[0])+1,
                     min(by0, wp_a[1])-1, max(by1, wp_a[1])+1)
@@ -537,7 +545,8 @@ def _annotate_view(msp, welds, view_id, bbox, part_centroids, f_counter, w_count
             label = _next_label(ww, f_counter, w_counter)
             dname, diag_len, angle = _search_placement(
                 wp, lines, text_bboxes, circles, placed_bboxes,
-                placed_text_bboxes, vx0, vy0, vx1, vy1, draw_bbox)
+                placed_text_bboxes, vx0, vy0, vx1, vy1, draw_bbox,
+                hatch_bboxes=hatch_bboxes)
             bx0, bx1, by0, by1 = _single_bbox(wp, dname, diag_len, angle)
             bbox = (min(bx0, wp[0])-1, max(bx1, wp[0])+1,
                     min(by0, wp[1])-1, max(by1, wp[1])+1)
@@ -547,7 +556,8 @@ def _annotate_view(msp, welds, view_id, bbox, part_centroids, f_counter, w_count
 
     # ---- 全局后处理：冲突解决（最多8次迭代） ----
     _resolve_label_conflicts(msp, lines, text_bboxes, circles,
-                             vx0, vy0, vx1, vy1, draw_bbox, _placements, placed_text_bboxes, 8)
+                             vx0, vy0, vx1, vy1, draw_bbox, _placements, placed_text_bboxes, 8,
+                             hatch_bboxes=hatch_bboxes)
 
     # ---- 绘制所有标注 ----
     for pd in _placements:
@@ -728,7 +738,8 @@ def _draw_paired_weld_label(msp, labels, weld_pos, dname, diag_len, angle_deg):
 
 
 def _search_placement(weld_pos, lines, text_bboxes, circles, placed_bboxes,
-                      placed_text_bboxes, vx0, vy0, vx1, vy1, draw_bbox=None, is_pair=False):
+                      placed_text_bboxes, vx0, vy0, vx1, vy1, draw_bbox=None, is_pair=False,
+                      hatch_bboxes=None):
     """在360°连续角度中搜索最佳标注位置。"""
     wx, wy = weld_pos
 
@@ -820,6 +831,10 @@ def _search_placement(weld_pos, lines, text_bboxes, circles, placed_bboxes,
         for (ccx, ccy, cr) in circles:
             if not (bx1 < ccx - cr or bx0 > ccx + cr or by1 < ccy - cr or by0 > ccy + cr):
                 return True
+        if hatch_bboxes:
+            for (hx0, hx1, hy0, hy1) in hatch_bboxes:
+                if not (bx1 < hx0 - 8 or bx0 > hx1 + 8 or by1 < hy0 - 8 or by0 > hy1 + 8):
+                    return True
         return False
 
     def _fine_tune(dist, angle, _db):
@@ -1102,7 +1117,8 @@ def _bbox_in_boundary(nbb, vx0, vy0, vx1, vy1, draw_bbox):
 
 
 def _resolve_label_conflicts(msp, lines, text_bboxes, circles,
-                              vx0, vy0, vx1, vy1, draw_bbox, placements, placed_text_bboxes, max_iter=8):
+                              vx0, vy0, vx1, vy1, draw_bbox, placements, placed_text_bboxes, max_iter=8,
+                              hatch_bboxes=None):
     """全局后处理：检测标注间的文字重叠并进行综合微调（距离/角度/方向翻转/双向调整）。"""
     _OVERLAP_MARGIN = 8.0
 
@@ -1190,6 +1206,13 @@ def _resolve_label_conflicts(msp, lines, text_bboxes, circles,
                     _tbb[3] < ccy - cr or _tbb[2] > ccy + cr):
                 return None
 
+        # 文字与 HATCH 填充区重叠
+        if hatch_bboxes:
+            for (hx0, hx1, hy0, hy1) in hatch_bboxes:
+                if not (_tbb[1] < hx0 - 8 or _tbb[0] > hx1 + 8 or
+                        _tbb[3] < hy0 - 8 or _tbb[2] > hy1 + 8):
+                    return None
+
         return nbb, _tbb
 
     for _iter in range(max_iter):
@@ -1263,7 +1286,7 @@ def _resolve_label_conflicts(msp, lines, text_bboxes, circles,
                         pos, lines, text_bboxes, circles,
                         [p[7] for p in placements], placed_text_bboxes,
                         vx0, vy0, vx1, vy1, draw_bbox,
-                        is_pair=(g == 'pair'))
+                        is_pair=(g == 'pair'), hatch_bboxes=hatch_bboxes)
                     _re_result = _adjust_safe(target, pos, _dn, _ds, _ag, g, target)
                     if _re_result:
                         _nbb, _tbb = _re_result
