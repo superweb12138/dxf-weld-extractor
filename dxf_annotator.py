@@ -902,6 +902,64 @@ def _search_placement(weld_pos, lines, text_bboxes, circles, placed_bboxes,
                     return True
         return False
 
+    def _has_major_conflict(angle_deg, dist, _db):
+        """Rigid check: only text overlap, boundary, and text-inside-shape."""
+        rad = math.radians(angle_deg)
+        cos_a, sin_a = math.cos(rad), math.sin(rad)
+        ex = wx + dist * cos_a
+        ey = wy + dist * sin_a
+        h_len = PAIR_HORIZ_LAND if is_pair else HORIZ_LAND
+        h_land = h_len if cos_a >= -0.05 else -h_len
+        hx = ex + h_land; hy = ey
+        lw = LABEL_HEIGHT * (6.5 if is_pair else 3.2)
+        bx0 = hx if h_land >= 0 else hx - lw
+        bx1 = hx + lw if h_land >= 0 else hx
+        by0, by1 = hy, hy + LABEL_HEIGHT
+        nbb = (min(wx, ex, bx0), max(wx, ex, bx1),
+               min(wy, ey, by0), max(wy, ey, by1))
+        if not _bbox_in_boundary(nbb, vx0, vy0, vx1, vy1, _db):
+            return True
+        for otb in placed_text_bboxes:
+            if not (bx1 < otb[0] - 8 or bx0 > otb[1] + 8 or by1 < otb[2] - 8 or by0 > otb[3] + 8):
+                return True
+        for (tx0, tx1, ty0, ty1) in text_bboxes:
+            if not (bx1 < tx0 - 8 or bx0 > tx1 + 8 or by1 < ty0 - 8 or by0 > ty1 + 8):
+                return True
+        for (tx0, tx1, ty0, ty1) in text_bboxes:
+            if _seg_cross_rect((wx, wy), (ex, ey), tx0, tx1, ty0, ty1):
+                return True
+        for otb in placed_text_bboxes:
+            if _seg_cross_rect((wx, wy), (ex, ey), otb[0], otb[1], otb[2], otb[3]):
+                return True
+        for otb in placed_text_bboxes:
+            if _seg_cross_rect((ex, ey), (hx, hy), otb[0], otb[1], otb[2], otb[3]):
+                return True
+        for (pbx0, pbx1, pby0, pby1) in placed_bboxes:
+            if _seg_cross_rect((wx, wy), (ex, ey), pbx0, pbx1, pby0, pby1):
+                return True
+            if _seg_cross_rect((ex, ey), (hx, hy), pbx0, pbx1, pby0, pby1):
+                return True
+        _cx_txt = (bx0 + bx1) / 2
+        _cy_txt = (by0 + by1) / 2
+        _rays = [(_cx_txt + 99999, _cy_txt), (_cx_txt - 99999, _cy_txt),
+                 (_cx_txt, _cy_txt + 99999), (_cx_txt, _cy_txt - 99999)]
+        _odd = 0
+        for _rx, _ry in _rays:
+            _cnt = sum(1 for (sx, sy), (ex2, ey2) in lines
+                       if _segments_cross_((_cx_txt, _cy_txt), (_rx, _ry), (sx, sy), (ex2, ey2)))
+            if _cnt % 2 == 1:
+                _odd += 1
+        if _odd >= 3:
+            return True
+        for (ccx, ccy, cr) in circles:
+            if not (bx1 < ccx - cr or bx0 > ccx + cr or by1 < ccy - cr or by0 > ccy + cr):
+                return True
+        if hatch_bboxes:
+            for (hx0, hx1, hy0, hy1) in hatch_bboxes:
+                if not (bx1 < hx0 - 8 or bx0 > hx1 + 8 or by1 < hy0 - 8 or by0 > hy1 + 8):
+                    return True
+        return False
+
     def _fine_tune(dist, angle, _db):
         """Find shorter clean position near the given one."""
         _ang, _dst = angle, dist
@@ -950,6 +1008,13 @@ def _search_placement(weld_pos, lines, text_bboxes, circles, placed_bboxes,
                     if not _has_conflict(angle, dist, _db):
                         _fa, _fd, _fs = _fine_tune(dist, angle, _db)
                         return _fs, (_fa, _fd, 0)
+        # Phase 3: opposite-side short search (skip minor geometry checks)
+        _opposite = (_ideal_ang + 180) % 360
+        for dist in distances:
+            if not _has_major_conflict(_opposite, dist, _db):
+                _fa, _fd, _fs = _fine_tune(dist, _opposite, _db)
+                return _fs, (_fa, _fd, 0)
+        # Phase 4: scoring fallback (rare)
         _best_score = -999999999
         _best_result = (_ideal_ang, min(distances), 0)
         for dist in distances:
