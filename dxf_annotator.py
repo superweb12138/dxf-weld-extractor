@@ -213,6 +213,23 @@ def _collect_all_obstacles(doc, view_id):
     for blk in doc.blocks:
         if blk.name.startswith('Part') and re.search(rf' - {view_id}$', blk.name):
             _add_block_entities(blk)
+            # Add Part's overall line bbox to hatch_bboxes (catches I-beam/stiffener overlaps that ray casting misses)
+            def _part_lines(blk2, _xs, _ys):
+                for _sub in blk2:
+                    if _sub.dxftype() == 'LINE':
+                        _xs.append(_sub.dxf.start.x); _xs.append(_sub.dxf.end.x)
+                        _ys.append(_sub.dxf.start.y); _ys.append(_sub.dxf.end.y)
+                    elif _sub.dxftype() == 'INSERT':
+                        _sblk = doc.blocks.get(_sub.dxf.name)
+                        if _sblk:
+                            _part_lines(_sblk, _xs, _ys)
+            _pxs, _pys = [], []
+            _part_lines(blk, _pxs, _pys)
+            if _pxs and _pys:
+                _m = 8  # shrink: +8mm to offset hatch bbox 8mm margin → effective = original Part outline
+                _pb = (min(_pxs) + _m, max(_pxs) - _m, min(_pys) + _m, max(_pys) - _m)
+                if _pb[0] < _pb[1] and _pb[2] < _pb[3]:
+                    hatch_bboxes.append(_pb)
 
     # 2) WeldMark and Mark blocks in this view (original symbols, leader lines)
     for blk in doc.blocks:
@@ -692,12 +709,12 @@ def _text_bbox(weld_pos, dname, diag_len, angle_deg, is_pair=False):
     _rad = math.radians(angle_deg)
     _tbx, _tby = _label_corner(weld_pos, dname, diag_len, angle_deg, is_pair=is_pair)
     _width = LABEL_HEIGHT * (6.5 if is_pair else 3.2)
-    if math.cos(_rad) >= -0.05:
-        _tbx0 = _tbx
-        _tbx1 = _tbx + _width
-    else:
+    if math.cos(_rad) >= -0.05:    # BR: text extends LEFT from hx
         _tbx0 = _tbx - _width
         _tbx1 = _tbx
+    else:                            # BL: text extends RIGHT from hx
+        _tbx0 = _tbx
+        _tbx1 = _tbx + _width
     return (_tbx0, _tbx1, _tby, _tby + LABEL_HEIGHT)
 
 
@@ -819,8 +836,8 @@ def _search_placement(weld_pos, lines, text_bboxes, circles, placed_bboxes,
         h_land = h_len if cos_a >= -0.05 else -h_len
         hx = ex + h_land; hy = ey
         lw = LABEL_HEIGHT * (6.5 if is_pair else 3.2)
-        bx0 = hx if h_land >= 0 else hx - lw
-        bx1 = hx + lw if h_land >= 0 else hx
+        bx0 = hx - lw if h_land >= 0 else hx
+        bx1 = hx if h_land >= 0 else hx + lw
         by0, by1 = hy, hy + LABEL_HEIGHT
         nbb = (min(wx, ex, bx0), max(wx, ex, bx1),
                min(wy, ey, by0), max(wy, ey, by1))
@@ -933,21 +950,15 @@ def _search_placement(weld_pos, lines, text_bboxes, circles, placed_bboxes,
                     if not _has_conflict(angle, dist, _db):
                         _fa, _fd, _fs = _fine_tune(dist, angle, _db)
                         return _fs, (_fa, _fd, 0)
-        # Phase 2b: opposite hemisphere early
-        _opposite = (_ideal_ang + 180) % 360
-        for dist in distances:
-            if not _has_conflict(_opposite, dist, _db):
-                _fa, _fd, _fs = _fine_tune(dist, _opposite, _db)
-                return _fs, (_fa, _fd, 0)
         # Phase 2c: remaining angles (±30° to ±170°)
         for step in range(3, 19):
             for sign in (1, -1):
                 angle = (_ideal_ang + sign * step * 10) % 360
-                if angle == _opposite: continue
                 for dist in distances:
                     if not _has_conflict(angle, dist, _db):
                         _fa, _fd, _fs = _fine_tune(dist, angle, _db)
                         return _fs, (_fa, _fd, 0)
+
         _best_score = -999999999
         _best_result = (_ideal_ang, min(distances), 0)
         for dist in distances:
@@ -959,6 +970,9 @@ def _search_placement(weld_pos, lines, text_bboxes, circles, placed_bboxes,
                                          _db, is_pair=is_pair, min_score=_best_score,
                                          line_grid=_line_grid,
                                          hatch_bboxes=hatch_bboxes)
+                _ang_diff = abs((angle - _ideal_ang + 180) % 360 - 180)
+                if _ang_diff > 90:
+                    score -= 500
                 if score > _best_score:
                     _best_score = score
                     _best_result = (angle, dist, 0)
@@ -990,9 +1004,9 @@ def _score_placement(wx, wy, angle_deg, dist, lines, text_bboxes, circles,
     lw = LABEL_HEIGHT * 6.5 if is_pair else LABEL_HEIGHT * 3.2
     lh = LABEL_HEIGHT
     if h_land >= 0:
-        bx0, bx1 = hx, hx + lw
-    else:
         bx0, bx1 = hx - lw, hx
+    else:
+        bx0, bx1 = hx, hx + lw
     by0, by1 = hy, hy + lh
 
     # 候选标注整体包围盒：用于近邻线过滤（大幅提升性能）
@@ -1109,9 +1123,29 @@ def _score_placement(wx, wy, angle_deg, dist, lines, text_bboxes, circles,
                 score -= 30
                 break
  
-    # 文字中心点被几何线包围（在结构内部）：扣80
+    # 文字边穿越几何线：扣500
+    _txt_edges = [((bx0, by0), (bx1, by0)), ((bx1, by0), (bx1, by1)),
+                  ((bx1, by1), (bx0, by1)), ((bx0, by1), (bx0, by0))]
+    for (sx, sy), (ex2, ey2) in _near_lines:
+        for (_s, _e) in _txt_edges:
+            if _segments_cross_(_s, _e, (sx, sy), (ex2, ey2)):
+                score -= 500
+                break
+
+    # 射线法：检查文字中心是否在几何线围成的封闭形状内
     cx_txt = (bx0 + bx1) / 2
     cy_txt = (by0 + by1) / 2
+    _rays = [(cx_txt + 99999, cy_txt), (cx_txt - 99999, cy_txt),
+             (cx_txt, cy_txt + 99999), (cx_txt, cy_txt - 99999)]
+    _odd = 0
+    for _rx, _ry in _rays:
+        _cnt = sum(1 for (sx, sy), (ex2, ey2) in lines
+                   if _segments_cross_((cx_txt, cy_txt), (_rx, _ry), (sx, sy), (ex2, ey2)))
+        if _cnt % 2 == 1:
+            _odd += 1
+    if _odd >= 3:
+        score -= 2000
+
     _min_center_dist = 999
     for (sx, sy), (ex2, ey2) in _near_lines:
         d, _ = _dist_pt_to_seg((cx_txt, cy_txt), (sx, sy), (ex2, ey2))
@@ -1132,8 +1166,8 @@ def _score_placement(wx, wy, angle_deg, dist, lines, text_bboxes, circles,
                 score -= 2000
 
     # 距离惩罚：越远越不推荐（避免延伸出图）
-    if dist > 30:
-        score -= (dist - 30) * 3
+    if dist > 60:
+        score -= (dist - 60) * 1
 
     return score
 
