@@ -881,7 +881,7 @@ def _search_placement(weld_pos, lines, text_bboxes, circles, placed_bboxes,
                  (_cx_txt, _cy_txt + 99999), (_cx_txt, _cy_txt - 99999)]
         _odd = 0
         for _rx, _ry in _rays:
-            _cnt = sum(1 for (sx, sy), (ex2, ey2) in _near
+            _cnt = sum(1 for (sx, sy), (ex2, ey2) in lines
                        if _segments_cross_((_cx_txt, _cy_txt), (_rx, _ry), (sx, sy), (ex2, ey2)))
             if _cnt % 2 == 1:
                 _odd += 1
