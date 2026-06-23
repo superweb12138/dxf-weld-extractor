@@ -955,13 +955,6 @@ def _search_placement(weld_pos, lines, text_bboxes, circles, placed_bboxes,
                         if sc > _best_sc:
                             _best_sc = sc
                             _best_ang, _best_dst = na, nd2
-            # Remote check: 尝试远端是否更干净（不经过 _has_conflict 过滤，直接评分比较）
-            for _rd in [36, 48, 60, 72, 96]:
-                for _roff in range(-40, 41, 20):
-                    _rna = (_best_ang + _roff) % 360
-                    _rsc = _ft_score(_rna, _rd)
-                    if _rsc > _best_sc:
-                        _best_sc, _best_ang, _best_dst = _rsc, _rna, _rd
             return _best_ang, _best_dst, 0
 
         return _ang, _dst, 0
