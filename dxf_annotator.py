@@ -1224,6 +1224,20 @@ def _score_placement(wx, wy, angle_deg, dist, lines, text_bboxes, circles,
             if bx1 > hx0 - 8 and bx0 < hx1 + 8 and by1 > hy0 - 8 and by0 < hy1 + 8:
                 score -= 2000
 
+    # 远离已放置标签奖励：防止多个标签挤在一起
+    _clearance_bonus = 0
+    for (_pb0, _pb1, _pb2, _pb3) in placed_text_bboxes:
+        _gx = max(_pb0 - bx1, bx0 - _pb1, 0)
+        _gy = max(_pb2 - by1, by0 - _pb3, 0)
+        _d = math.hypot(_gx, _gy)
+        if _d < 16:
+            _clearance_bonus -= (16 - _d) * 10
+        elif _d < 40:
+            _clearance_bonus += (_d - 16) * 2
+        else:
+            _clearance_bonus += 48
+    score += _clearance_bonus
+
     # 距离惩罚：越远越不推荐（避免延伸出图）
     if is_crowded:
         if dist < 20:
