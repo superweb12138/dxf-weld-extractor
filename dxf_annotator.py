@@ -826,7 +826,7 @@ def _search_placement(weld_pos, lines, text_bboxes, circles, placed_bboxes,
             for _gy in range(_gy0, _gy1 + 1):
                 _line_grid.setdefault((_gx, _gy), []).append((_s, _e))
 
-    def _has_conflict(angle_deg, dist, _db):
+    def _has_conflict(angle_deg, dist, _db, relaxed=False):
         """True if position has any critical conflict (text overlap, line cross, boundary)."""
         rad = math.radians(angle_deg)
         cos_a, sin_a = math.cos(rad), math.sin(rad)
@@ -875,10 +875,11 @@ def _search_placement(weld_pos, lines, text_bboxes, circles, placed_bboxes,
         for (sx, sy), (ex2, ey2) in _near:
             if not (max(sx, ex2) < _min_x - _mrg or min(sx, ex2) > _max_x + _mrg or
                     max(sy, ey2) < _min_y - _mrg or min(sy, ey2) > _max_y + _mrg):
-                if _segments_cross_((ex, ey), (hx, hy), (sx, sy), (ex2, ey2)):
-                    return True
+                if not relaxed:
+                    if _segments_cross_((ex, ey), (hx, hy), (sx, sy), (ex2, ey2)):
+                        return True
         # 文字与几何线过近
-        _line_mrg = 3.0
+        _line_mrg = 2.0 if relaxed else 3.0
         _txt_pts = [(bx0, by0), (bx1, by0), (bx0, by1), (bx1, by1),
                     ((bx0+bx1)/2, by0), ((bx0+bx1)/2, by1),
                     (bx0, (by0+by1)/2), (bx1, (by0+by1)/2)]
@@ -918,7 +919,7 @@ def _search_placement(weld_pos, lines, text_bboxes, circles, placed_bboxes,
         return False
 
     def _fine_tune(dist, angle, _db):
-        """Find shorter clean position near the given one."""
+        """Find clean position near the given one, trying all distances."""
         _ang, _dst = angle, dist
         for da in range(-30, 31, 2):
             if not _has_conflict(angle + da, dist, _db):
@@ -928,6 +929,13 @@ def _search_placement(weld_pos, lines, text_bboxes, circles, placed_bboxes,
             for na_off in range(-30, 31, 2):
                 if not _has_conflict(_ang + na_off, nd, _db):
                     _ang, _dst = _ang + na_off, nd; break
+        if _dst == dist:
+            for nd in range(dist + 2, 57, 2):
+                for na_off in range(-30, 31, 2):
+                    if not _has_conflict(_ang + na_off, nd, _db, relaxed=True):
+                        _ang, _dst = _ang + na_off, nd; break
+                if _dst != dist:
+                    break
         return _ang, _dst, 0
 
     def _search_pass(_db):
@@ -1163,7 +1171,7 @@ def _score_placement(wx, wy, angle_deg, dist, lines, text_bboxes, circles,
     if hatch_bboxes:
         for (hx0, hx1, hy0, hy1) in hatch_bboxes:
             if bx1 > hx0 and bx0 < hx1 and by1 > hy0 and by0 < hy1:
-                score -= 2000
+                score -= 5000
 
     # 文字与已放置标注重叠：扣20000（硬性惩罚，防止标签叠在一起）
     _OV_MARGIN = 8.0
@@ -1342,8 +1350,8 @@ def _resolve_label_conflicts(msp, lines, text_bboxes, circles,
         # 文字与 HATCH 填充区重叠
         if hatch_bboxes:
             for (hx0, hx1, hy0, hy1) in hatch_bboxes:
-                if not (_tbb[1] < hx0 - 8 or _tbb[0] > hx1 + 8 or
-                        _tbb[3] < hy0 - 8 or _tbb[2] > hy1 + 8):
+                if not (_tbb[1] < hx0 or _tbb[0] > hx1 or
+                        _tbb[3] < hy0 or _tbb[2] > hy1):
                     return None
 
         return nbb, _tbb
@@ -1433,17 +1441,27 @@ def _resolve_label_conflicts(msp, lines, text_bboxes, circles,
         if not _any_fix:
             break
 
-    # 最终安全兜底：强制所有超出边界的标注回到最短距离
+    # 最终安全兜底：超出边界的标注逐步缩短距离，找到不超边界且不重叠 hatch 的最短距离
     for k, pd in enumerate(placements):
         gk, it_k, lb_k, pk, dnk, dsk, agk, bbk = pd
-        if not _bbox_in_boundary(bbk, vx0, vy0, vx1, vy1, draw_bbox):
-            nd = 8
+        if _bbox_in_boundary(bbk, vx0, vy0, vx1, vy1, draw_bbox):
+            continue
+        for nd in range(8, dsk + 1, 2):
             if gk == 'pair':
                 nbb = _paired_bbox(pk, dnk, nd, agk)
             else:
                 nbb = _single_bbox(pk, dnk, nd, agk)
-            if _bbox_in_boundary(nbb, vx0, vy0, vx1, vy1, draw_bbox):
+            if not _bbox_in_boundary(nbb, vx0, vy0, vx1, vy1, draw_bbox):
+                continue
+            _tb = _text_bbox(pk, dnk, nd, agk, is_pair=(gk == 'pair'))
+            _hatch_ok = True
+            if hatch_bboxes:
+                for (hx0, hx1, hy0, hy1) in hatch_bboxes:
+                    if not (_tb[1] < hx0 or _tb[0] > hx1 or _tb[3] < hy0 or _tb[2] > hy1):
+                        _hatch_ok = False; break
+            if _hatch_ok:
                 placements[k] = (gk, it_k, lb_k, pk, dnk, nd, agk, nbb)
+                break
 
 
 def _draw_fallback_label(msp, w, label, bbox):
