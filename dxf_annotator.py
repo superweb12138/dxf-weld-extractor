@@ -1003,9 +1003,9 @@ def _search_placement(weld_pos, lines, text_bboxes, circles, placed_bboxes,
 
         _best_score = -999999999
         _best_result = (_ideal_ang, min(distances), 0)
-        _p3_dists = [d for d in distances if d <= 30]
+        _p3_dists = [d for d in distances if d <= 54]
         for dist in _p3_dists:
-            for _off in range(0, 360, 30):
+            for _off in range(0, 360, 10):
                 angle = (_ideal_ang + _off) % 360
                 score = _score_candidate(angle, dist)
                 if score > _best_score:
