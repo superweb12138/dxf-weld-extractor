@@ -1003,14 +1003,6 @@ def _search_placement(weld_pos, lines, text_bboxes, circles, placed_bboxes,
 
         _best_score = -999999999
         _best_result = (_ideal_ang, min(distances), 0)
-        _short_dists = [d for d in distances if d <= 30]
-        for dist in _short_dists:
-            for _off in range(0, 360, 30):
-                angle = (_ideal_ang + _off) % 360
-                score = _score_candidate(angle, dist)
-                if score > _best_score:
-                    _best_score = score
-                    _best_result = (angle, dist, 0)
         _bd, _bdst, _ = _best_result
         _fa, _fd, _fs = _fine_tune(_bdst, _bd, _db)
         return _fs, (_fa, _fd, 0)
@@ -1116,10 +1108,10 @@ def _score_placement(wx, wy, angle_deg, dist, lines, text_bboxes, circles,
         if _seg_cross_rect((wx, wy), (ex, ey), pbx0, pbx1, pby0, pby1):
             score -= 200
 
-    # 斜引线穿过已放置标注文字：扣20000（硬性惩罚，远大于hatch重叠）
+    # 斜引线穿过已放置标注文字：扣2000（硬性惩罚）
     for k, otb in enumerate(placed_text_bboxes):
         if _seg_cross_rect((wx, wy), (ex, ey), otb[0], otb[1], otb[2], otb[3]):
-            score -= 20000
+            score -= 2000
 
     # 斜引线靠近文字框但不穿过：扣30
     _DIAG_PROX_MARGIN = 3.0
@@ -1131,16 +1123,16 @@ def _score_placement(wx, wy, angle_deg, dist, lines, text_bboxes, circles,
             if not _seg_cross_rect((wx, wy), (ex, ey), tx0, tx1, ty0, ty1):
                 score -= 30
 
-    # 文字与已有文字框重叠：扣20000（不可接受，远大于hatch重叠）
+    # 文字与已有文字框重叠：扣2000（不可接受）
     _OVERLAP_MARGIN = 8.0
     for (tx0, tx1, ty0, ty1) in text_bboxes:
         if bx1 > tx0 - _OVERLAP_MARGIN and bx0 < tx1 + _OVERLAP_MARGIN and by1 > ty0 - _OVERLAP_MARGIN and by0 < ty1 + _OVERLAP_MARGIN:
-            score -= 20000
+            score -= 2000
 
-    # 文字与已放置标注文字重叠：扣20000（不可接受）
+    # 文字与已放置标注文字重叠：扣2000（不可接受）
     for (pbx0, pbx1, pby0, pby1) in placed_text_bboxes:
         if bx1 > pbx0 - _OVERLAP_MARGIN and bx0 < pbx1 + _OVERLAP_MARGIN and by1 > pby0 - _OVERLAP_MARGIN and by0 < pby1 + _OVERLAP_MARGIN:
-            score -= 20000
+            score -= 2000
  
     # 文字与几何线过近：扣30（检测4个角点+4条边中点）
     _LINE_MARGIN = 4.0
