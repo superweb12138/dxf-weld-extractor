@@ -591,9 +591,6 @@ def _annotate_view(msp, welds, view_id, bbox, part_centroids, f_counter, w_count
     if part_centroids and len(set(part_centroids)) >= 2:
         _redistribute_groups(groups, part_centroids)
 
-    # ---- 拥挤度判定：标签对数 ≥5 视为拥挤视图 ----
-    is_crowded = len(groups) >= 5
-
     placed_bboxes = []          # 引线+文字整体包围盒
     placed_text_bboxes = []     # 纯文字包围盒（用于文字重叠检测）
     _placements = []
@@ -607,7 +604,7 @@ def _annotate_view(msp, welds, view_id, bbox, part_centroids, f_counter, w_count
             dname, diag_len, angle = _search_placement(
                 wp_a, lines, text_bboxes, circles, placed_bboxes,
                 placed_text_bboxes, vx0, vy0, vx1, vy1, draw_bbox, is_pair=True,
-                hatch_bboxes=hatch_bboxes, is_crowded=is_crowded)
+                hatch_bboxes=hatch_bboxes)
             bx0, bx1, by0, by1 = _paired_bbox(wp_a, dname, diag_len, angle)
             bbox = (min(bx0, wp_a[0])-1, max(bx1, wp_a[0])+1,
                     min(by0, wp_a[1])-1, max(by1, wp_a[1])+1)
@@ -620,7 +617,7 @@ def _annotate_view(msp, welds, view_id, bbox, part_centroids, f_counter, w_count
             dname, diag_len, angle = _search_placement(
                 wp, lines, text_bboxes, circles, placed_bboxes,
                 placed_text_bboxes, vx0, vy0, vx1, vy1, draw_bbox,
-                hatch_bboxes=hatch_bboxes, is_crowded=is_crowded)
+                hatch_bboxes=hatch_bboxes)
             bx0, bx1, by0, by1 = _single_bbox(wp, dname, diag_len, angle)
             bbox = (min(bx0, wp[0])-1, max(bx1, wp[0])+1,
                     min(by0, wp[1])-1, max(by1, wp[1])+1)
@@ -813,7 +810,7 @@ def _draw_paired_weld_label(msp, labels, weld_pos, dname, diag_len, angle_deg):
 
 def _search_placement(weld_pos, lines, text_bboxes, circles, placed_bboxes,
                       placed_text_bboxes, vx0, vy0, vx1, vy1, draw_bbox=None, is_pair=False,
-                      hatch_bboxes=None, is_crowded=False):
+                      hatch_bboxes=None):
     """在360°连续角度中搜索最佳标注位置。"""
     wx, wy = weld_pos
 
@@ -941,66 +938,41 @@ def _search_placement(weld_pos, lines, text_bboxes, circles, placed_bboxes,
         _vcx = (vx0 + vx1) / 2
         _vcy = (vy0 + vy1) / 2
         _ideal_ang = math.degrees(math.atan2(wy - _vcy, wx - _vcx)) % 360
-
-        def _score_candidate(angle, dist):
-            score = _score_placement(wx, wy, angle, dist, lines, text_bboxes,
-                                    circles, placed_bboxes, placed_text_bboxes,
-                                    vx0, vy0, vx1, vy1,
-                                    _db, is_pair=is_pair, min_score=None,
-                                    line_grid=_line_grid,
-                                    hatch_bboxes=hatch_bboxes,
-                                    is_crowded=is_crowded)
-            _ang_diff = abs((angle - _ideal_ang + 180) % 360 - 180)
-            if _ang_diff > 90:
-                score -= 500
-            return score
-
-        if is_crowded:
-            _candidates = []
-            def _try_pos(angle, dist):
-                if not _has_conflict(angle, dist, _db):
-                    _candidates.append((_score_candidate(angle, dist), angle, dist))
-            for dist in distances:
-                _try_pos(_ideal_ang, dist)
-            for step in [1, 2]:
-                for sign in (1, -1):
-                    angle = (_ideal_ang + sign * step * 10) % 360
-                    for dist in distances:
-                        _try_pos(angle, dist)
-            for step in range(3, 19):
-                for sign in (1, -1):
-                    angle = (_ideal_ang + sign * step * 10) % 360
-                    for dist in distances:
-                        _try_pos(angle, dist)
-            if _candidates:
-                _best = max(_candidates, key=lambda x: x[0])
-                return _best[0], (_best[1], _best[2], 0)
-        else:
-            for dist in distances:
-                if not _has_conflict(_ideal_ang, dist, _db):
-                    _fa, _fd, _fs = _fine_tune(dist, _ideal_ang, _db)
-                    return _fs, (_fa, _fd, 0)
-            for step in [1, 2]:
-                for sign in (1, -1):
-                    angle = (_ideal_ang + sign * step * 10) % 360
-                    for dist in distances:
-                        if not _has_conflict(angle, dist, _db):
-                            _fa, _fd, _fs = _fine_tune(dist, angle, _db)
-                            return _fs, (_fa, _fd, 0)
-            for step in range(3, 19):
-                for sign in (1, -1):
-                    angle = (_ideal_ang + sign * step * 10) % 360
-                    for dist in distances:
-                        if not _has_conflict(angle, dist, _db):
-                            _fa, _fd, _fs = _fine_tune(dist, angle, _db)
-                            return _fs, (_fa, _fd, 0)
+        for dist in distances:
+            if not _has_conflict(_ideal_ang, dist, _db):
+                _fa, _fd, _fs = _fine_tune(dist, _ideal_ang, _db)
+                return _fs, (_fa, _fd, 0)
+        # Phase 2a: near-ideal angles (±10°, ±20°)
+        for step in [1, 2]:
+            for sign in (1, -1):
+                angle = (_ideal_ang + sign * step * 10) % 360
+                for dist in distances:
+                    if not _has_conflict(angle, dist, _db):
+                        _fa, _fd, _fs = _fine_tune(dist, angle, _db)
+                        return _fs, (_fa, _fd, 0)
+        # Phase 2c: remaining angles (±30° to ±170°)
+        for step in range(3, 19):
+            for sign in (1, -1):
+                angle = (_ideal_ang + sign * step * 10) % 360
+                for dist in distances:
+                    if not _has_conflict(angle, dist, _db):
+                        _fa, _fd, _fs = _fine_tune(dist, angle, _db)
+                        return _fs, (_fa, _fd, 0)
 
         _best_score = -999999999
         _best_result = (_ideal_ang, min(distances), 0)
         for dist in distances:
             for _off in range(0, 360, 10):
                 angle = (_ideal_ang + _off) % 360
-                score = _score_candidate(angle, dist)
+                score = _score_placement(wx, wy, angle, dist, lines, text_bboxes,
+                                         circles, placed_bboxes, placed_text_bboxes,
+                                         vx0, vy0, vx1, vy1,
+                                         _db, is_pair=is_pair, min_score=_best_score,
+                                         line_grid=_line_grid,
+                                         hatch_bboxes=hatch_bboxes)
+                _ang_diff = abs((angle - _ideal_ang + 180) % 360 - 180)
+                if _ang_diff > 90:
+                    score -= 500
                 if score > _best_score:
                     _best_score = score
                     _best_result = (angle, dist, 0)
@@ -1015,7 +987,7 @@ def _search_placement(weld_pos, lines, text_bboxes, circles, placed_bboxes,
 def _score_placement(wx, wy, angle_deg, dist, lines, text_bboxes, circles,
                      placed_bboxes, placed_text_bboxes, vx0, vy0, vx1, vy1,
                      draw_bbox=None, is_pair=False, min_score=None, line_grid=None,
-                     hatch_bboxes=None, is_crowded=False):
+                     hatch_bboxes=None):
     """对 (角度, 距离) 位置评分。分值越高越推荐，正分表示无冲突，负分表示冲突严重。"""
     score = 0
     rad = math.radians(angle_deg)
@@ -1194,14 +1166,8 @@ def _score_placement(wx, wy, angle_deg, dist, lines, text_bboxes, circles,
                 score -= 2000
 
     # 距离惩罚：越远越不推荐（避免延伸出图）
-    if is_crowded:
-        if dist < 20:
-            score -= (20 - dist) * 5   # 拥挤视图惩罚过短引线
-        elif dist > 80:
-            score -= (dist - 80) * 1   # 仍不鼓励过长
-    else:
-        if dist > 60:
-            score -= (dist - 60) * 1   # 简单视图保持现有
+    if dist > 60:
+        score -= (dist - 60) * 1
 
     return score
 
