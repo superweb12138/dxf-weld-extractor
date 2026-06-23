@@ -920,12 +920,12 @@ def _search_placement(weld_pos, lines, text_bboxes, circles, placed_bboxes,
     def _fine_tune(dist, angle, _db):
         """Find shorter clean position near the given one."""
         _ang, _dst = angle, dist
-        for da in [-8, -6, -4, -2, 2, 4, 6, 8]:
+        for da in range(-30, 31, 2):
             if not _has_conflict(angle + da, dist, _db):
                 _ang = angle + da; break
         for nd in range(dist - 2, 7, -2):
             if nd < 8: continue
-            for na_off in range(-6, 7, 2):
+            for na_off in range(-30, 31, 2):
                 if not _has_conflict(_ang + na_off, nd, _db):
                     _ang, _dst = _ang + na_off, nd; break
         return _ang, _dst, 0
@@ -962,7 +962,7 @@ def _search_placement(weld_pos, lines, text_bboxes, circles, placed_bboxes,
         _best_score = -999999999
         _best_result = (_ideal_ang, min(distances), 0)
         for dist in distances:
-            for _off in range(0, 360, 10):
+            for _off in range(0, 360, 30):
                 angle = (_ideal_ang + _off) % 360
                 score = _score_placement(wx, wy, angle, dist, lines, text_bboxes,
                                          circles, placed_bboxes, placed_text_bboxes,
@@ -1164,6 +1164,12 @@ def _score_placement(wx, wy, angle_deg, dist, lines, text_bboxes, circles,
         for (hx0, hx1, hy0, hy1) in hatch_bboxes:
             if bx1 > hx0 - 8 and bx0 < hx1 + 8 and by1 > hy0 - 8 and by0 < hy1 + 8:
                 score -= 2000
+
+    # 文字与已放置标注重叠：扣20000（硬性惩罚，防止标签叠在一起）
+    _OV_MARGIN = 8.0
+    for (pbx0, pbx1, pby0, pby1) in placed_text_bboxes:
+        if bx1 > pbx0 - _OV_MARGIN and bx0 < pbx1 + _OV_MARGIN and by1 > pby0 - _OV_MARGIN and by0 < pby1 + _OV_MARGIN:
+            score -= 20000
 
     # 距离惩罚：越远越不推荐（避免延伸出图）
     if dist > 60:
