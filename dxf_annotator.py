@@ -227,8 +227,7 @@ def _collect_all_obstacles(doc, view_id):
             _part_lines(blk, _pxs, _pys)
             if _pxs and _pys:
                 _pw = max(_pxs) - min(_pxs); _ph = max(_pys) - min(_pys)
-                _m = min(8, _pw // 2, _ph // 2)  # shrink by 8mm max, or half of smaller dimension
-                _pb = (min(_pxs) + _m, max(_pxs) - _m, min(_pys) + _m, max(_pys) - _m)
+                _pb = (min(_pxs), max(_pxs), min(_pys), max(_pys))
                 if _pb[0] < _pb[1] and _pb[2] < _pb[3]:
                     hatch_bboxes.append(_pb)
 
@@ -914,7 +913,7 @@ def _search_placement(weld_pos, lines, text_bboxes, circles, placed_bboxes,
                 return True
         if hatch_bboxes:
             for (hx0, hx1, hy0, hy1) in hatch_bboxes:
-                if not (bx1 < hx0 - 8 or bx0 > hx1 + 8 or by1 < hy0 - 8 or by0 > hy1 + 8):
+                if not (bx1 < hx0 or bx0 > hx1 or by1 < hy0 or by0 > hy1):
                     return True
         return False
 
@@ -1163,7 +1162,7 @@ def _score_placement(wx, wy, angle_deg, dist, lines, text_bboxes, circles,
     # 文字与 HATCH/SOLID 填充区重叠：扣2000
     if hatch_bboxes:
         for (hx0, hx1, hy0, hy1) in hatch_bboxes:
-            if bx1 > hx0 - 8 and bx0 < hx1 + 8 and by1 > hy0 - 8 and by0 < hy1 + 8:
+            if bx1 > hx0 and bx0 < hx1 and by1 > hy0 and by0 < hy1:
                 score -= 2000
 
     # 文字与已放置标注重叠：扣20000（硬性惩罚，防止标签叠在一起）
