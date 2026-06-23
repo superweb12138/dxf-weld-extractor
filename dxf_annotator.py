@@ -52,8 +52,9 @@ MT_BOTTOM_CENTER = 8
 MT_BOTTOM_RIGHT = 9
 
 
-def _collect_all_obstacles(doc, view_id):
-    """Collect all visual obstacles in a view: lines, text bboxes, circles/arcs, hatch bboxes."""
+def _collect_all_obstacles(doc, view_id, view_bbox=None):
+    """Collect all visual obstacles in a view: lines, text bboxes, circles/arcs, hatch bboxes.
+    view_bbox: (x0,y0,x1,y1) to filter modelspace entities by spatial proximity."""
     lines, text_bboxes, circles, hatch_bboxes = [], [], [], []
 
     def add_entity(e):
@@ -238,7 +239,44 @@ def _collect_all_obstacles(doc, view_id):
                 _add_block_entities(blk)
 
     # 3) Modelspace entities (dimensions, title blocks, general annotations)
+    _MARGIN = 100  # buffer zone around view bbox
     for e in doc.modelspace():
+        if view_bbox:
+            # Quick spatial filter: check if entity is near the view
+            if e.dxftype() in ('LINE','LWPOLYLINE','POLYLINE'):
+                try:
+                    if e.dxftype() == 'LINE':
+                        pts = [(e.dxf.start.x, e.dxf.start.y), (e.dxf.end.x, e.dxf.end.y)]
+                    else:
+                        pts = [(v[0], v[1]) for v in list(e.get_points())[:2]]
+                    if (max(p[0] for p in pts) < view_bbox[0] - _MARGIN or
+                        min(p[0] for p in pts) > view_bbox[1] + _MARGIN or
+                        max(p[1] for p in pts) < view_bbox[2] - _MARGIN or
+                        min(p[1] for p in pts) > view_bbox[3] + _MARGIN):
+                        continue
+                except Exception:
+                    pass
+            elif e.dxftype() == 'INSERT':
+                ix, iy = e.dxf.insert.x, e.dxf.insert.y
+                if (ix < view_bbox[0] - _MARGIN or ix > view_bbox[1] + _MARGIN or
+                    iy < view_bbox[2] - _MARGIN or iy > view_bbox[3] + _MARGIN):
+                    continue
+            elif e.dxftype() in ('TEXT','MTEXT','ATTRIB','ATTDEF','MLEADER','DIMENSION'):
+                try:
+                    ix, iy = e.dxf.insert.x, e.dxf.insert.y
+                    if (ix < view_bbox[0] - _MARGIN or ix > view_bbox[1] + _MARGIN or
+                        iy < view_bbox[2] - _MARGIN or iy > view_bbox[3] + _MARGIN):
+                        continue
+                except Exception:
+                    pass
+            elif e.dxftype() in ('CIRCLE','ARC'):
+                try:
+                    cx, cy = e.dxf.center.x, e.dxf.center.y
+                    if (cx < view_bbox[0] - _MARGIN or cx > view_bbox[1] + _MARGIN or
+                        cy < view_bbox[2] - _MARGIN or cy > view_bbox[3] + _MARGIN):
+                        continue
+                except Exception:
+                    pass
         if e.dxftype() == 'INSERT':
             blk = doc.blocks.get(e.dxf.name)
             if blk:
@@ -462,7 +500,7 @@ def _annotate_one(doc, welds):
         vw = welds_by_view[view_id]
         bbox = view_bboxes.get(view_id)
         centroids = part_centroids.get(view_id, [])
-        obs_result = _collect_all_obstacles(doc, view_id)
+        obs_result = _collect_all_obstacles(doc, view_id, view_bbox=bbox)
         part_lines = obs_result[:3]
         hatch_bboxes = obs_result[3] if len(obs_result) > 3 else None
         _annotate_view(msp, vw, view_id, bbox, centroids, f_counter, w_counter, part_lines, draw_bbox, hatch_bboxes=hatch_bboxes)
@@ -892,13 +930,28 @@ def _search_placement(weld_pos, lines, text_bboxes, circles, placed_bboxes,
         for (sx, sy), (ex2, ey2) in _near:
             if _dist_pt_to_seg((_cx_txt, _cy_txt), (sx, sy), (ex2, ey2))[0] < 1.5:
                 return True
-        # 射线法：检查文字中心是否在几何线围成的封闭形状内
-        _rays = [(_cx_txt + 99999, _cy_txt), (_cx_txt - 99999, _cy_txt),
-                 (_cx_txt, _cy_txt + 99999), (_cx_txt, _cy_txt - 99999)]
+        # 射线法（优化）：只检查可能跨过射线的线
+        # 水平射线（y 恒定）：只检查 y 范围覆盖射线 y 的线
+        # 垂直射线（x 恒定）：只检查 x 范围覆盖射线 x 的线
         _odd = 0
-        for _rx, _ry in _rays:
-            _cnt = sum(1 for (sx, sy), (ex2, ey2) in lines
-                       if _segments_cross_((_cx_txt, _cy_txt), (_rx, _ry), (sx, sy), (ex2, ey2)))
+        for _rx, _ry in [(_cx_txt + 99999, _cy_txt), (_cx_txt - 99999, _cy_txt)]:
+            if abs(_ry - _cy_txt) < 0.001:
+                _cnt = sum(1 for (sx, sy), (ex2, ey2) in _near
+                           if (sy <= _cy_txt <= ey2 or ey2 <= _cy_txt <= sy)
+                           and _segments_cross_((_cx_txt, _cy_txt), (_rx, _ry), (sx, sy), (ex2, ey2)))
+            else:
+                _cnt = sum(1 for (sx, sy), (ex2, ey2) in _near
+                           if _segments_cross_((_cx_txt, _cy_txt), (_rx, _ry), (sx, sy), (ex2, ey2)))
+            if _cnt % 2 == 1:
+                _odd += 1
+        for _rx, _ry in [(_cx_txt, _cy_txt + 99999), (_cx_txt, _cy_txt - 99999)]:
+            if abs(_rx - _cx_txt) < 0.001:
+                _cnt = sum(1 for (sx, sy), (ex2, ey2) in _near
+                           if (sx <= _cx_txt <= ex2 or ex2 <= _cx_txt <= sx)
+                           and _segments_cross_((_cx_txt, _cy_txt), (_rx, _ry), (sx, sy), (ex2, ey2)))
+            else:
+                _cnt = sum(1 for (sx, sy), (ex2, ey2) in _near
+                           if _segments_cross_((_cx_txt, _cy_txt), (_rx, _ry), (sx, sy), (ex2, ey2)))
             if _cnt % 2 == 1:
                 _odd += 1
         if _odd >= 3:
@@ -1140,15 +1193,21 @@ def _score_placement(wx, wy, angle_deg, dist, lines, text_bboxes, circles,
                 score -= 500
                 break
 
-    # 射线法：检查文字中心是否在几何线围成的封闭形状内
+    # 射线法（优化）：只检查可能跨过射线的线
     cx_txt = (bx0 + bx1) / 2
     cy_txt = (by0 + by1) / 2
-    _rays = [(cx_txt + 99999, cy_txt), (cx_txt - 99999, cy_txt),
-             (cx_txt, cy_txt + 99999), (cx_txt, cy_txt - 99999)]
     _odd = 0
-    for _rx, _ry in _rays:
-        _cnt = sum(1 for (sx, sy), (ex2, ey2) in lines
-                   if _segments_cross_((cx_txt, cy_txt), (_rx, _ry), (sx, sy), (ex2, ey2)))
+    _ray_lines = _near_lines if _near_lines else lines
+    for _rx, _ry in [(cx_txt + 99999, cy_txt), (cx_txt - 99999, cy_txt)]:
+        _cnt = sum(1 for (sx, sy), (ex2, ey2) in _ray_lines
+                   if (sy <= cy_txt <= ey2 or ey2 <= cy_txt <= sy)
+                   and _segments_cross_((cx_txt, cy_txt), (_rx, _ry), (sx, sy), (ex2, ey2)))
+        if _cnt % 2 == 1:
+            _odd += 1
+    for _rx, _ry in [(cx_txt, cy_txt + 99999), (cx_txt, cy_txt - 99999)]:
+        _cnt = sum(1 for (sx, sy), (ex2, ey2) in _ray_lines
+                   if (sx <= cx_txt <= ex2 or ex2 <= cx_txt <= sx)
+                   and _segments_cross_((cx_txt, cy_txt), (_rx, _ry), (sx, sy), (ex2, ey2)))
         if _cnt % 2 == 1:
             _odd += 1
     if _odd >= 3:

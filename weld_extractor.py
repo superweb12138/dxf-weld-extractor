@@ -2576,11 +2576,11 @@ def extract_welds(dxf_path):
 
             # CO010 stiffener weld-length override (normal WM path).
             _PP_ONLY = {'p182','p183','sp22','sp23','sp27'}
+            # WM 真实的焊道不应被 pp-only 跳过（pp 推导只处理无 WM 的额外焊道）
             if (comp == 'CO010'
                     and lbl_non_comp != comp
                     and lbl_non_comp in _PP_ONLY):
-                print(f"    [CO010 pp-only skip] {lbl_non_comp} geo={weld_len_mm_orig}")
-                continue
+                print(f"    [CO010 pp-only WM] {lbl_non_comp} geo={weld_len_mm_orig} (WM source, keep)")
             if (comp == 'CO010'
                     and lbl_non_comp != comp
                     and lbl_non_comp in part_dims
@@ -2730,9 +2730,33 @@ def extract_welds(dxf_path):
             else:
                 _typ_positions = [_weld_pos] * bom_fallback_count
 
+            # 收集其他含相同板材对的视图（TYP 跨视图分发）
+            _alt_views = []
+            if bom_fallback_count > 1 and comp == 'CO010' and part_lines_map and part_number_map:
+                _tgt_label = lbl_non_comp if lbl_non_comp and lbl_non_comp != comp else lbl1
+                for _v in part_lines_map:
+                    if _v == view_id: continue
+                    _vparts = part_lines_map[_v]
+                    # 目标视图必须同时含有 comp 主构件和 lbl_non_comp 板材
+                    # 注意：part_number_map 对未标记的 Part 默认 return comp（不是 ''）
+                    _has_comp = any((part_number_map.get(pn, comp)) == comp for pn in _vparts)
+                    _has_plate = (_tgt_label and
+                                  any(part_number_map.get(pn, '') == _tgt_label for pn in _vparts))
+                    if _has_comp and _has_plate:
+                        _alt_views.append(_v)
+                if _alt_views:
+                    print(f"    [TYP distribute] {lbl_non_comp} to views: {_alt_views}")
+
+            _rep_vid = view_id
+            _rep_pos = _typ_positions
             if cjp_sides:
                 # CJP side → always 'Above', hf=None, note='CJP'
                 for _rep in range(bom_fallback_count):
+                    _rep_vid = view_id
+                    _rep_pos_val = _typ_positions[_rep]
+                    if _rep > 0 and _rep - 1 < len(_alt_views):
+                        _rep_vid = _alt_views[_rep - 1]
+                        _rep_pos_val = None
                     results.append({
                         'component':  comp,
                         'position':   'Above',
@@ -2741,8 +2765,8 @@ def extract_welds(dxf_path):
                         'annotation': 'CJP',
                         'part1':      lbl1,
                         'part2':      lbl2,
-                        'dxf_pos':    _typ_positions[_rep],
-                        'view_id':    view_id,
+                        'dxf_pos':    _rep_pos_val,
+                        'view_id':    _rep_vid,
                     })
                 # CJP paired fillet (Below) is part of the same weld joint,
                 # not a separate weld.  Only 3-SIDES path emits paired fillet.
@@ -2763,6 +2787,11 @@ def extract_welds(dxf_path):
                         else:
                             hf_val = 6
                     for _rep in range(bom_fallback_count):
+                        _rep_vid = view_id
+                        _rep_pos_val = _typ_positions[_rep]
+                        if _rep > 0 and _rep - 1 < len(_alt_views):
+                            _rep_vid = _alt_views[_rep - 1]
+                            _rep_pos_val = None
                         results.append({
                             'component':  comp,
                             'position':   side,
@@ -2771,8 +2800,8 @@ def extract_welds(dxf_path):
                             'annotation': '',
                             'part1':      lbl1,
                             'part2':      lbl2,
-                            'dxf_pos':    _typ_positions[_rep],
-                            'view_id':    view_id,
+                            'dxf_pos':    _rep_pos_val,
+                            'view_id':    _rep_vid,
                         })
 
     # Post-processing: connected-part enumeration for 3-SIDES views
@@ -4196,6 +4225,9 @@ def extract_welds(dxf_path):
         _rm = []
         for i, r in enumerate(results):
             if r['component'] == comp and comp in {r['part1'], r['part2']}:
+                # Skip results with real geometry positions (WeldMark/3-SIDES source)
+                if r.get('dxf_pos') is not None:
+                    continue
                 _other = list({r['part1'], r['part2']} - {comp})[0]
                 if _other in _pp_only and r.get('weld_type','') != 'CJP':
                     _rm.append(i); continue
@@ -4242,7 +4274,17 @@ def extract_welds(dxf_path):
                 _pos = _find_weld_pos_for_pair(comp, _other, vid)
             if _pos is not None:
                 r['dxf_pos'] = _pos; _filled_pos += 1; continue
-            # View assigned but no geometry found — keep view_id, skip step 3
+            # View assigned but no geometry found — use plate centroid fallback
+            # (needed for propagated copies where view has both plates but no contact edge)
+            _vparts = part_lines_map.get(vid, {})
+            _blk = next((pn for pn in _vparts if part_number_map.get(pn, '') == p1), None)
+            if _blk:
+                _pts = [(ln['start'][0], ln['start'][1]) for ln in _vparts[_blk]]
+                _pts += [(ln['end'][0], ln['end'][1]) for ln in _vparts[_blk]]
+                if _pts:
+                    r['dxf_pos'] = (sum(p[0] for p in _pts)/len(_pts),
+                                    sum(p[1] for p in _pts)/len(_pts))
+                    _filled_pos += 1; continue
             continue
 
         # Step 3: view_id empty — search all views for this plate pair.
