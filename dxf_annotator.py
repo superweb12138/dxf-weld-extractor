@@ -226,7 +226,8 @@ def _collect_all_obstacles(doc, view_id):
             _pxs, _pys = [], []
             _part_lines(blk, _pxs, _pys)
             if _pxs and _pys:
-                _m = 8  # shrink: +8mm to offset hatch bbox 8mm margin → effective = original Part outline
+                _pw = max(_pxs) - min(_pxs); _ph = max(_pys) - min(_pys)
+                _m = min(8, _pw // 2, _ph // 2)  # shrink by 8mm max, or half of smaller dimension
                 _pb = (min(_pxs) + _m, max(_pxs) - _m, min(_pys) + _m, max(_pys) - _m)
                 if _pb[0] < _pb[1] and _pb[2] < _pb[3]:
                     hatch_bboxes.append(_pb)
@@ -1171,9 +1172,15 @@ def _score_placement(wx, wy, angle_deg, dist, lines, text_bboxes, circles,
         if bx1 > pbx0 - _OV_MARGIN and bx0 < pbx1 + _OV_MARGIN and by1 > pby0 - _OV_MARGIN and by0 < pby1 + _OV_MARGIN:
             score -= 20000
 
-    # 距离惩罚：越远越不推荐（避免延伸出图）
-    if dist > 60:
-        score -= (dist - 60) * 1
+    # 动态距离惩罚：根据冲突严重程度调整
+    # 无冲突→近处优先（强惩罚远距离），严重冲突→可以走远找干净位置（弱惩罚）
+    _non_pen = -score  # 非距离惩罚总绝对值
+    if _non_pen < 30:        # 无冲突/极轻微 → 强烈反对远距离
+        if dist > 30: score -= (dist - 30) * 4
+    elif _non_pen < 500:     # 轻微冲突 → 适中
+        if dist > 50: score -= (dist - 50) * 3
+    else:                    # 严重冲突（hatch/标注重叠）→ 允许走远找干净位置
+        if dist > 70: score -= (dist - 70) * 2
 
     return score
 
