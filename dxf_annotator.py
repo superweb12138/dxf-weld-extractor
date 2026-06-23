@@ -1003,6 +1003,7 @@ def _search_placement(weld_pos, lines, text_bboxes, circles, placed_bboxes,
 
         _best_score = -999999999
         _best_result = (_ideal_ang, min(distances), 0)
+        # Phase 3a: 粗搜索（30°步长×≤30距离）
         _p3_dists = [d for d in distances if d <= 30]
         for dist in _p3_dists:
             for _off in range(0, 360, 30):
@@ -1011,6 +1012,17 @@ def _search_placement(weld_pos, lines, text_bboxes, circles, placed_bboxes,
                 if score > _best_score:
                     _best_score = score
                     _best_result = (angle, dist, 0)
+        # Phase 3b: 如果粗搜索没找到干净位置，在最佳角度附近精细搜索
+        if _best_score < 0:
+            _f3_center = _best_result[0]
+            _f3_dists = [d for d in distances if d <= 54]
+            for _off in range(-40, 41, 10):
+                angle = (_f3_center + _off) % 360
+                for dist in _f3_dists:
+                    score = _score_candidate(angle, dist)
+                    if score > _best_score:
+                        _best_score = score
+                        _best_result = (angle, dist, 0)
         _bd, _bdst, _ = _best_result
         _fa, _fd, _fs = _fine_tune(_bdst, _bd, _db)
         return _fs, (_fa, _fd, 0)
