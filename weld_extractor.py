@@ -2082,7 +2082,10 @@ def extract_welds(dxf_path):
                     # Only suppress for CO010 comp→plate edges where a
                     # 3-SIDES geo length clearly doesn't belong to any plausible
                     # weld dimension (any of bw, bl, bw-cope, or cope*2).
-                    if comp == 'CO010' and lbl_o == comp and lbl_g != comp:
+                    # Note: 3-SIDES/CIRCLE edge geometry IS the real weld edge,
+                    # not a derived dimension — never suppress.
+                    if (comp == 'CO010' and lbl_o == comp and lbl_g != comp
+                            and not is_three_sides and not is_circle_wm):
                         _np = lbl_g
                         if _np in part_dims and not _use_largest_gusset:
                             _bwn = round(part_dims[_np].get('width') or 0)
@@ -2280,6 +2283,16 @@ def extract_welds(dxf_path):
                 _ext_mul = typ_mul_3s
                 if lbl_g in _cfg.get('x2_instances', set()):
                     _ext_mul = max(_ext_mul, 2)
+                # CO010: 收集所有含同 gusset 板材的视图（TYP 分发）
+                _mirror_views = []
+                if comp == 'CO010' and lbl_g != comp:
+                    _gusset_label = part_number_map.get(gusset_name, comp)
+                    for _mv in part_lines_map:
+                        if _mv == view_id: continue
+                        _mv_has = any(part_number_map.get(pn, comp) == _gusset_label for pn in part_lines_map[_mv])
+                        if _mv_has:
+                            _mirror_views.append(_mv)
+                    _ext_mul = max(_ext_mul, 1 + len(_mirror_views))
                 # Cross-view dedup for CO007: if the same gusset appears in
                 # multiple 3-SIDES views, remove BOM-length (bl) edges from
                 # the second view ONLY if a matching edge exists at a close position.
@@ -2330,37 +2343,35 @@ def extract_welds(dxf_path):
                             for ln in _plns:
                                 _view_comp_xs.extend([ln['start'][0], ln['end'][0]])
                     _view_comp_cx = (min(_view_comp_xs) + max(_view_comp_xs)) / 2 if _view_comp_xs else _center_x
-                    # Find cross-view: other view whose Part label set most closely
-                    # matches the current view (same structural cut, different location).
-                    _cur_labels = set(part_number_map.get(pn, comp) for pn in view_parts)
-                    _cross_view_id = ''
-                    _best_match = -1
-                    _best_extra = 999
-                    for _vid2 in part_lines_map:
-                        if _vid2 == view_id:
-                            continue
-                        _v2_labels = set(part_number_map.get(pn, comp) for pn in part_lines_map[_vid2])
-                        _shared = len(_cur_labels & _v2_labels)
-                        _extra = len(_v2_labels - _cur_labels)
-                        if _shared > _best_match or (_shared == _best_match and _extra < _best_extra):
-                            _best_match = _shared
-                            _best_extra = _extra
-                            _cross_view_id = _vid2
                     _mirrored_rows = []
-                    # Compute cross-view gusset x-range for proportional mapping
-                    _gx_cross = []
-                    if _cross_view_id:
-                        _cross_vparts = part_lines_map.get(_cross_view_id, {})
-                        for _pname2, _plns2 in _cross_vparts.items():
+                    # CO010: 为每个同 gusset 视图创建一组镜像副本
+                    _target_views = _mirror_views if comp == 'CO010' else []
+                    if not _target_views:
+                        # 非 CO010 原逻辑：找最佳匹配跨视图
+                        _cur_labels = set(part_number_map.get(pn, comp) for pn in view_parts)
+                        _cross_view_id = ''
+                        _best_match = -1; _best_extra = 999
+                        for _vid2 in part_lines_map:
+                            if _vid2 == view_id: continue
+                            _v2_labels = set(part_number_map.get(pn, comp) for pn in part_lines_map[_vid2])
+                            _shared = len(_cur_labels & _v2_labels)
+                            _extra = len(_v2_labels - _cur_labels)
+                            if _shared > _best_match or (_shared == _best_match and _extra < _best_extra):
+                                _best_match = _shared; _best_extra = _extra; _cross_view_id = _vid2
+                        if _cross_view_id:
+                            _target_views = [_cross_view_id]
+                    for _tv in _target_views:
+                        # Compute cross-view gusset x-range for proportional mapping
+                        _gx_cross = []; _gy_cross = []
+                        _tv_parts = part_lines_map.get(_tv, {})
+                        for _pname2, _plns2 in _tv_parts.items():
                             if part_number_map.get(_pname2, comp) == _gusset_label:
                                 for ln in _plns2:
                                     _gx_cross.extend([ln['start'][0], ln['end'][0]])
-                    for _rep in range(1, _ext_mul):
+                                    _gy_cross.extend([ln['start'][1], ln['end'][1]])
                         for er in edge_rows:
                             _mirror = dict(er)
                             _ox, _oy = er['dxf_pos']
-                            # x2_instances: 使用简单镜像（不跨视图比例映射），
-                            # 根据 x2_mirror_axis 配置选择轴
                             if _cfg.get('x2_instances', set()) and lbl_g in _cfg.get('x2_instances', set()):
                                 _mirror_axis = _cfg.get('x2_mirror_axis', {}).get(lbl_g, 'x')
                                 if _mirror_axis == 'y':
@@ -2369,19 +2380,17 @@ def extract_welds(dxf_path):
                                     _mx = 2 * _view_comp_cx - _ox
                                     _mirror['dxf_pos'] = (_mx, _oy)
                                 _mirror['view_id'] = view_id
-                            elif _cross_view_id and _gx_current and _gx_cross:
-                                # TYP: Proportional mapping to cross-view
+                            elif _gx_current and _gx_cross:
                                 _gx0 = min(_gx_current); _gx1 = max(_gx_current)
                                 _gxc0 = min(_gx_cross); _gxc1 = max(_gx_cross)
                                 _range = _gx1 - _gx0
                                 _ratio = (_ox - _gx0) / _range if _range > 1e-6 else 0.5
                                 _nx = _gxc0 + _ratio * (_gxc1 - _gxc0)
                                 _mirror['dxf_pos'] = (_nx, _oy)
-                                if _cross_view_id:
-                                    _mirror['view_id'] = _cross_view_id
                             else:
                                 _mirror['dxf_pos'] = (2 * _center_x - _ox, _oy)
-                            _mirror['_no_refine'] = True  # keep mirrored position
+                            _mirror['view_id'] = _tv
+                            _mirror['_no_refine'] = True
                             _mirrored_rows.append(_mirror)
                     results.extend(edge_rows + _mirrored_rows)
 
@@ -2732,28 +2741,41 @@ def extract_welds(dxf_path):
 
             # 收集其他含相同板材对的视图（TYP 跨视图分发）
             _alt_views = []
-            if bom_fallback_count > 1 and comp == 'CO010' and part_lines_map and part_number_map:
-                _tgt_label = lbl_non_comp if lbl_non_comp and lbl_non_comp != comp else lbl1
-                for _v in part_lines_map:
-                    if _v == view_id: continue
-                    _vparts = part_lines_map[_v]
-                    # 目标视图必须同时含有 comp 主构件和 lbl_non_comp 板材
-                    # 注意：part_number_map 对未标记的 Part 默认 return comp（不是 ''）
-                    _has_comp = any((part_number_map.get(pn, comp)) == comp for pn in _vparts)
-                    _has_plate = (_tgt_label and
-                                  any(part_number_map.get(pn, '') == _tgt_label for pn in _vparts))
-                    if _has_comp and _has_plate:
-                        _alt_views.append(_v)
-                if _alt_views:
-                    print(f"    [TYP distribute] {lbl_non_comp} to views: {_alt_views}")
+            if comp == 'CO010' and part_lines_map and part_number_map:
+                # CJP/pp 即使 bom_fallback_count=1 也要分发（确保 S-S/T-T 等视图有标注）
+                if cjp_sides or bom_fallback_count > 1:
+                    _tgt_label = lbl_non_comp if lbl_non_comp and lbl_non_comp != comp else lbl1
+                    for _v in part_lines_map:
+                        if _v == view_id: continue
+                        _vparts = part_lines_map[_v]
+                        # pp 焊道：目标视图同时含 lbl1 和 lbl2
+                        if lbl1 != comp and lbl2 != comp:
+                            _has_both = (any(part_number_map.get(pn, '') == lbl1 for pn in _vparts) and
+                                         any(part_number_map.get(pn, '') == lbl2 for pn in _vparts))
+                            if _has_both:
+                                _alt_views.append(_v)
+                        else:
+                            # comp→plate：目标视图含有 comp + lbl_non_comp
+                            _has_comp = any((part_number_map.get(pn, comp)) == comp for pn in _vparts)
+                            _has_plate = (_tgt_label and
+                                          any(part_number_map.get(pn, '') == _tgt_label for pn in _vparts))
+                            if _has_comp and _has_plate:
+                                _alt_views.append(_v)
+                            # CJP 特殊：即使目标视图无 comp，只要有该板材也分发
+                            # （视图如 S-S/T-T 虽无 comp 截面，但实际有该焊缝）
+                            elif cjp_sides and _has_plate and not _has_comp:
+                                _alt_views.append(_v)
+                    if _alt_views:
+                        print(f"    [TYP distribute] {lbl_non_comp or lbl1} to views: {_alt_views}")
 
             _rep_vid = view_id
             _rep_pos = _typ_positions
+            _cjp_rep_count = max(bom_fallback_count, 1 + len(_alt_views))
             if cjp_sides:
                 # CJP side → always 'Above', hf=None, note='CJP'
-                for _rep in range(bom_fallback_count):
+                for _rep in range(_cjp_rep_count):
                     _rep_vid = view_id
-                    _rep_pos_val = _typ_positions[_rep]
+                    _rep_pos_val = _typ_positions[_rep] if _rep < len(_typ_positions) else None
                     if _rep > 0 and _rep - 1 < len(_alt_views):
                         _rep_vid = _alt_views[_rep - 1]
                         _rep_pos_val = None
@@ -2786,9 +2808,9 @@ def extract_welds(dxf_path):
                             hf_val = hf_from_thickness(comp_web_t)
                         else:
                             hf_val = 6
-                    for _rep in range(bom_fallback_count):
+                    for _rep in range(max(bom_fallback_count, 1 + len(_alt_views))):
                         _rep_vid = view_id
-                        _rep_pos_val = _typ_positions[_rep]
+                        _rep_pos_val = _typ_positions[_rep] if _rep < len(_typ_positions) else None
                         if _rep > 0 and _rep - 1 < len(_alt_views):
                             _rep_vid = _alt_views[_rep - 1]
                             _rep_pos_val = None
@@ -4227,6 +4249,9 @@ def extract_welds(dxf_path):
             if r['component'] == comp and comp in {r['part1'], r['part2']}:
                 # Skip results with real geometry positions (WeldMark/3-SIDES source)
                 if r.get('dxf_pos') is not None:
+                    continue
+                # Skip CJP results (groove welds have no fillet length to validate)
+                if r.get('hf') is None or r.get('weld_type') == 'CJP':
                     continue
                 _other = list({r['part1'], r['part2']} - {comp})[0]
                 if _other in _pp_only and r.get('weld_type','') != 'CJP':
