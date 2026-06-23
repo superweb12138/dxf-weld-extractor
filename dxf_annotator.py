@@ -1,4 +1,4 @@
-﻿"""
+"""
 DXF Weld Annotator — adds weld labels to DXF drawings based on extracted results.
 
 Rules:
@@ -931,32 +931,6 @@ def _search_placement(weld_pos, lines, text_bboxes, circles, placed_bboxes,
             for na_off in range(-6, 7, 2):
                 if not _has_conflict(_ang + na_off, nd, _db):
                     _ang, _dst = _ang + na_off, nd; break
-
-        if is_crowded:
-            _ft_ideal = math.degrees(math.atan2(wy - (vy0+vy1)/2, wx - (vx0+vx1)/2)) % 360
-            def _ft_score(a, d):
-                s = _score_placement(wx, wy, a, d, lines, text_bboxes, circles,
-                                    placed_bboxes, placed_text_bboxes,
-                                    vx0, vy0, vx1, vy1, _db, is_pair=is_pair,
-                                    min_score=None, line_grid=_line_grid,
-                                    hatch_bboxes=hatch_bboxes, is_crowded=is_crowded)
-                if abs((a - _ft_ideal + 180) % 360 - 180) > 90:
-                    s -= 500
-                return s
-            _best_sc = _ft_score(_ang, _dst)
-            _best_ang, _best_dst = _ang, _dst
-            for da in range(-10, 11, 10):
-                for dd in range(-4, 5, 2):
-                    na = (_ang + da) % 360
-                    nd2 = max(8, _dst + dd)
-                    if nd2 == _dst: continue
-                    if not _has_conflict(na, nd2, _db):
-                        sc = _ft_score(na, nd2)
-                        if sc > _best_sc:
-                            _best_sc = sc
-                            _best_ang, _best_dst = na, nd2
-            return _best_ang, _best_dst, 0
-
         return _ang, _dst, 0
 
     def _search_pass(_db):
@@ -981,28 +955,55 @@ def _search_placement(weld_pos, lines, text_bboxes, circles, placed_bboxes,
                 score -= 500
             return score
 
-        # Phase 1-2-3 + _fine_tune 混合优化（拥挤/简单视图统一）
-        for dist in distances:
-            if not _has_conflict(_ideal_ang, dist, _db):
-                _fa, _fd, _fs = _fine_tune(dist, _ideal_ang, _db)
-                return _fs, (_fa, _fd, 0)
-        for step in [1, 2]:
-            for sign in (1, -1):
-                angle = (_ideal_ang + sign * step * 10) % 360
-                for dist in distances:
-                    if not _has_conflict(angle, dist, _db):
-                        _fa, _fd, _fs = _fine_tune(dist, angle, _db)
-                        return _fs, (_fa, _fd, 0)
-        for step in range(3, 19):
-            for sign in (1, -1):
-                angle = (_ideal_ang + sign * step * 10) % 360
-                for dist in distances:
-                    if not _has_conflict(angle, dist, _db):
-                        _fa, _fd, _fs = _fine_tune(dist, angle, _db)
-                        return _fs, (_fa, _fd, 0)
+        if is_crowded:
+            _candidates = []
+            def _try_pos(angle, dist):
+                if not _has_conflict(angle, dist, _db):
+                    _candidates.append((_score_candidate(angle, dist), angle, dist))
+            for dist in distances:
+                _try_pos(_ideal_ang, dist)
+            for step in [1, 2]:
+                for sign in (1, -1):
+                    angle = (_ideal_ang + sign * step * 10) % 360
+                    for dist in distances:
+                        _try_pos(angle, dist)
+            for step in range(3, 19):
+                for sign in (1, -1):
+                    angle = (_ideal_ang + sign * step * 10) % 360
+                    for dist in distances:
+                        _try_pos(angle, dist)
+            if _candidates:
+                _best = max(_candidates, key=lambda x: x[0])
+                return _best[0], (_best[1], _best[2], 0)
+        else:
+            for dist in distances:
+                if not _has_conflict(_ideal_ang, dist, _db):
+                    _fa, _fd, _fs = _fine_tune(dist, _ideal_ang, _db)
+                    return _fs, (_fa, _fd, 0)
+            for step in [1, 2]:
+                for sign in (1, -1):
+                    angle = (_ideal_ang + sign * step * 10) % 360
+                    for dist in distances:
+                        if not _has_conflict(angle, dist, _db):
+                            _fa, _fd, _fs = _fine_tune(dist, angle, _db)
+                            return _fs, (_fa, _fd, 0)
+            for step in range(3, 19):
+                for sign in (1, -1):
+                    angle = (_ideal_ang + sign * step * 10) % 360
+                    for dist in distances:
+                        if not _has_conflict(angle, dist, _db):
+                            _fa, _fd, _fs = _fine_tune(dist, angle, _db)
+                            return _fs, (_fa, _fd, 0)
 
         _best_score = -999999999
         _best_result = (_ideal_ang, min(distances), 0)
+        for dist in distances:
+            for _off in range(0, 360, 10):
+                angle = (_ideal_ang + _off) % 360
+                score = _score_candidate(angle, dist)
+                if score > _best_score:
+                    _best_score = score
+                    _best_result = (angle, dist, 0)
         _bd, _bdst, _ = _best_result
         _fa, _fd, _fs = _fine_tune(_bdst, _bd, _db)
         return _fs, (_fa, _fd, 0)
