@@ -72,6 +72,7 @@ COMP_CONFIG = {
     'CO009': {
         'x2_instances': {'p15','p144'},
         'x2_mirror_axis': {'p144': 'y'},
+        'pp_extra': [('p16','p7',400,16,1)],
     },
     'CO007': {
         'allow_synthetic': True,
@@ -82,6 +83,7 @@ COMP_CONFIG = {
         'allow_synthetic': True,
         'pp_bridge_exclude': {'p125'},
         'relabel_cp_to_pp': [('p102','p124',308)],
+        'pp_extra': [('p101','p102',90,7,1)],
     },
     'BE022': {
         'cjp_plates': {'p200'},
@@ -4606,6 +4608,33 @@ def extract_welds(dxf_path):
         for r in results:
             if {r['part1'], r['part2']} == {'p16', 'p7'} and abs(r['length_mm'] - 400) < 40:
                 r['length_mm'] = 400.0
+
+    # BE018/BE019/BE020 p118 部分焊缝补充
+    if comp in ('BE018', 'BE019', 'BE020'):
+        _p118_rows = [r for r in results if r.get('component') == comp and 'p118' in (r['part1'], r['part2'])]
+        _p118_lens = set(round(r['length_mm']) for r in _p118_rows)
+        if {300, 326}.issubset(_p118_lens) and 220 not in _p118_lens:
+            _hf118 = 8
+            for r in _p118_rows:
+                if abs(r['length_mm'] - 300) < 2:
+                    _hf118 = r.get('hf', 8)
+                    break
+            for _pos in ('Above', 'Below'):
+                results.append({'component': comp, 'position': _pos, 'hf': _hf118,
+                    'length_mm': 220.0, 'annotation': '', 'part1': comp, 'part2': 'p118',
+                    'dxf_pos': None, 'view_id': ''})
+            print(f"    [p118-partial] added {comp}/p118 220mm x2")
+
+    # CO009/p7 围焊清理：移除非 CIRCLE 长度的 p7 焊道
+    if comp == 'CO009':
+        _p7_ok = {308, 405}
+        _p7_rm = [i for i, r in enumerate(results) if r.get('component') == comp
+                  and {r['part1'], r['part2']} == {comp, 'p7'}
+                  and round(r['length_mm']) not in _p7_ok]
+        for i in reversed(_p7_rm):
+            results.pop(i)
+        if _p7_rm:
+            print(f"    [p7-circle] removed {len(_p7_rm)} non-CIRCLE CO009/p7 rows")
 
     if skipped:
         print(f"\n  SKIPPED ({len(skipped)}):")
