@@ -82,8 +82,8 @@ COMP_CONFIG = {
     'CO008': {
         'allow_synthetic': True,
         'pp_bridge_exclude': {'p125'},
-        'relabel_cp_to_pp': [('p102','p124',308)],
-        'pp_extra': [('p101','p102',90,7,1)],
+        'relabel_cp_to_pp': [],
+        'pp_extra': [('p101','p102',90,7,1), ('p102','p124',90,8,1)],
     },
     'BE022': {
         'cjp_plates': {'p200'},
@@ -2537,10 +2537,14 @@ def extract_welds(dxf_path):
                             # Case 1: geo ≈ bom_len
                             # Sub-case: if geo also matches bw closely, prefer bl (both dimensions match)
                             if abs(weld_len_mm - bw) / max(weld_len_mm, 1) < BOM_LEN_TOL:
-                                # Both bw and bl match; prefer bl (typically the weld
-                                # run length, as engineering convention rounds up)
-                                print(f"    [BOM case1-both] {lbl_non_comp} geo={weld_len_mm} bw={bw} bl={bl}")
-                                weld_len_mm = round(bl)
+                                # Both bw and bl match; if they differ by >20%,
+                                # this is a section-view projection → use bw (width)
+                                if bl and abs(bl - bw) / max(bw, 1) > 0.05:
+                                    weld_len_mm = round(bw)
+                                    print(f"    [BOM case1-proj] {lbl_non_comp} geo={weld_len_mm} bw={bw} bl={bl} (section view)")
+                                else:
+                                    print(f"    [BOM case1-both] {lbl_non_comp} geo={weld_len_mm} bw={bw} bl={bl}")
+                                    weld_len_mm = round(bl)
                             elif abs(bl - bw) / max(bl, 1) > 0.3:
                                 # bl and bw are very different (not a square plate)
                                 # geo matches bl → weld runs along plate length, keep geo unchanged
@@ -3994,7 +3998,9 @@ def extract_welds(dxf_path):
                 # 如果已有多个不同长度的 comp→plate 结果（3-SIDES 覆盖），跳过腹板面推导
                 _cp_lens = set(r['length_mm'] for r in results
                                if r['component']==comp and {r['part1'],r['part2']}=={comp,_plbl})
-                if len(_cp_lens) >= 2: continue
+                # 跳过已有 2+ 种不同长度的板的腹板面（3-SIDES 全覆盖）
+                # CIRCLE 围焊板需保留腹板面边（即使已有 1 种长度）
+                if _plbl not in {'p47', 'p92'} and len(_cp_lens) >= 1: continue
                 if not _has_cp: continue
                 _tkey = tuple(sorted((comp,_plbl))) + (float(_wfw_len),)
                 if _tkey in _triples_covered: continue
