@@ -2537,11 +2537,20 @@ def extract_welds(dxf_path):
                             # Case 1: geo ≈ bom_len
                             # Sub-case: if geo also matches bw closely, prefer bl (both dimensions match)
                             if abs(weld_len_mm - bw) / max(weld_len_mm, 1) < BOM_LEN_TOL:
-                                # Both bw and bl match; if they differ by >20%,
-                                # this is a section-view projection → use bw (width)
-                                if bl and abs(bl - bw) / max(bw, 1) > 0.08:
-                                    weld_len_mm = round(bw)
-                                    print(f"    [BOM case1-proj] {lbl_non_comp} geo={weld_len_mm} bw={bw} bl={bl} (section view)")
+                                # Both bw and bl match; for BE stiffeners the geo may be
+                                # the full plate length (bom_len) but actual weld is on
+                                # the beam web: depth - 2*cope(25) - 2*flange_t
+                                _wfw_bl = 0
+                                if comp.startswith('BE') and comp_dims.get('depth') and comp_dims.get('flange_t'):
+                                    _wfw_bl = round(comp_dims['depth'] - 2*25 - 2*comp_dims['flange_t'])
+                                # 仅当板宽接近翼缘宽时才使用腹板公式（腹板加劲板）
+                                _is_web_stiffener = False
+                                if _wfw_bl > 0 and comp_dims.get('flange_w'):
+                                    _fw = comp_dims['flange_w']
+                                    _is_web_stiffener = abs(bw - _fw) / _fw < 0.05
+                                if _wfw_bl > 0 and _wfw_bl < bl and _is_web_stiffener:
+                                    weld_len_mm = _wfw_bl
+                                    print(f"    [BOM case1-web] {lbl_non_comp} geo={weld_len_mm_orig} → web={_wfw_bl} (bw={bw} bl={bl})")
                                 else:
                                     print(f"    [BOM case1-both] {lbl_non_comp} geo={weld_len_mm} bw={bw} bl={bl}")
                                     weld_len_mm = round(bl)
@@ -4621,22 +4630,6 @@ def extract_welds(dxf_path):
         for r in results:
             if {r['part1'], r['part2']} == {'p16', 'p7'} and abs(r['length_mm'] - 400) < 40:
                 r['length_mm'] = 400.0
-
-    # BE018/BE019/BE020 p118 部分焊缝补充
-    if comp in ('BE018', 'BE019', 'BE020'):
-        _p118_rows = [r for r in results if r.get('component') == comp and 'p118' in (r['part1'], r['part2'])]
-        _p118_lens = set(round(r['length_mm']) for r in _p118_rows)
-        if {300, 326}.issubset(_p118_lens) and 220 not in _p118_lens:
-            _hf118 = 8
-            for r in _p118_rows:
-                if abs(r['length_mm'] - 300) < 2:
-                    _hf118 = r.get('hf', 8)
-                    break
-            for _pos in ('Above', 'Below'):
-                results.append({'component': comp, 'position': _pos, 'hf': _hf118,
-                    'length_mm': 220.0, 'annotation': '', 'part1': comp, 'part2': 'p118',
-                    'dxf_pos': None, 'view_id': ''})
-            print(f"    [p118-partial] added {comp}/p118 220mm x2")
 
     # CO009/p7 围焊清理：移除非 CIRCLE 长度的 p7 焊道
     if comp == 'CO009':
