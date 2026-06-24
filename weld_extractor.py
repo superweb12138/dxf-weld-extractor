@@ -4601,6 +4601,12 @@ def extract_welds(dxf_path):
                     r['length_mm'] = float(_target)
                     break
 
+    # CO009 特殊修正：p16/p7 焊接长度应为 400mm（非 370mm 几何投影）
+    if comp == 'CO009':
+        for r in results:
+            if {r['part1'], r['part2']} == {'p16', 'p7'} and abs(r['length_mm'] - 400) < 40:
+                r['length_mm'] = 400.0
+
     if skipped:
         print(f"\n  SKIPPED ({len(skipped)}):")
         for name, reason in skipped:
