@@ -1240,8 +1240,8 @@ def extract_welds(dxf_path):
                         else:
                             # 回退路径：用 gusset 几何边界分布 3 条合成边
                             if _use_largest_gusset and _synth_lbl_g != comp and comp_dims.get('depth') and comp_dims.get('flange_t'):
-                                _web_h = round((comp_dims['depth'] - 2 * comp_dims['flange_t']) / SCALE, 1)
-                                if _web_h > 0 and abs(_mid_cad - _web_h) > 2.0 and _is_section_view:
+                                _web_h = round((comp_dims['depth'] - 2 * 25 - 2 * comp_dims['flange_t']) / SCALE, 1)
+                                if _web_h > 0 and (_is_section_view or abs(_mid_cad - _web_h) > 3.0):
                                     _mid_cad = _web_h
                             _cir_y = arrow[1] if _is_section_view else _gy_min
                             _y_mid = _cir_y - 15.0 if _is_section_view else _cir_y
@@ -4582,6 +4582,24 @@ def extract_welds(dxf_path):
                 if abs(r['length_mm'] - _bw) < 2:
                     r['length_mm'] = float(_bl)
                     _converted += 1
+
+    # PP 焊道长度修正：当焊道长度接近 bom_len - cope 时使用该值
+    # （解决 p143/p144 164→197 等 2-SIDES 投影偏差）
+    for r in results:
+        if r.get('component') in ('CO009',) and r.get('joint_type') == 'LJ':
+            for _pp in (r['part1'], r['part2']):
+                if _pp not in part_dims: continue
+                _pd_pp = part_dims[_pp]
+                _bl_pp = round(_pd_pp.get('bom_len') or 0)
+                _bw_pp = round(_pd_pp.get('width') or 0)
+                if not (_bl_pp > 0 and _bw_pp > 0 and _bl_pp > _bw_pp * 1.15):
+                    continue
+                _cope_pp = _get_cope_for_plate(_pp) or 25
+                _target = round(_bl_pp - _cope_pp)
+                if abs(r['length_mm'] - _target) / max(_target, 1) < 0.20:
+                    print(f"    [pp-cope] {r['part1']}/{r['part2']} {r['length_mm']}->{_target}")
+                    r['length_mm'] = float(_target)
+                    break
 
     if skipped:
         print(f"\n  SKIPPED ({len(skipped)}):")
