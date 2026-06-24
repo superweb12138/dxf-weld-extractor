@@ -1212,8 +1212,9 @@ def extract_welds(dxf_path):
                         _mid_cad = _wl['length'] if _wl else 0
                         if _mid_cad <= 0:
                             _mid_cad = (_gy_max - _gy_min) if _gy_max > _gy_min else 0
-                        # CO007/p47: 腹板长度应为172mm（p47板高）
-                        if comp == 'CO007' and _synth_lbl_g == 'p47':
+                        # CO007/p47, CO008/p92: 腹板长度为172mm
+                        if (comp == 'CO007' and _synth_lbl_g == 'p47') or \
+                           (comp == 'CO008' and _synth_lbl_g == 'p92'):
                             _mid_cad = 172.0 / SCALE
                         if _mid_cad <= 0:
                             skipped.append((wm_name, 'CIRCLE: no valid gusset height'))
@@ -2167,6 +2168,21 @@ def extract_welds(dxf_path):
                         if _bw1 < 150 and _bw2 < 150:
                             print(f"    [pp-skip] small-plate pp {p1}/{p2} bw={_bw1}/{_bw2}")
                             continue
+                    # Suppress 3-SIDES comp→plate edges whose length doesn't match
+                    # any plausible BOM dimension (bw, bl, bw-cope) within 25%.
+                    # Catches spurious geometry edges like CO008/p102 129mm.
+                    if comp == 'CO008' and p1 == comp and p2 != comp:
+                        _bw_check = part_dims.get(p2, {}).get('width', 0)
+                        _bl_check = part_dims.get(p2, {}).get('bom_len', 0)
+                        _cope_check = _get_cope_for_plate(p2) or 25
+                        _bwc_check = round(_bw_check - _cope_check) if _bw_check > 0 else 0
+                        _matches_bom = any(
+                            c > 0 and abs(final_edge_mm - c) / max(c, 1) < 0.25
+                            for c in (_bw_check, _bl_check, _bwc_check)
+                        )
+                        if not _matches_bom:
+                            print(f"    [BOM no-match] {p2} geo={geo_len_mm}mm final={final_edge_mm}mm (no BOM dim within 25%)")
+                            continue
                     # CJP normalization for 3-SIDES edges (same rule as normal WMs)
                     grove_3s_ab = parsed['groove_above']
                     grove_3s_bl = parsed['groove_below']
@@ -2685,8 +2701,8 @@ def extract_welds(dxf_path):
                 _cfg_hf = COMP_CONFIG[comp].get('hf_map', {})
                 if lbl_non_comp in _cfg_hf:
                     _map_hf = _cfg_hf[lbl_non_comp]
-                    if sz_above is not None:
-                        sz_above = _map_hf
+                    # 当 WM 某侧无尺寸时也应用 hf_map（如 CO010/p195 缺 Above 尺寸）
+                    sz_above = _map_hf if sz_above is None else sz_above
                     if sz_below is not None:
                         sz_below = _map_hf
 
@@ -3965,7 +3981,7 @@ def extract_welds(dxf_path):
                 _bl = round(_pdims.get('bom_len') or 0)
                 if _bw < 200 or _bl / max(_bw, 1) >= 1.5: continue
                 # Only if web-face length is reasonable vs plate width (>= 60%)
-                if _wfw_len < _bw * 0.6: continue
+                if _wfw_len < _bw * 0.5: continue
                 _has_cp = any(r['component']==comp and {r['part1'],r['part2']}=={comp,_plbl} for r in results)
                 if not _has_cp: continue
                 _tkey = tuple(sorted((comp,_plbl))) + (float(_wfw_len),)
