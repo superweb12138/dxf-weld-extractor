@@ -2976,6 +2976,12 @@ def extract_welds(dxf_path):
                     if p1 == p2:
                         continue
                     for _pos in ('Above', 'Below'):
+                        # 跳过已有的相同焊道（BE018/p118 300mm 在 WM 已产生）
+                        _exists = any(r for r in results
+                                      if r['component'] == comp and r['position'] == _pos
+                                      and {r['part1'], r['part2']} == {p1, p2}
+                                      and abs(r['length_mm'] - _wlen) < 0.5)
+                        if _exists: continue
                         for _dup in (0, 1):  # _dup=0: front face; _dup=1: mirrored back face
                             _mpos = _line_mid(_cln)
                             if _dup == 1 and _view_center_x:
@@ -3985,6 +3991,10 @@ def extract_welds(dxf_path):
                 # Only if web-face length is reasonable vs plate width (>= 60%)
                 if _wfw_len < _bw * 0.5: continue
                 _has_cp = any(r['component']==comp and {r['part1'],r['part2']}=={comp,_plbl} for r in results)
+                # 如果已有多个不同长度的 comp→plate 结果（3-SIDES 覆盖），跳过腹板面推导
+                _cp_lens = set(r['length_mm'] for r in results
+                               if r['component']==comp and {r['part1'],r['part2']}=={comp,_plbl})
+                if len(_cp_lens) >= 2: continue
                 if not _has_cp: continue
                 _tkey = tuple(sorted((comp,_plbl))) + (float(_wfw_len),)
                 if _tkey in _triples_covered: continue
