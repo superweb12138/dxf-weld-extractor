@@ -3032,6 +3032,11 @@ def extract_welds(dxf_path):
                     _exist_hf_bom = r['hf']
                     _exist_hf_map[r['length_mm']] = r['hf']
             if _exist_hf_bom is None:
+                # 查找已有 WM 结果中任何非 comp 板的 hf（peer 继承）
+                for r in results:
+                    if r['component'] == comp and r.get('hf') is not None and r['hf'] > 0:
+                        _exist_hf_bom = r['hf']; break
+            if _exist_hf_bom is None:
                 _exist_hf_bom = hf_from_thickness(_t) if _t else 7
             _hf = _exist_hf_bom
             _cpair = tuple(sorted((comp, _plbl)))
@@ -3252,23 +3257,25 @@ def extract_welds(dxf_path):
                     # Get existing hf — for plates with 0 WM entries, always
                     # inherit from peer (geometry enumeration hf is unreliable)
                     _exist_hf = None
-                    if _cp_distinct_lens[_plbl]:
-                        for r in results:
-                            if r['component'] == comp and {r['part1'], r['part2']} == {comp, _plbl}:
-                                if r['hf'] is not None and r['hf'] > 0:
-                                    _exist_hf = r['hf']; break
-                    if _exist_hf is None:
-                        # Inherit hf from peer's first comp→plate entry
-                        for _ptk_p, _plbl_p, _p_edges_p in _peers_by_vid.get(_vid, []):
-                            if _plbl_p != _plbl and abs(_ptk_p - _tk_self) <= 5:
-                                for _el_p, _eo_p in _p_edges_p:
-                                    if _eo_p == comp:
-                                        for r in results:
-                                            if r['component'] == comp and {r['part1'], r['part2']} == {comp, _plbl_p}:
+                    # 优先从 peer 板继承 hf（peer 板的 WM 结果更可靠）
+                    for _ptk_p, _plbl_p, _p_edges_p in _peers_by_vid.get(_vid, []):
+                        if _plbl_p != _plbl and abs(_ptk_p - _tk_self) <= 5:
+                            for _el_p, _eo_p in _p_edges_p:
+                                if _eo_p == comp:
+                                    for r in results:
+                                        if r['component'] == comp and {r['part1'], r['part2']} == {comp, _plbl_p}:
+                                            if r.get('hf') is not None and r['hf'] > 0:
                                                 _exist_hf = r['hf']; break
-                                        if _exist_hf is not None and _exist_hf > 0: break
-                                if _exist_hf is not None: break
+                                    if _exist_hf is not None and _exist_hf > 0: break
                             if _exist_hf is not None: break
+                        if _exist_hf is not None: break
+                    # 退路：用自身已有的 comp→plate 结果
+                    if _exist_hf is None:
+                        if _cp_distinct_lens[_plbl]:
+                            for r in results:
+                                if r['component'] == comp and {r['part1'], r['part2']} == {comp, _plbl}:
+                                    if r['hf'] is not None and r['hf'] > 0:
+                                        _exist_hf = r['hf']; break
                     if _exist_hf is None: _exist_hf = 7
                     _tk_self = int(part_dims[_plbl].get('thick') or comp_web_t or 12)
                     for _ptk, _plbl_peer, _p_edges in _peers_by_vid.get(_vid, []):
