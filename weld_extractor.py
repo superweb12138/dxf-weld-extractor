@@ -4672,6 +4672,20 @@ def extract_welds(dxf_path):
         if _p7_rm:
             print(f"    [p7-circle] removed {len(_p7_rm)} non-CIRCLE CO009/p7 rows")
 
+        # 同板 hf 补齐：WM来源(dxf_pos≠None)的 hf 填到同板无 hf 的结果（跳过 CJP）
+        _plate_wm_hf = {}
+        for r in results:
+            if r.get('hf') and r['hf'] > 0 and r.get('dxf_pos') is not None:
+                _plate = r['part2'] if r['part1'] == r.get('component') else r['part1']
+                _plate_wm_hf.setdefault((r['component'], _plate), r['hf'])
+        for r in results:
+            _cur = r.get('hf')
+            if _cur is not None: continue  # 已有值（含 CJP 的 hf=None）
+            _plate = r['part2'] if r['part1'] == r.get('component') else r['part1']
+            _src = _plate_wm_hf.get((r['component'], _plate))
+            if _src:
+                r['hf'] = _src
+
     if skipped:
         print(f"\n  SKIPPED ({len(skipped)}):")
         for name, reason in skipped:
