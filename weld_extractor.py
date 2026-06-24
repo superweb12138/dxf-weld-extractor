@@ -4251,9 +4251,6 @@ def extract_welds(dxf_path):
         _rm = []
         for i, r in enumerate(results):
             if r['component'] == comp and comp in {r['part1'], r['part2']}:
-                # Skip results with real geometry positions (WeldMark/3-SIDES source)
-                if r.get('dxf_pos') is not None:
-                    continue
                 _other = list({r['part1'], r['part2']} - {comp})[0]
                 if _other in _pp_only and r.get('weld_type','') != 'CJP':
                     _rm.append(i); continue
