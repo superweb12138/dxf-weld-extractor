@@ -2539,7 +2539,7 @@ def extract_welds(dxf_path):
                             if abs(weld_len_mm - bw) / max(weld_len_mm, 1) < BOM_LEN_TOL:
                                 # Both bw and bl match; if they differ by >20%,
                                 # this is a section-view projection → use bw (width)
-                                if bl and abs(bl - bw) / max(bw, 1) > 0.05:
+                                if bl and abs(bl - bw) / max(bw, 1) > 0.08:
                                     weld_len_mm = round(bw)
                                     print(f"    [BOM case1-proj] {lbl_non_comp} geo={weld_len_mm} bw={bw} bl={bl} (section view)")
                                 else:
@@ -2591,7 +2591,8 @@ def extract_welds(dxf_path):
                                     weld_len_mm = _bl_rounded
                                 else:
                                     weld_len_mm = _bw_rounded
-                            else:
+                            elif bl:
+                                # bl exists → section view projection → snap to bw
                                 weld_len_mm = round(bw)
                         else:
                             print(f"    [BOM no-case] {lbl_non_comp} geo={weld_len_mm} bw={bw} bl={bl}")
@@ -2952,12 +2953,8 @@ def extract_welds(dxf_path):
                             continue
                         _lbl_o = comp  # plate sits on comp face
                     elif _cp_s in _comp_blocks:
-                        if _is_diag:
-                            continue  # diagonal free edge touching comp at one corner
                         _lbl_o = comp
                     elif _cp_e in _comp_blocks:
-                        if _is_diag:
-                            continue  # diagonal free edge touching comp at one corner
                         _lbl_o = comp
                     elif _cp_s and _cp_e and _cp_s == _cp_e:
                         _lbl_o = _nbl_s  # both touch same non-comp → plate→plate
