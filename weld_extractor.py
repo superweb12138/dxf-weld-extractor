@@ -1836,9 +1836,16 @@ def extract_welds(dxf_path):
                                     else:
                                         # Only map to bw if the edge is within 80%
                                         # range (avoids e.g. p42 33→73 but allows
-                                        # p200 438.9→140 in section-view projection)
-                                        if abs(_geo - _bw_smaller) / max(_geo, 1) < 0.80:
-                                            _bom_edge_map[(_cg, _geo)] = round(_bw_smaller)
+                                        # p200 438.9→140 in section-view projection).
+                                        # For geo > bw (projection), keep wide 80% threshold;
+                                        # for geo < bw (partial weld), require 20%.
+                                        _bw_ratio = abs(_geo - _bw_smaller) / max(_geo, 1)
+                                        if _geo < _bw_smaller:
+                                            _bw_ratio = abs(_geo - _bw_smaller) / max(_bw_smaller, 1)
+                                            if _bw_ratio < 0.20:
+                                                _bom_edge_map[(_cg, _geo)] = _br(_bw_smaller)
+                                        elif _bw_ratio < 0.80:
+                                            _bom_edge_map[(_cg, _geo)] = _br(_bw_smaller)
                         if _bom_edge_map:
                             print(f"    [BOM map] {lbl_g}  w={_bw3} L={_bl3}")
 
@@ -2537,9 +2544,11 @@ def extract_welds(dxf_path):
                             weld_len_mm = round(bl)
                         elif (bl and bl > 0
                               and abs(weld_len_mm - bw) < 0.5
-                              and abs(bl - bw) / max(bw, 1) > 0.10):
-                            # Case 2b: geo == bom_width exactly, but bom_len differs
-                            # by >10% → section view projection, weld along length
+                              and abs(bl - bw) / max(bw, 1) > 0.10
+                              and abs(weld_len_mm - bl) / max(bl, 1) < 0.15):
+                            # Case 2b: geo == bom_width exactly, bom_len differs,
+                            # AND geo is also close to bl → section view projection
+                            # (if geo is far from bl, it's a partial weld, not projection)
                             print(f"    [BOM case2b] {lbl_non_comp} geo={weld_len_mm} bw={bw} bl={bl}")
                             weld_len_mm = round(bl)
                         elif (bl and bl > 0
