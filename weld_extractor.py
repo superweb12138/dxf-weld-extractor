@@ -2212,7 +2212,12 @@ def extract_welds(dxf_path):
                             if s3['sz'] is not None:
                                 _hf_fb = s3['sz']
                             elif lbl_g in part_dims:
-                                _hf_fb = hf_from_thickness(part_dims[lbl_g]['thick'])
+                                # 优先继承已有 WM 结果的 hf（否则 hf_from_thickness 可能不匹配）
+                                _inherit_hf = None
+                                for r in results:
+                                    if r['component'] == comp and lbl_g in (r['part1'], r['part2']) and r.get('hf') is not None and r['hf'] > 0:
+                                        _inherit_hf = r['hf']; break
+                                _hf_fb = _inherit_hf if _inherit_hf else hf_from_thickness(part_dims[lbl_g]['thick'])
                             elif comp_web_t:
                                 _hf_fb = hf_from_thickness(comp_web_t)
                             else:
@@ -2717,8 +2722,8 @@ def extract_welds(dxf_path):
                 _cfg_hf = COMP_CONFIG[comp].get('hf_map', {})
                 if lbl_non_comp in _cfg_hf:
                     _map_hf = _cfg_hf[lbl_non_comp]
-                    # 当 WM 某侧无尺寸时也应用 hf_map（如 CO010/p195 缺 Above 尺寸）
-                    sz_above = _map_hf if sz_above is None else sz_above
+                    if sz_above is not None:
+                        sz_above = _map_hf
                     if sz_below is not None:
                         sz_below = _map_hf
 
@@ -3250,7 +3255,8 @@ def extract_welds(dxf_path):
                     if _cp_distinct_lens[_plbl]:
                         for r in results:
                             if r['component'] == comp and {r['part1'], r['part2']} == {comp, _plbl}:
-                                _exist_hf = r['hf']; break
+                                if r['hf'] is not None and r['hf'] > 0:
+                                    _exist_hf = r['hf']; break
                     if _exist_hf is None:
                         # Inherit hf from peer's first comp→plate entry
                         for _ptk_p, _plbl_p, _p_edges_p in _peers_by_vid.get(_vid, []):
@@ -3260,7 +3266,7 @@ def extract_welds(dxf_path):
                                         for r in results:
                                             if r['component'] == comp and {r['part1'], r['part2']} == {comp, _plbl_p}:
                                                 _exist_hf = r['hf']; break
-                                        if _exist_hf is not None: break
+                                        if _exist_hf is not None and _exist_hf > 0: break
                                 if _exist_hf is not None: break
                             if _exist_hf is not None: break
                     if _exist_hf is None: _exist_hf = 7
@@ -4101,7 +4107,14 @@ def extract_welds(dxf_path):
                     _tkey = _ppair + (float(_e_len),)
                     if _tkey in _triples_covered: continue
                     _t_c = _pdims_c.get('thick') or _p_thick
-                    _hf_pb = hf_from_thickness(min(_p_thick, _t_c))
+                    # 继承任一侧板已有 WM 结果的 hf
+                    _hf_pb = None
+                    for r in results:
+                        if r['component'] == comp and r.get('hf') is not None and r['hf'] > 0:
+                            if _e_other in (r['part1'], r['part2']) or _plbl_c in (r['part1'], r['part2']):
+                                _hf_pb = r['hf']; break
+                    if _hf_pb is None:
+                        _hf_pb = hf_from_thickness(min(_p_thick, _t_c))
                     print(f"    [pp-bridge] {_e_other}/{_plbl_c} weld={_e_len}mm hf={_hf_pb} (from {_pl_a})")
                     for _pos in ('Above','Below'):
                         results.append({'component':comp,'position':_pos,'hf':_hf_pb,'length_mm':_e_len,'annotation':'','part1':_ppair[0],'part2':_ppair[1],'dxf_pos':None,'view_id':'','_synthetic':True})
