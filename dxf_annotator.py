@@ -250,30 +250,30 @@ def _collect_all_obstacles(doc, view_id, view_bbox=None):
                     else:
                         pts = [(v[0], v[1]) for v in list(e.get_points())[:2]]
                     if (max(p[0] for p in pts) < view_bbox[0] - _MARGIN or
-                        min(p[0] for p in pts) > view_bbox[1] + _MARGIN or
-                        max(p[1] for p in pts) < view_bbox[2] - _MARGIN or
+                        min(p[0] for p in pts) > view_bbox[2] + _MARGIN or
+                        max(p[1] for p in pts) < view_bbox[1] - _MARGIN or
                         min(p[1] for p in pts) > view_bbox[3] + _MARGIN):
                         continue
                 except Exception:
                     pass
             elif e.dxftype() == 'INSERT':
                 ix, iy = e.dxf.insert.x, e.dxf.insert.y
-                if (ix < view_bbox[0] - _MARGIN or ix > view_bbox[1] + _MARGIN or
-                    iy < view_bbox[2] - _MARGIN or iy > view_bbox[3] + _MARGIN):
+                if (ix < view_bbox[0] - _MARGIN or ix > view_bbox[2] + _MARGIN or
+                    iy < view_bbox[1] - _MARGIN or iy > view_bbox[3] + _MARGIN):
                     continue
             elif e.dxftype() in ('TEXT','MTEXT','ATTRIB','ATTDEF','MLEADER','DIMENSION'):
                 try:
                     ix, iy = e.dxf.insert.x, e.dxf.insert.y
-                    if (ix < view_bbox[0] - _MARGIN or ix > view_bbox[1] + _MARGIN or
-                        iy < view_bbox[2] - _MARGIN or iy > view_bbox[3] + _MARGIN):
+                    if (ix < view_bbox[0] - _MARGIN or ix > view_bbox[2] + _MARGIN or
+                        iy < view_bbox[1] - _MARGIN or iy > view_bbox[3] + _MARGIN):
                         continue
                 except Exception:
                     pass
             elif e.dxftype() in ('CIRCLE','ARC'):
                 try:
                     cx, cy = e.dxf.center.x, e.dxf.center.y
-                    if (cx < view_bbox[0] - _MARGIN or cx > view_bbox[1] + _MARGIN or
-                        cy < view_bbox[2] - _MARGIN or cy > view_bbox[3] + _MARGIN):
+                    if (cx < view_bbox[0] - _MARGIN or cx > view_bbox[2] + _MARGIN or
+                        cy < view_bbox[1] - _MARGIN or cy > view_bbox[3] + _MARGIN):
                         continue
                 except Exception:
                     pass
@@ -864,7 +864,7 @@ def _search_placement(weld_pos, lines, text_bboxes, circles, placed_bboxes,
             for _gy in range(_gy0, _gy1 + 1):
                 _line_grid.setdefault((_gx, _gy), []).append((_s, _e))
 
-    def _has_conflict(angle_deg, dist, _db, relaxed=False):
+    def _has_conflict(angle_deg, dist, _db):
         """True if position has any critical conflict (text overlap, line cross, boundary)."""
         rad = math.radians(angle_deg)
         cos_a, sin_a = math.cos(rad), math.sin(rad)
@@ -913,11 +913,10 @@ def _search_placement(weld_pos, lines, text_bboxes, circles, placed_bboxes,
         for (sx, sy), (ex2, ey2) in _near:
             if not (max(sx, ex2) < _min_x - _mrg or min(sx, ex2) > _max_x + _mrg or
                     max(sy, ey2) < _min_y - _mrg or min(sy, ey2) > _max_y + _mrg):
-                if not relaxed:
-                    if _segments_cross_((ex, ey), (hx, hy), (sx, sy), (ex2, ey2)):
-                        return True
+                if _segments_cross_((ex, ey), (hx, hy), (sx, sy), (ex2, ey2)):
+                    return True
         # 文字与几何线过近
-        _line_mrg = 2.0 if relaxed else 3.0
+        _line_mrg = 3.0
         _txt_pts = [(bx0, by0), (bx1, by0), (bx0, by1), (bx1, by1),
                     ((bx0+bx1)/2, by0), ((bx0+bx1)/2, by1),
                     (bx0, (by0+by1)/2), (bx1, (by0+by1)/2)]
@@ -930,28 +929,19 @@ def _search_placement(weld_pos, lines, text_bboxes, circles, placed_bboxes,
         for (sx, sy), (ex2, ey2) in _near:
             if _dist_pt_to_seg((_cx_txt, _cy_txt), (sx, sy), (ex2, ey2))[0] < 1.5:
                 return True
-        # 射线法（优化）：只检查可能跨过射线的线
-        # 水平射线（y 恒定）：只检查 y 范围覆盖射线 y 的线
-        # 垂直射线（x 恒定）：只检查 x 范围覆盖射线 x 的线
+        # 射线法：检查文字中心是否在几何线围成的封闭形状内
+        # 使用全部 lines（非 _near），配合 y/x 范围过滤保证性能
         _odd = 0
         for _rx, _ry in [(_cx_txt + 99999, _cy_txt), (_cx_txt - 99999, _cy_txt)]:
-            if abs(_ry - _cy_txt) < 0.001:
-                _cnt = sum(1 for (sx, sy), (ex2, ey2) in _near
-                           if (sy <= _cy_txt <= ey2 or ey2 <= _cy_txt <= sy)
-                           and _segments_cross_((_cx_txt, _cy_txt), (_rx, _ry), (sx, sy), (ex2, ey2)))
-            else:
-                _cnt = sum(1 for (sx, sy), (ex2, ey2) in _near
-                           if _segments_cross_((_cx_txt, _cy_txt), (_rx, _ry), (sx, sy), (ex2, ey2)))
+            _cnt = sum(1 for (sx, sy), (ex2, ey2) in lines
+                       if (sy <= _cy_txt <= ey2 or ey2 <= _cy_txt <= sy)
+                       and _segments_cross_((_cx_txt, _cy_txt), (_rx, _ry), (sx, sy), (ex2, ey2)))
             if _cnt % 2 == 1:
                 _odd += 1
         for _rx, _ry in [(_cx_txt, _cy_txt + 99999), (_cx_txt, _cy_txt - 99999)]:
-            if abs(_rx - _cx_txt) < 0.001:
-                _cnt = sum(1 for (sx, sy), (ex2, ey2) in _near
-                           if (sx <= _cx_txt <= ex2 or ex2 <= _cx_txt <= sx)
-                           and _segments_cross_((_cx_txt, _cy_txt), (_rx, _ry), (sx, sy), (ex2, ey2)))
-            else:
-                _cnt = sum(1 for (sx, sy), (ex2, ey2) in _near
-                           if _segments_cross_((_cx_txt, _cy_txt), (_rx, _ry), (sx, sy), (ex2, ey2)))
+            _cnt = sum(1 for (sx, sy), (ex2, ey2) in lines
+                       if (sx <= _cx_txt <= ex2 or ex2 <= _cx_txt <= sx)
+                       and _segments_cross_((_cx_txt, _cy_txt), (_rx, _ry), (sx, sy), (ex2, ey2)))
             if _cnt % 2 == 1:
                 _odd += 1
         if _odd >= 3:
@@ -985,7 +975,7 @@ def _search_placement(weld_pos, lines, text_bboxes, circles, placed_bboxes,
         if _dst == dist:
             for nd in range(dist + 2, 57, 2):
                 for na_off in range(-30, 31, 2):
-                    if not _has_conflict(_ang + na_off, nd, _db, relaxed=True):
+                    if not _has_conflict(_ang + na_off, nd, _db):
                         _ang, _dst = _ang + na_off, nd; break
                 if _dst != dist:
                     break
@@ -1197,15 +1187,14 @@ def _score_placement(wx, wy, angle_deg, dist, lines, text_bboxes, circles,
     cx_txt = (bx0 + bx1) / 2
     cy_txt = (by0 + by1) / 2
     _odd = 0
-    _ray_lines = _near_lines if _near_lines else lines
     for _rx, _ry in [(cx_txt + 99999, cy_txt), (cx_txt - 99999, cy_txt)]:
-        _cnt = sum(1 for (sx, sy), (ex2, ey2) in _ray_lines
+        _cnt = sum(1 for (sx, sy), (ex2, ey2) in lines
                    if (sy <= cy_txt <= ey2 or ey2 <= cy_txt <= sy)
                    and _segments_cross_((cx_txt, cy_txt), (_rx, _ry), (sx, sy), (ex2, ey2)))
         if _cnt % 2 == 1:
             _odd += 1
     for _rx, _ry in [(cx_txt, cy_txt + 99999), (cx_txt, cy_txt - 99999)]:
-        _cnt = sum(1 for (sx, sy), (ex2, ey2) in _ray_lines
+        _cnt = sum(1 for (sx, sy), (ex2, ey2) in lines
                    if (sx <= cx_txt <= ex2 or ex2 <= cx_txt <= sx)
                    and _segments_cross_((cx_txt, cy_txt), (_rx, _ry), (sx, sy), (ex2, ey2)))
         if _cnt % 2 == 1:
