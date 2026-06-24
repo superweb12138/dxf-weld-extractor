@@ -1692,6 +1692,9 @@ def extract_welds(dxf_path):
                     sz3_below = _correct_hf_3s(parsed['size_below'], lbl_g)
 
                 # Rank-based BOM mapping for 3-SIDES gussets with known dimensions.
+                # Consistent rounding helper for BOM values (CO: int+0.49, others: round)
+                def _br(val):
+                    return int(val + 0.49) if comp.startswith('CO') else round(val)
                 # Two strategies depending on edge-length distribution:
                 #
                 #   A) 2 distinct lengths with one appearing twice (e.g. p42 edges
@@ -1754,10 +1757,13 @@ def extract_welds(dxf_path):
                                 for _g in _gusset_geo_lens:
                                     if _g == _sorted_geo[-1]:
                                         # Largest edge → comp depth
-                                        _bom_edge_map[(_cg, _g)] = round(_comp_depth)
+                                        _bom_edge_map[(_cg, _g)] = _br(_comp_depth)
                                     else:
                                         # Other edges → plate width
-                                        _bom_edge_map[(_cg, _g)] = round(_bw3)
+                                        if comp.startswith('CO'):
+                                            _bom_edge_map[(_cg, _g)] = int(_bw3 + 0.49)
+                                        else:
+                                            _bom_edge_map[(_cg, _g)] = round(_bw3)
                             
                             print(f"    [BOM map-flange] {lbl_g}  w={_bw3} depth={round(_comp_depth)} (geo far from BOM)")
                     
@@ -1793,17 +1799,17 @@ def extract_welds(dxf_path):
                                 if abs(_d0 - _d1) / max(_dup_len, 1) < 0.08:
                                     pass  # ambiguous, keep geo
                                 elif _d0 <= _d1:
-                                    _bom_edge_map[(_cg, _dup_len)] = round(_bom_dims[0])
+                                    _bom_edge_map[(_cg, _dup_len)] = _br(_bom_dims[0])
                                     if abs(_uniq_len - _bom_dims[1]) / max(_uniq_len, 1) < 0.40:
                                         _dw = abs(_uniq_len - _bom_dims[0]) / max(_uniq_len, 1)
                                         _dl = abs(_uniq_len - _bom_dims[1]) / max(_uniq_len, 1)
-                                        _bom_edge_map[(_cg, _uniq_len)] = round(_bom_dims[0] if _dw < _dl else _bom_dims[1])
+                                        _bom_edge_map[(_cg, _uniq_len)] = _br(_bom_dims[0] if _dw < _dl else _bom_dims[1])
                                 else:
-                                    _bom_edge_map[(_cg, _dup_len)] = round(_bom_dims[1])
+                                    _bom_edge_map[(_cg, _dup_len)] = _br(_bom_dims[1])
                                     if abs(_uniq_len - _bom_dims[0]) / max(_uniq_len, 1) < 0.40:
                                         _dw = abs(_uniq_len - _bom_dims[0]) / max(_uniq_len, 1)
                                         _dl = abs(_uniq_len - _bom_dims[1]) / max(_uniq_len, 1)
-                                        _bom_edge_map[(_cg, _uniq_len)] = round(_bom_dims[0] if _dw < _dl else _bom_dims[1])
+                                        _bom_edge_map[(_cg, _uniq_len)] = _br(_bom_dims[0] if _dw < _dl else _bom_dims[1])
                             elif _total == 3 and len(_geo_counter) == 3:
                                 # Strategy B — three unique lengths
                                 # BOM pattern is [bw, bl] → 3 edges = [bw, bw, bl]
@@ -1824,9 +1830,9 @@ def extract_welds(dxf_path):
                                         _dw = abs(_geo - _bw_smaller) / max(_geo, 1)
                                         _dl = abs(_geo - _bl_larger) / max(_geo, 1)
                                         if _dw < _dl:
-                                            _bom_edge_map[(_cg, _geo)] = round(_bw_smaller)
+                                            _bom_edge_map[(_cg, _geo)] = _br(_bw_smaller)
                                         else:
-                                            _bom_edge_map[(_cg, _geo)] = round(_bl_larger)
+                                            _bom_edge_map[(_cg, _geo)] = _br(_bl_larger)
                                     else:
                                         # Only map to bw if the edge is within 80%
                                         # range (avoids e.g. p42 33→73 but allows
@@ -2496,7 +2502,8 @@ def extract_welds(dxf_path):
                 print(f"    [BOM pre-check] lbl_nc={lbl_non_comp} stiff={stiffener_override_applied} in_dims={lbl_non_comp in part_dims} wlm={weld_len_mm}")
                 if (not stiffener_override_applied
                         and lbl_non_comp != comp
-                        and lbl_non_comp in part_dims):
+                        and lbl_non_comp in part_dims
+                        and (lbl1 == comp or lbl2 == comp)):
                     pd_nc = part_dims[lbl_non_comp]
                     bw = pd_nc['width']
                     bl = pd_nc.get('bom_len')
@@ -2545,12 +2552,14 @@ def extract_welds(dxf_path):
                         elif abs(weld_len_mm - bw) / weld_len_mm < BOM_WIDTH_TOL:
                             print(f"    [BOM case3] {lbl_non_comp} geo={weld_len_mm} bw={bw}")
                             if bl and bl > 0:
-                                _d_bw = abs(weld_len_mm - round(bw))
-                                _d_bl = abs(weld_len_mm - bl)
+                                _bw_rounded = int(bw + 0.49) if comp.startswith('CO') else round(bw)
+                                _bl_rounded = int(bl + 0.49) if comp.startswith('CO') else round(bl)
+                                _d_bw = abs(weld_len_mm - _bw_rounded)
+                                _d_bl = abs(weld_len_mm - _bl_rounded)
                                 if _d_bl < _d_bw * 0.5:
-                                    weld_len_mm = round(bl)
+                                    weld_len_mm = _bl_rounded
                                 else:
-                                    weld_len_mm = round(bw)
+                                    weld_len_mm = _bw_rounded
                             else:
                                 weld_len_mm = round(bw)
                         else:
@@ -2819,7 +2828,7 @@ def extract_welds(dxf_path):
 
     # Post-processing: connected-part enumeration for 3-SIDES views
     # where gusset is the comp body. Only for BE (non-CO) components.
-    # Helper: compute midpoint of a line dict
+            # Helper: compute midpoint of a line dict
     def _line_mid(ln):
         return ((ln['start'][0] + ln['end'][0]) / 2,
                 (ln['start'][1] + ln['end'][1]) / 2)
@@ -3406,6 +3415,18 @@ def extract_welds(dxf_path):
                         _ppair = tuple(sorted((_plbl, _nbl)))
                         _tkey_pp = _ppair + (_wl_mm,)
                         if _tkey_pp in _triples_covered:
+                            continue
+                        # BOM 相关性过滤：焊接长度应接近任一块板的 BOM 尺寸
+                        _wl_close_to_bom = False
+                        for _bp in (_plbl, _nbl):
+                            _bpd = part_dims.get(_bp, {})
+                            _bw_bp = _bpd.get('width', 0)
+                            _bl_bp = _bpd.get('bom_len', 0)
+                            for _cand in (_bw_bp, _bl_bp):
+                                if _cand > 0 and abs(_wl_mm - _cand) / max(_cand, 1) < 0.25:
+                                    _wl_close_to_bom = True; break
+                            if _wl_close_to_bom: break
+                        if not _wl_close_to_bom:
                             continue
                         _t_other = part_dims[_nbl].get('thick', comp_web_t or 12)
                         _hf_pp = hf_from_thickness(min(_t_self, _t_other)) if min(_t_self, _t_other) else 7
@@ -4445,6 +4466,24 @@ def extract_welds(dxf_path):
                 _gt = part_dims.get(_groove, {}).get('thick')
                 if _gt:
                     r['annotation'] = f'PL{round(_gt)}mm'
+    # CO 组件长度四舍五入修正：int(x+0.49) 替代 round()，避免 banker's rounding 偏差
+    for r in results:
+        if r.get('component','').startswith('CO') and isinstance(r.get('length_mm'), (int, float)):
+            _len = r['length_mm']
+            _len_int = int(_len + 0.5)
+            if _len_int > 30 and abs(_len - _len_int) < 0.01 and _len > _len_int - 0.01:
+                # Length is an exact integer — might have been banker's-rounded from x.5
+                # Check if the BOM width or bom_len matches a half-integer
+                for _p in (r['part1'], r['part2']):
+                    _pd = part_dims.get(_p, {})
+                    for _key in ('width', 'bom_len'):
+                        _v = _pd.get(_key, 0)
+                        if _v > 0 and abs(_v - _len_int) < 1.0 and abs(_v - round(_v)) > 0.01:
+                            # BOM value is fractional (e.g. 115.5), current length is int from round()
+                            # Use int(x + 0.49) instead
+                            _corrected = int(_v + 0.49)
+                            if _corrected != _len_int and abs(_v - _corrected) <= abs(_v - _len_int):
+                                r['length_mm'] = float(_corrected)
             # CO007/CO008 CJP 长度修正：float 截断导致 115.5→115 而非 116
             if (r.get('component') in ('CO007', 'CO008') and r.get('weld_type') == 'CJP'
                     and isinstance(r.get('length_mm'), (int, float)) and r['length_mm'] > 0):
@@ -4500,11 +4539,15 @@ def extract_welds(dxf_path):
         _bw = 0; _bl = 0; _cjp_plate = ''
         for r in _cjp_rows:
             _pc = r['part2'] if r['part1'] == _comp else r['part1']
+            _cjp_plate = _pc
             _pd = part_dims.get(_pc, {})
             _bw = round(_pd.get('width') or 0)
             _bl = round(_pd.get('bom_len') or 0)
             if _bw > 0 and _bl > 0 and _bw < _bl: break
         if not (_bw > 0 and _bl > 0): continue
+        # CIRCLE 板已由合成边覆盖，不恢复 bl 长度
+        _circle_plates = {'p47', 'p92'}
+        if _cjp_plate in _circle_plates: continue
         _n_bl = sum(1 for r in _cjp_rows if abs(r['length_mm'] - _bl) < 5)
         if _n_bl == 0 and len(_cjp_rows) >= 4:
             # 全部是 bw 长度，恢复 2 条为 bl 长度
