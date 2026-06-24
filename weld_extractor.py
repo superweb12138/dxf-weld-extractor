@@ -3032,7 +3032,13 @@ def extract_welds(dxf_path):
                     _exist_hf_bom = r['hf']
                     _exist_hf_map[r['length_mm']] = r['hf']
             if _exist_hf_bom is None:
-                # 查找已有 WM 结果中任何非 comp 板的 hf（peer 继承）
+                # 优先查找同厚度板的 hf（peer 继承，如 p127→p126）
+                for r in results:
+                    if r['component'] == comp and r.get('hf') is not None and r['hf'] > 0:
+                        _other = r['part2'] if r['part1'] == comp else r['part1']
+                        if _other in part_dims and abs(part_dims[_other].get('thick',0) - _t) <= 5:
+                            _exist_hf_bom = r['hf']; break
+            if _exist_hf_bom is None:
                 for r in results:
                     if r['component'] == comp and r.get('hf') is not None and r['hf'] > 0:
                         _exist_hf_bom = r['hf']; break
@@ -3043,22 +3049,25 @@ def extract_welds(dxf_path):
             _covered = _cpair in _pairs_covered
             if _bw and _bw > 0:
                 _bwr = round(_bw)
+                # 按长度查找更精确的 hf（同长度的 WM 结果 hf 更可信）
+                _hf_bw = _exist_hf_map.get(_bwr, _hf)
                 if not _covered and (_cpair + (_bwr,)) not in _triples_covered:
                     for _dup in (0, 1):
                         results.append({
                             'component': comp, 'position': 'Above',
-                            'hf': _hf, 'length_mm': _bwr,
+                            'hf': _hf_bw, 'length_mm': _bwr,
                             'annotation': '', 'part1': comp, 'part2': _plbl,
                             'dxf_pos': None, 'view_id': '',
                         })
                     _triples_covered.add(_cpair + (_bwr,))
             if _bl and _bl > 0 and abs(_bl - _bw) / max(_bl, _bw, 1) > 0.1:
                 _blr = round(_bl)
+                _hf_bl = _exist_hf_map.get(_blr, _hf)
                 if not _covered and (_cpair + (_blr,)) not in _triples_covered:
                     for _dup in (0, 1):
                         results.append({
                             'component': comp, 'position': 'Above',
-                            'hf': _hf, 'length_mm': _blr,
+                            'hf': _hf_bl, 'length_mm': _blr,
                             'annotation': '', 'part1': comp, 'part2': _plbl,
                             'dxf_pos': None, 'view_id': '',
                         })
@@ -3068,10 +3077,11 @@ def extract_welds(dxf_path):
             if _covered and _bw and _bw > 0 and _bl and _bl > 0 and abs(_bl - _bw) / max(_bl, _bw, 1) > 0.1:
                 _blr, _bwr = round(_bl), round(_bw)
                 if (_cpair + (_bwr,)) in _triples_covered and (_cpair + (_blr,)) not in _triples_covered:
+                    _hf_bl2 = _exist_hf_map.get(_blr, _hf)
                     for _dup in (0, 1):
                         results.append({
                             'component': comp, 'position': 'Above',
-                            'hf': _hf, 'length_mm': _blr,
+                            'hf': _hf_bl2, 'length_mm': _blr,
                             'annotation': '', 'part1': comp, 'part2': _plbl,
                             'dxf_pos': None, 'view_id': '',
                         })
