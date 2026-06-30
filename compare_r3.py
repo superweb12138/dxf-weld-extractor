@@ -2,6 +2,8 @@
 import openpyxl, re
 from collections import Counter, defaultdict
 
+TOL = 3  # length tolerance in mm
+
 def load(path, sheet=None):
     wb = openpyxl.load_workbook(path, data_only=True)
     ws = wb[sheet] if sheet else wb.active
@@ -32,17 +34,62 @@ for c in sorted(HAVE_DXF):
 print(f"{'TOTAL':<8} {sum(mc.values()):>5} {sum(sc.values()):>5}")
 print()
 
-def loose_key(r):
+def full_key(r):
     p = tuple(sorted((str(r['p1'] or '').lower(), str(r['p2'] or '').lower())))
     return (r['comp'], r['pos'], r['hf'], p)
 
-ml = Counter(loose_key(r) for r in manual)
-sl = Counter(loose_key(r) for r in script)
-print("=== LOOSE match (ignore length & annotation) ===")
-print(f"  matched : {sum((ml & sl).values())}")
-print(f"  man-only: {sum((ml - sl).values())}")
-print(f"  scr-only: {sum((sl - ml).values())}")
+# Greedy matching with length tolerance
+_used_s = [False] * len(script)
+_matched = 0
+_man_only_rows = []
+_scr_only_rows = []
+_len_mismatch = []  # matched on full_key but length out of tolerance
 
-total = sum((ml & sl).values()) + sum((ml - sl).values()) + sum((sl - ml).values())
-matched = sum((ml & sl).values())
-print(f"\nMatch rate: {matched}/{total} = {matched/total*100:.1f}%")
+for i, mr in enumerate(manual):
+    found = False
+    for j, sr in enumerate(script):
+        if _used_s[j]:
+            continue
+        if full_key(mr) != full_key(sr):
+            continue
+        if abs(mr['len'] - sr['len']) <= TOL:
+            _matched += 1
+            _used_s[j] = True
+            found = True
+            break
+        # Matched on key but length out of tolerance — still pair them to avoid
+        # double-counting, but report as length mismatch
+        _len_mismatch.append((mr, sr))
+        _matched += 1
+        _used_s[j] = True
+        found = True
+        break
+    if not found:
+        _man_only_rows.append(mr)
+
+for j, sr in enumerate(script):
+    if not _used_s[j]:
+        _scr_only_rows.append(sr)
+
+print(f"=== FULL match (comp+pos+hf+pair+len, TOL={TOL}mm) ===")
+print(f"  matched : {_matched}")
+print(f"  man-only: {len(_man_only_rows)}")
+print(f"  scr-only: {len(_scr_only_rows)}")
+
+total = _matched + len(_man_only_rows) + len(_scr_only_rows)
+print(f"\nMatch rate: {_matched}/{total} = {_matched/total*100:.1f}%")
+
+if _len_mismatch:
+    print(f"\n--- length mismatch (matched by key but len diff > {TOL}mm) ---")
+    for mr, sr in _len_mismatch:
+        print(f"  {mr['comp']:<6} {mr['p1']:<8}/{mr['p2']:<8} {mr['pos']:<6} hf={mr['hf']}  man_len={mr['len']:.0f}  scr_len={sr['len']:.0f}  diff={abs(mr['len']-sr['len']):.0f}")
+
+if _man_only_rows:
+    print(f"\n--- man-only ({len(_man_only_rows)}) ---")
+    for r in _man_only_rows:
+        print(f"  {r['comp']:<6} {r['p1']:<8}/{r['p2']:<8} {r['pos']:<6} len={r['len']:.0f} hf={r['hf']} ann={r['ann']}")
+
+if _scr_only_rows:
+    print(f"\n--- scr-only ({len(_scr_only_rows)}) ---")
+    for r in _scr_only_rows:
+        print(f"  {r['comp']:<6} {r['p1']:<8}/{r['p2']:<8} {r['pos']:<6} len={r['len']:.0f} hf={r['hf']} ann={r['ann']}")

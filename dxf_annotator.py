@@ -280,6 +280,18 @@ def _collect_all_obstacles(doc, view_id, view_bbox=None):
         if e.dxftype() == 'INSERT':
             blk = doc.blocks.get(e.dxf.name)
             if blk:
+                # 计算 WM 块的整体包围盒，加入 hatch_bboxes
+                if blk.name.startswith('WeldMark'):
+                    _wmx, _wmy = [], []
+                    for _sub in blk:
+                        if _sub.dxftype() == 'LINE':
+                            _wmx.extend([_sub.dxf.start.x, _sub.dxf.end.x])
+                            _wmy.extend([_sub.dxf.start.y, _sub.dxf.end.y])
+                        elif _sub.dxftype() in ('CIRCLE', 'ARC'):
+                            _wmx.append(_sub.dxf.center.x)
+                            _wmy.append(_sub.dxf.center.y)
+                    if _wmx:
+                        hatch_bboxes.append((min(_wmx), max(_wmx), min(_wmy), max(_wmy)))
                 _add_block_entities(blk)
         else:
             add_entity(e)
@@ -288,7 +300,8 @@ def _collect_all_obstacles(doc, view_id, view_bbox=None):
 
 
 def annotate(results, dxf_paths=None):
-    """Main entry point. Annotates DXF files with weld labels."""
+    """Main entry point. Annotates DXF files with weld labels.
+    Returns list of sampled weld label entries for Excel output."""
     os.makedirs(ANNOTATED_DIR, exist_ok=True)
 
     by_comp = defaultdict(list)
@@ -298,6 +311,8 @@ def annotate(results, dxf_paths=None):
     if dxf_paths is None:
         import glob
         dxf_paths = sorted([f for f in glob.glob(os.path.join(FOLDER, "*.dxf")) if '(2)' not in f])
+
+    all_sampled_labels = []
 
     for dxf_path in dxf_paths:
         comp_m = re.search(r'-(BE\d+|CO\d+)_', os.path.basename(dxf_path), re.I)
@@ -318,9 +333,18 @@ def annotate(results, dxf_paths=None):
             continue
 
         try:
-            _annotate_one(doc, comp_welds)
+            sampled_labels = _annotate_one(doc, comp_welds)
+            all_sampled_labels.extend(sampled_labels)
             out_path = os.path.join(ANNOTATED_DIR, os.path.basename(dxf_path))
-            doc.saveas(out_path)
+            for _retry in range(3):
+                try:
+                    doc.saveas(out_path)
+                    break
+                except OSError:
+                    if _retry < 2:
+                        import time; time.sleep(0.5)
+                    else:
+                        raise
 
             # Patch DXF header to inject $VIEWCTR and $VIEWSIZE (ezdxf drops them)
             try:
@@ -336,6 +360,8 @@ def annotate(results, dxf_paths=None):
             import traceback
             print(f"    ERROR annotating {comp}: {e}")
             traceback.print_exc()
+
+    return all_sampled_labels
 
 
 def _compute_drawing_bbox(doc):
@@ -452,9 +478,12 @@ def _detect_drawing_frames(doc):
 
 
 def _annotate_one(doc, welds):
-    """Annotate a single DXF with weld labels."""
+    """Annotate a single DXF with weld labels. Returns list of sampled weld entries."""
     msp = doc.modelspace()
+    _clean_original_labels(doc)
     _ensure_layer(doc)
+    _ensure_style(doc)
+    sampled_labels = []
 
     # Compute view bounding boxes from Part blocks for center calculation
     view_bboxes, part_centroids = _compute_view_bboxes(doc)
@@ -495,15 +524,48 @@ def _annotate_one(doc, welds):
     f_counter = [0]
     w_counter = [0]
 
-    # Process each view in numerical order
+    # 计算每个视图的真实边界（仅 Part 块，不含 Mark/WeldMark 标注元素）
+    _other_view_bboxes = []
+    for _vid in view_bboxes.keys():
+        _v_xs, _v_ys = [], []
+        for _blk in doc.blocks:
+            _bn = _blk.name
+            if not _bn.startswith('Part'):
+                continue
+            if _bn.endswith(f' - {_vid}') or f' - {_vid}' in _bn:
+                for _e in _blk:
+                    if _e.dxftype() == 'LINE':
+                        _v_xs.extend([_e.dxf.start.x, _e.dxf.end.x])
+                        _v_ys.extend([_e.dxf.start.y, _e.dxf.end.y])
+        if _v_xs:
+            _other_view_bboxes.append((min(_v_xs), min(_v_ys), max(_v_xs), max(_v_ys)))
+
+    # 检测表格区域（BOM 表格块），作为 hatch_bbox 加入阻挡
+    _table_hatch = []
+    for _e in doc.modelspace():
+        if _e.dxftype() == 'INSERT' and _e.dxf.name.startswith('Unknown-'):
+            _blk = doc.blocks.get(_e.dxf.name)
+            if _blk:
+                _tx, _ty = [], []
+                for _sub in _blk:
+                    if _sub.dxftype() == 'LINE':
+                        _tx.extend([_sub.dxf.start.x, _sub.dxf.end.x])
+                        _ty.extend([_sub.dxf.start.y, _sub.dxf.end.y])
+                if _tx:
+                    _table_hatch.append((min(_tx), max(_tx), min(_ty), max(_ty)))
+
+    # 处理每个视图
     for view_id in sorted(welds_by_view.keys(), key=lambda v: int(v) if v.isdigit() else 0):
         vw = welds_by_view[view_id]
         bbox = view_bboxes.get(view_id)
         centroids = part_centroids.get(view_id, [])
         obs_result = _collect_all_obstacles(doc, view_id, view_bbox=bbox)
         part_lines = obs_result[:3]
-        hatch_bboxes = obs_result[3] if len(obs_result) > 3 else None
-        _annotate_view(msp, vw, view_id, bbox, centroids, f_counter, w_counter, part_lines, draw_bbox, hatch_bboxes=hatch_bboxes)
+        hatch_bboxes = obs_result[3] if len(obs_result) > 3 else []
+        # 加入表格阻挡
+        if _table_hatch:
+            hatch_bboxes = list(hatch_bboxes) + _table_hatch
+        _annotate_view(msp, vw, view_id, bbox, centroids, f_counter, w_counter, part_lines, draw_bbox, hatch_bboxes=hatch_bboxes if hatch_bboxes else None, other_view_bboxes=_other_view_bboxes, sampled_labels=sampled_labels)
 
     # Handle welds without view_id
     if welds_no_view:
@@ -513,6 +575,25 @@ def _annotate_one(doc, welds):
     _set_model_view_to_extents(doc)
 
     print(f"    F: {f_counter[0]}  W: {w_counter[0]}")
+    return sampled_labels
+
+
+def _clean_original_labels(doc):
+    """Remove part/dimension label INSERT references to reduce annotation overlap.
+    Removes Mark-, MarkSet-, StraightDimension-, AngleDimension- block inserts.
+    Preserves SectionMark, WeldMark, Unknown (BOM/title block), Part blocks."""
+    msp = doc.modelspace()
+    _remove_prefixes = ('Mark-', 'MarkSet-', 'StraightDimension-', 'AngleDimension-')
+    _removed = 0
+    for e in list(msp):
+        if e.dxftype() == 'INSERT':
+            blk_name = e.dxf.name
+            if any(blk_name.startswith(p) for p in _remove_prefixes):
+                msp.delete_entity(e)
+                _removed += 1
+    if _removed:
+        print(f"    [clean] removed {_removed} part/dimension labels")
+    return _removed
 
 
 def _ensure_layer(doc):
@@ -524,23 +605,43 @@ def _ensure_layer(doc):
     layer.color = LABEL_COLOR  # blue
 
 
+def _ensure_style(doc, name='Arial Narrow', font='ARIALN.TTF'):
+    """Ensure a text style exists in the document (match WM symbol style)."""
+    if name not in doc.styles:
+        style = doc.styles.new(name=name, dxfattribs={'font': font})
+
+
 def _compute_view_bboxes(doc):
-    """Compute bounding box and Part block centroids of each view."""
+    """Compute bounding box and Part block centroids of each view.
+    扩展视图边界：含 Part/WeldMark/Mark/SectionMark 等全部块类型。"""
     view_bboxes = {}
     view_part_centroids = defaultdict(list)  # view_id -> [(cx, cy), ...]
+    _BLOCK_PREFIXES = ('Part', 'WeldMark', 'Mark', 'SectionMark')
     for blk in doc.blocks:
         blk_name = blk.name
         m = re.search(r' - (\d+)$', blk_name)
         if not m:
             continue
         view_id = m.group(1)
-        if not blk_name.startswith('Part'):
+        if not any(blk_name.startswith(p) for p in _BLOCK_PREFIXES):
             continue
         xs, ys = [], []
         for e in blk:
             if e.dxftype() == 'LINE':
                 xs.extend([e.dxf.start.x, e.dxf.end.x])
                 ys.extend([e.dxf.start.y, e.dxf.end.y])
+            elif e.dxftype() in ('TEXT','MTEXT','ATTRIB','ATTDEF'):
+                try:
+                    xs.append(e.dxf.insert.x)
+                    ys.append(e.dxf.insert.y)
+                except Exception:
+                    pass
+            elif e.dxftype() in ('CIRCLE','ARC'):
+                try:
+                    xs.append(e.dxf.center.x)
+                    ys.append(e.dxf.center.y)
+                except Exception:
+                    pass
         if xs:
             if view_id not in view_bboxes:
                 view_bboxes[view_id] = [min(xs), min(ys), max(xs), max(ys)]
@@ -550,14 +651,23 @@ def _compute_view_bboxes(doc):
                 bb[1] = min(bb[1], min(ys))
                 bb[2] = max(bb[2], max(xs))
                 bb[3] = max(bb[3], max(ys))
-            view_part_centroids[view_id].append((sum(xs)/len(xs), sum(ys)/len(ys)))
+            if blk_name.startswith('Part'):
+                view_part_centroids[view_id].append((sum(xs)/len(xs), sum(ys)/len(ys)))
     return view_bboxes, dict(view_part_centroids)
 
 
-def _annotate_view(msp, welds, view_id, bbox, part_centroids, f_counter, w_counter, obstacles, draw_bbox=None, hatch_bboxes=None):
+def _annotate_view(msp, welds, view_id, bbox, part_centroids, f_counter, w_counter, obstacles, draw_bbox=None, hatch_bboxes=None, other_view_bboxes=None, sampled_labels=None):
     """Annotate all welds in a single view.
     相同位置的 Above+Below 焊缝对共用一根引线，标号并排在横线末端。CJP(W*) 和 FW(F*) 不混合。"""
+    if sampled_labels is None:
+        sampled_labels = []
     lines, text_bboxes, circles = obstacles
+    # 扫描已有 WELD_LABELS MTEXT（跨视图重叠保护）
+    for e in msp:
+        if e.dxftype() == 'MTEXT' and e.dxf.layer == LAYER_NAME:
+            ins = e.dxf.insert
+            w = LABEL_HEIGHT * (6.5 if ',' in e.dxf.text else 3.2)
+            text_bboxes.append((ins.x - w, ins.x, ins.y, ins.y + LABEL_HEIGHT))
     pos_welds = [(w, w['dxf_pos']) for w in welds if w.get('dxf_pos')]
     no_pos_welds = [w for w in welds if not w.get('dxf_pos')]
     if not pos_welds and not no_pos_welds:
@@ -627,7 +737,7 @@ def _annotate_view(msp, welds, view_id, bbox, part_centroids, f_counter, w_count
 
     # ---- 分散多实例：同位有多个组时，分配到不同质心 ----
     if part_centroids and len(set(part_centroids)) >= 2:
-        _redistribute_groups(groups, part_centroids)
+        _redistribute_groups(groups, part_centroids, (vx0, vy0, vx1, vy1))
 
     placed_bboxes = []          # 引线+文字整体包围盒
     placed_text_bboxes = []     # 纯文字包围盒（用于文字重叠检测）
@@ -642,7 +752,7 @@ def _annotate_view(msp, welds, view_id, bbox, part_centroids, f_counter, w_count
             dname, diag_len, angle = _search_placement(
                 wp_a, lines, text_bboxes, circles, placed_bboxes,
                 placed_text_bboxes, vx0, vy0, vx1, vy1, draw_bbox, is_pair=True,
-                hatch_bboxes=hatch_bboxes)
+                hatch_bboxes=hatch_bboxes, other_view_bboxes=other_view_bboxes)
             bx0, bx1, by0, by1 = _paired_bbox(wp_a, dname, diag_len, angle)
             bbox = (min(bx0, wp_a[0])-1, max(bx1, wp_a[0])+1,
                     min(by0, wp_a[1])-1, max(by1, wp_a[1])+1)
@@ -655,7 +765,7 @@ def _annotate_view(msp, welds, view_id, bbox, part_centroids, f_counter, w_count
             dname, diag_len, angle = _search_placement(
                 wp, lines, text_bboxes, circles, placed_bboxes,
                 placed_text_bboxes, vx0, vy0, vx1, vy1, draw_bbox,
-                hatch_bboxes=hatch_bboxes)
+                hatch_bboxes=hatch_bboxes, other_view_bboxes=other_view_bboxes)
             bx0, bx1, by0, by1 = _single_bbox(wp, dname, diag_len, angle)
             bbox = (min(bx0, wp[0])-1, max(bx1, wp[0])+1,
                     min(by0, wp[1])-1, max(by1, wp[1])+1)
@@ -666,19 +776,47 @@ def _annotate_view(msp, welds, view_id, bbox, part_centroids, f_counter, w_count
     # ---- 全局后处理：冲突解决（最多8次迭代） ----
     _resolve_label_conflicts(msp, lines, text_bboxes, circles,
                              vx0, vy0, vx1, vy1, draw_bbox, _placements, placed_text_bboxes, 8,
-                             hatch_bboxes=hatch_bboxes)
+                             hatch_bboxes=hatch_bboxes, other_view_bboxes=other_view_bboxes)
 
     # ---- 绘制所有标注 ----
     for pd in _placements:
         gtype, items, labels, pos, dname, diag_len, angle = pd[:7]
+        _smp = items[0][0].get('_sampled', False)
         if gtype == 'pair':
-            _draw_paired_weld_label(msp, labels, pos, dname, diag_len, angle)
+            _draw_paired_weld_label(msp, labels, pos, dname, diag_len, angle, sampled=_smp)
         else:
-            _draw_weld_label(msp, labels[0], pos, dname, diag_len, angle)
+            _draw_weld_label(msp, labels[0], pos, dname, diag_len, angle, sampled=_smp)
+        if _smp:
+            if gtype == 'pair':
+                for i in range(2):
+                    ww = items[i][0]
+                    lb = labels[i]
+                    sampled_labels.append({
+                        'component': ww.get('comp_full', ww['component']), 'label': lb,
+                        'weld_type': ww.get('weld_type', ''), 'part1': ww['part1'], 'part2': ww['part2'],
+                        'position': ww.get('position', ''), 'length': ww.get('length_mm', 0),
+                        'hf': ww.get('hf', ''), 'annotation': ww.get('annotation', ''),
+                    })
+            else:
+                ww = items[0][0]; lb = labels[0]
+                sampled_labels.append({
+                    'component': ww['component'], 'label': lb,
+                    'weld_type': ww.get('weld_type', ''), 'part1': ww['part1'], 'part2': ww['part2'],
+                    'position': ww.get('position', ''), 'length': ww.get('length_mm', 0),
+                    'hf': ww.get('hf', ''), 'annotation': ww.get('annotation', ''),
+                })
 
     for w in no_pos_welds:
         label = _next_label(w, f_counter, w_counter)
         _draw_fallback_label(msp, w, label, bbox)
+        if w.get('_sampled'):
+            sampled_labels.append({
+                'component': w.get('comp_full', w['component']), 'label': label,
+                'weld_type': w.get('weld_type', ''), 'part1': w['part1'], 'part2': w['part2'],
+                'position': w.get('position', ''), 'length': w.get('length_mm', 0),
+                'hf': w.get('hf', ''), 'annotation': w.get('annotation', ''),
+            })
+    return sampled_labels
 
 
 def _single_bbox(weld_pos, dname, diag_len, angle_deg):
@@ -768,7 +906,7 @@ def _draw_arrow_head(msp, tip, angle_deg, arm_len=2.0):
                      dxfattribs={'layer': LAYER_NAME, 'color': LABEL_COLOR})
 
 
-def _draw_weld_label(msp, label, weld_pos, dname, diag_len, angle_deg):
+def _draw_weld_label(msp, label, weld_pos, dname, diag_len, angle_deg, sampled=False):
     """绘制标注：箭头 → 斜线 → 水平接地短横线 → 文字紧贴横线末端。"""
     wx, wy = weld_pos
     rad = math.radians(angle_deg)
@@ -804,10 +942,25 @@ def _draw_weld_label(msp, label, weld_pos, dname, diag_len, angle_deg):
         'char_height': LABEL_HEIGHT,
         'insert': (lx, hy),
         'attachment_point': ap,
+        'style': 'Arial Narrow',
+        'lineweight': 30,
     })
 
+    if sampled:
+        _tw = len(label) * LABEL_HEIGHT * 0.6
+        if h_land >= 0:
+            _cx = lx - _tw / 2
+        else:
+            _cx = lx + _tw / 2
+        _cy = hy + LABEL_HEIGHT / 2
+        _rx = _tw / 2 + 1.3
+        _ry = LABEL_HEIGHT / 2 + 1.3
+        msp.add_ellipse(center=(_cx, _cy), major_axis=(_rx, 0),
+                        ratio=_ry / max(_rx, 0.01),
+                        dxfattribs={'layer': LAYER_NAME, 'color': 1})
 
-def _draw_paired_weld_label(msp, labels, weld_pos, dname, diag_len, angle_deg):
+
+def _draw_paired_weld_label(msp, labels, weld_pos, dname, diag_len, angle_deg, sampled=False):
     """绘制配对标注：共享引线 + 较长水平横线 + \"F1,F2\" 一个 MTEXT。"""
     wx, wy = weld_pos
     rad = math.radians(angle_deg)
@@ -843,12 +996,27 @@ def _draw_paired_weld_label(msp, labels, weld_pos, dname, diag_len, angle_deg):
         'char_height': LABEL_HEIGHT,
         'insert': (lx, hy),
         'attachment_point': ap,
+        'style': 'Arial Narrow',
+        'lineweight': 30,
     })
+
+    if sampled:
+        _tw = len(paired_text) * LABEL_HEIGHT * 0.6
+        if h_land >= 0:
+            _cx = lx - _tw / 2
+        else:
+            _cx = lx + _tw / 2
+        _cy = hy + LABEL_HEIGHT / 2
+        _rx = _tw / 2 + 1.3
+        _ry = LABEL_HEIGHT / 2 + 1.3
+        msp.add_ellipse(center=(_cx, _cy), major_axis=(_rx, 0),
+                        ratio=_ry / max(_rx, 0.01),
+                        dxfattribs={'layer': LAYER_NAME, 'color': 1})
 
 
 def _search_placement(weld_pos, lines, text_bboxes, circles, placed_bboxes,
                       placed_text_bboxes, vx0, vy0, vx1, vy1, draw_bbox=None, is_pair=False,
-                      hatch_bboxes=None):
+                      hatch_bboxes=None, other_view_bboxes=None):
     """在360°连续角度中搜索最佳标注位置。"""
     wx, wy = weld_pos
 
@@ -864,10 +1032,18 @@ def _search_placement(weld_pos, lines, text_bboxes, circles, placed_bboxes,
             for _gy in range(_gy0, _gy1 + 1):
                 _line_grid.setdefault((_gx, _gy), []).append((_s, _e))
 
+    # 预计算理想引线方向（半区原则用）
+    _vcx = (vx0 + vx1) / 2
+    _vcy = (vy0 + vy1) / 2
+    _ideal_ang = math.degrees(math.atan2(wy - _vcy, wx - _vcx)) % 360
+
     def _has_conflict(angle_deg, dist, _db):
         """True if position has any critical conflict (text overlap, line cross, boundary)."""
         rad = math.radians(angle_deg)
         cos_a, sin_a = math.cos(rad), math.sin(rad)
+        # 引线必须有倾角
+        if abs(sin_a) < math.sin(math.radians(20)):
+            return True
         ex = wx + dist * cos_a
         ey = wy + dist * sin_a
         h_len = PAIR_HORIZ_LAND if is_pair else HORIZ_LAND
@@ -881,6 +1057,15 @@ def _search_placement(weld_pos, lines, text_bboxes, circles, placed_bboxes,
                min(wy, ey, by0), max(wy, ey, by1))
         if not _bbox_in_boundary(nbb, vx0, vy0, vx1, vy1, _db):
             return True
+        # 跨视图终点检查：标注文字不能落入其他视图的 Part 包围盒
+        if other_view_bboxes:
+            for _ovb in other_view_bboxes:
+                if _ovb == (vx0, vy0, vx1, vy1):
+                    continue
+                # 用完整标注包围盒 nbb（含引线+文字），10px margin
+                _M = 10
+                if nbb[1] > _ovb[0] - _M and nbb[0] < _ovb[2] + _M and nbb[3] > _ovb[1] - _M and nbb[2] < _ovb[3] + _M:
+                    return True
         for otb in placed_text_bboxes:
             if not (bx1 < otb[0] - 8 or bx0 > otb[1] + 8 or by1 < otb[2] - 8 or by0 > otb[3] + 8):
                 return True
@@ -962,53 +1147,53 @@ def _search_placement(weld_pos, lines, text_bboxes, circles, placed_bboxes,
         return False
 
     def _fine_tune(dist, angle, _db):
-        """Find clean position near the given one, trying all distances."""
-        _ang, _dst = angle, dist
-        for da in range(-30, 31, 2):
+        """Local angle fix, then reverse-sweep from shortest distance to find the shortest leader."""
+        _ang = angle
+        for da in range(-60, 61, 3):
             if not _has_conflict(angle + da, dist, _db):
                 _ang = angle + da; break
-        for nd in range(dist - 2, 7, -2):
-            if nd < 8: continue
-            for na_off in range(-30, 31, 2):
-                if not _has_conflict(_ang + na_off, nd, _db):
-                    _ang, _dst = _ang + na_off, nd; break
-        if _dst == dist:
-            for nd in range(dist + 2, 57, 2):
-                for na_off in range(-30, 31, 2):
-                    if not _has_conflict(_ang + na_off, nd, _db):
-                        _ang, _dst = _ang + na_off, nd; break
-                if _dst != dist:
-                    break
-        return _ang, _dst, 0
+        # 反向扫描：从最短距离(8)向上，试全部角度找最短引线
+        _full_ao = [0, 10, -10, 20, -20, 30, -30, 40, -40, 50, -50,
+                    60, -60, 70, -70, 80, -80, 90, -90,
+                    100, -100, 110, -110, 120, -120, 130, -130,
+                    140, -140, 150, -150, 160, -160, 170, -170, 180]
+        for nd in range(8, dist, 2):
+            for offset in _full_ao:
+                na = (_ang + offset) % 360
+                if not _has_conflict(na, nd, _db):
+                    for da in range(-30, 31, 3):
+                        if not _has_conflict(na + da, nd, _db):
+                            return na + da, nd, 0
+                    return na, nd, 0
+        # 没更短距离，轻微延长
+        for nd in range(dist + 2, min(dist + 14, 61), 2):
+            for offset in _full_ao:
+                na = (_ang + offset) % 360
+                if not _has_conflict(na, nd, _db):
+                    for da in range(-30, 31, 3):
+                        if not _has_conflict(na + da, nd, _db):
+                            return na + da, nd, 0
+                    return na, nd, 0
+        return _ang, dist, 0
 
     def _search_pass(_db):
-        """推挤式搜索：从最短距离开始，有冲突才扩展。"""
-        distances = list(range(8, 56, 2)) + [60, 72, 96]
+        """联合遍历：外层距离短→长，内层角度从理想角向±90°扩展。"""
+        distances = list(range(8, 56, 2))
         if is_pair:
             distances = [d + 4 for d in distances]
-        _vcx = (vx0 + vx1) / 2
-        _vcy = (vy0 + vy1) / 2
-        _ideal_ang = math.degrees(math.atan2(wy - _vcy, wx - _vcx)) % 360
+        angle_offsets = [0, 5, -5, 10, -10, 15, -15, 20, -20, 25, -25, 30, -30,
+                         35, -35, 40, -40, 45, -45, 50, -50, 55, -55, 60, -60,
+                         65, -65, 70, -70, 75, -75, 80, -80, 85, -85, 90, -90,
+                         95, -95, 100, -100, 105, -105, 110, -110, 115, -115,
+                         120, -120, 125, -125, 130, -130, 135, -135, 140, -140,
+                         145, -145, 150, -150, 155, -155, 160, -160, 165, -165,
+                         170, -170, 175, -175, 180]
         for dist in distances:
-            if not _has_conflict(_ideal_ang, dist, _db):
-                _fa, _fd, _fs = _fine_tune(dist, _ideal_ang, _db)
-                return _fs, (_fa, _fd, 0)
-        # Phase 2a: near-ideal angles (±10°, ±20°)
-        for step in [1, 2]:
-            for sign in (1, -1):
-                angle = (_ideal_ang + sign * step * 10) % 360
-                for dist in distances:
-                    if not _has_conflict(angle, dist, _db):
-                        _fa, _fd, _fs = _fine_tune(dist, angle, _db)
-                        return _fs, (_fa, _fd, 0)
-        # Phase 2c: remaining angles (±30° to ±170°)
-        for step in range(3, 19):
-            for sign in (1, -1):
-                angle = (_ideal_ang + sign * step * 10) % 360
-                for dist in distances:
-                    if not _has_conflict(angle, dist, _db):
-                        _fa, _fd, _fs = _fine_tune(dist, angle, _db)
-                        return _fs, (_fa, _fd, 0)
+            for offset in angle_offsets:
+                angle = (_ideal_ang + offset) % 360
+                if not _has_conflict(angle, dist, _db):
+                    _fa, _fd, _fs = _fine_tune(dist, angle, _db)
+                    return _fs, (_fa, _fd, 0)
 
         _best_score = -999999999
         _best_result = (_ideal_ang, min(distances), 0)
@@ -1020,10 +1205,8 @@ def _search_placement(weld_pos, lines, text_bboxes, circles, placed_bboxes,
                                          vx0, vy0, vx1, vy1,
                                          _db, is_pair=is_pair, min_score=_best_score,
                                          line_grid=_line_grid,
-                                         hatch_bboxes=hatch_bboxes)
-                _ang_diff = abs((angle - _ideal_ang + 180) % 360 - 180)
-                if _ang_diff > 90:
-                    score -= 500
+                                         hatch_bboxes=hatch_bboxes,
+                                         other_view_bboxes=other_view_bboxes)
                 if score > _best_score:
                     _best_score = score
                     _best_result = (angle, dist, 0)
@@ -1038,7 +1221,7 @@ def _search_placement(weld_pos, lines, text_bboxes, circles, placed_bboxes,
 def _score_placement(wx, wy, angle_deg, dist, lines, text_bboxes, circles,
                      placed_bboxes, placed_text_bboxes, vx0, vy0, vx1, vy1,
                      draw_bbox=None, is_pair=False, min_score=None, line_grid=None,
-                     hatch_bboxes=None):
+                     hatch_bboxes=None, other_view_bboxes=None):
     """对 (角度, 距离) 位置评分。分值越高越推荐，正分表示无冲突，负分表示冲突严重。"""
     score = 0
     rad = math.radians(angle_deg)
@@ -1106,6 +1289,16 @@ def _score_placement(wx, wy, angle_deg, dist, lines, text_bboxes, circles,
         _extra_g = max(_extra_x_g, _extra_y_g)
         if _extra_g > 0:
             score -= _extra_g * 2000
+
+    # 跨视图重叠惩罚（完整标注包围盒 vs 其他视图边界）
+    if other_view_bboxes:
+        nbb = (min(wx, ex, bx0), max(wx, ex, bx1),
+               min(wy, ey, by0), max(wy, ey, by1))
+        for _ovb in other_view_bboxes:
+            if _ovb == (vx0, vy0, vx1, vy1):
+                continue
+            if nbb[1] > _ovb[0] - 10 and nbb[0] < _ovb[2] + 10 and nbb[3] > _ovb[1] - 10 and nbb[2] < _ovb[3] + 10:
+                score -= 50000
 
     # 水平接地线与几何线交叉：扣30
     for (sx, sy), (ex2, ey2) in _near_lines:
@@ -1269,10 +1462,11 @@ def _seg_cross_rect(p1, p2, rx0, rx1, ry0, ry1):
     return False
 
 
-def _redistribute_groups(groups, centroids):
-    """同位置有多个 group 时，垂直偏移避免完全重叠。支持所有类型（pair/single/CJP）。"""
+def _redistribute_groups(groups, centroids, view_bbox=None):
+    """Offset duplicate groups toward view center to avoid overlap."""
     if not centroids:
         return
+    _vy_center = (view_bbox[1] + view_bbox[3]) / 2.0 if view_bbox else None
     uniq_c = list(set(centroids))
     pos_map = {}
     for gi, (gtype, items) in enumerate(groups):
@@ -1287,15 +1481,18 @@ def _redistribute_groups(groups, centroids):
         for i_idx, (gi, gtype) in enumerate(entries):
             if i_idx == 0:
                 continue
-            _offset_y = wy + _y_step * i_idx
+            if _vy_center is not None and wy > _vy_center:
+                _offset_y = wy - _y_step * i_idx
+            else:
+                _offset_y = wy + _y_step * i_idx
             _, items = groups[gi]
             groups[gi] = (gtype, [(it[0], (wx, _offset_y)) for it in items])
 
 
 def _bbox_in_boundary(nbb, vx0, vy0, vx1, vy1, draw_bbox):
-    """检查 bbox (x0,x1,y0,y1) 在视图边界内（margin=80）且在图纸边界内（margin=0）。"""
-    if not (vx0 - 80 <= nbb[0] and nbb[1] <= vx1 + 80 and
-            vy0 - 80 <= nbb[2] and nbb[3] <= vy1 + 80):
+    """检查 bbox (x0,x1,y0,y1) 在视图边界内（margin=30）且在图纸边界内（margin=0）。"""
+    if not (vx0 - 30 <= nbb[0] and nbb[1] <= vx1 + 30 and
+            vy0 - 30 <= nbb[2] and nbb[3] <= vy1 + 30):
         return False
     if draw_bbox is not None:
         dx0, dy0, dx1, dy1 = draw_bbox
@@ -1307,7 +1504,7 @@ def _bbox_in_boundary(nbb, vx0, vy0, vx1, vy1, draw_bbox):
 
 def _resolve_label_conflicts(msp, lines, text_bboxes, circles,
                               vx0, vy0, vx1, vy1, draw_bbox, placements, placed_text_bboxes, max_iter=8,
-                              hatch_bboxes=None):
+                              hatch_bboxes=None, other_view_bboxes=None):
     """全局后处理：检测标注间的文字重叠并进行综合微调（距离/角度/方向翻转/双向调整）。"""
     _OVERLAP_MARGIN = 8.0
 
@@ -1475,7 +1672,7 @@ def _resolve_label_conflicts(msp, lines, text_bboxes, circles,
                         pos, lines, text_bboxes, circles,
                         [p[7] for p in placements], placed_text_bboxes,
                         vx0, vy0, vx1, vy1, draw_bbox,
-                        is_pair=(g == 'pair'), hatch_bboxes=hatch_bboxes)
+                        is_pair=(g == 'pair'), hatch_bboxes=hatch_bboxes, other_view_bboxes=other_view_bboxes)
                     _re_result = _adjust_safe(target, pos, _dn, _ds, _ag, g, target)
                     if _re_result:
                         _nbb, _tbb = _re_result
@@ -1532,6 +1729,8 @@ def _draw_fallback_label(msp, w, label, bbox):
         'char_height': LABEL_HEIGHT,
         'insert': (x + 3, y),
         'attachment_point': MT_MIDDLE_LEFT,
+        'style': 'Arial Narrow',
+        'lineweight': 30,
     })
 
 
@@ -1553,6 +1752,8 @@ def _annotate_welds_no_view(msp, welds_no_view, all_welds, f_counter, w_counter)
         'char_height': LABEL_HEIGHT * 1.2,
         'insert': (mid_x, top_y),
         'attachment_point': MT_MIDDLE_CENTER,
+        'style': 'Arial Narrow',
+        'lineweight': 30,
     })
 
     x = mid_x - LABEL_HEIGHT * 20
@@ -1566,6 +1767,8 @@ def _annotate_welds_no_view(msp, welds_no_view, all_welds, f_counter, w_counter)
             'char_height': LABEL_HEIGHT,
             'insert': (x, y),
             'attachment_point': MT_MIDDLE_LEFT,
+            'style': 'Arial Narrow',
+            'lineweight': 30,
         })
         y -= LABEL_HEIGHT * 2
 
