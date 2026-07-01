@@ -691,23 +691,34 @@ def _annotate_view(msp, welds, view_id, bbox, part_centroids, f_counter, w_count
     else:
         cx = cy = vx0 = vy0 = vx1 = vy1 = 0
 
-    # 按近邻焊缝数降序排序（密集区优先放置，减少后续冲突）
-    _CROWD_RADIUS = 30.0
-    _crowd_count = {}
-    for i, (_, pi) in enumerate(pos_welds):
-        _cnt = 0
-        for j, (_, pj) in enumerate(pos_welds):
-            if i != j and math.hypot(pi[0]-pj[0], pi[1]-pj[1]) < _CROWD_RADIUS:
-                _cnt += 1
-        _crowd_count[pi] = _cnt
-    pos_welds.sort(key=lambda wp: (-_crowd_count[wp[1]], -wp[1][1], wp[1][0]))
+    # 扇形分区排序：跨扇区交替放置，避免跨半球引线交叉
+    _vcx = (vx0 + vx1) / 2
+    _vcy = (vy0 + vy1) / 2
+    _N_SECTORS = 12
+    _sectors = [[] for _ in range(_N_SECTORS)]
+    for i, (w, pi) in enumerate(pos_welds):
+        _ang = math.degrees(math.atan2(pi[1] - _vcy, pi[0] - _vcx))
+        _sid = int((_ang + 15 + 360) % 360 / 30)
+        _sectors[_sid].append((i, w, pi))
+    for _s in _sectors:
+        _s.sort(key=lambda x: math.hypot(x[2][0]-_vcx, x[2][1]-_vcy))
+    _new_order = []
+    _max_len = max(len(_s) for _s in _sectors)
+    for _round in range(_max_len):
+        for _sid in range(_N_SECTORS):
+            if _round < len(_sectors[_sid]):
+                _new_order.append(_sectors[_sid][_round])
+    pos_welds = [(w, p) for _, w, p in _new_order]
 
     # ---- 分组：同位配对（CJP(Above)+FW(Below)跨类型可配对，同类型Above+Below配对） ----
     POS_TOL = 1.0
-    from itertools import groupby
+    from collections import defaultdict
+    _pos_map = defaultdict(list)
+    for wp in pos_welds:
+        _key = (round(wp[1][0], 0), round(wp[1][1], 0))
+        _pos_map[_key].append(wp)
     groups = []
-    for (px, py), g_items in groupby(pos_welds, key=lambda wp: (round(wp[1][0], 0), round(wp[1][1], 0))):
-        items = list(g_items)
+    for _key, items in _pos_map.items():
         n = len(items)
         paired_idx = [False] * n
 
@@ -1197,19 +1208,20 @@ def _search_placement(weld_pos, lines, text_bboxes, circles, placed_bboxes,
         return _ang, dist, 0
 
     def _search_pass(_db):
-        """联合遍历：外层距离短→长，内层角度从理想角向±90°扩展。"""
+        """三阶段搜索：短距放宽角→中距正常角→长距兜底。"""
         distances = list(range(8, 56, 2))
         if is_pair:
             distances = [d + 4 for d in distances]
-        angle_offsets = [0, 5, -5, 10, -10, 15, -15, 20, -20, 25, -25, 30, -30,
-                         35, -35, 40, -40, 45, -45, 50, -50, 55, -55, 60, -60,
-                         65, -65, 70, -70, 75, -75, 80, -80, 85, -85, 90, -90,
-                         95, -95, 100, -100, 105, -105, 110, -110, 115, -115,
-                         120, -120, 125, -125, 130, -130, 135, -135, 140, -140,
-                         145, -145, 150, -150, 155, -155, 160, -160, 165, -165,
-                         170, -170, 175, -175, 180]
-        for dist in distances:
-            for offset in angle_offsets:
+        _full_ao = [0, 5, -5, 10, -10, 15, -15, 20, -20, 25, -25, 30, -30,
+                     35, -35, 40, -40, 45, -45, 50, -50, 55, -55, 60, -60,
+                     65, -65, 70, -70, 75, -75, 80, -80, 85, -85, 90, -90,
+                     95, -95, 100, -100, 105, -105, 110, -110, 115, -115,
+                     120, -120, 125, -125, 130, -130, 135, -135, 140, -140,
+                     145, -145, 150, -150, 155, -155, 160, -160, 165, -165,
+                     170, -170, 175, -175, 180]
+
+        def _try_place(dist, ao_list):
+            for offset in ao_list:
                 angle = (_ideal_ang + offset) % 360
                 rad = math.radians(angle)
                 if abs(math.sin(rad)) < math.sin(math.radians(20)): continue
@@ -1217,6 +1229,28 @@ def _search_placement(weld_pos, lines, text_bboxes, circles, placed_bboxes,
                 if not _has_conflict(angle, dist, _db):
                     _fa, _fd, _fs = _fine_tune(dist, angle, _db)
                     return _fs, (_fa, _fd, 0)
+            return None
+
+        # Phase A: 短距离 8→24, 放宽角度 ±60°（空间大时优先用短引线）
+        _wide_ao = [0,5,-5,10,-10,15,-15,20,-20,25,-25,30,-30,
+                    35,-35,40,-40,45,-45,50,-50,55,-55,60,-60]
+        for dist in distances:
+            if dist > 24: break
+            result = _try_place(dist, _wide_ao)
+            if result: return result
+
+        # Phase B: 中距离 26→38, 正常角度 ±45°（常规区域）
+        _mid_ao = [0,8,-8,15,-15,22,-22,30,-30,38,-38,45,-45]
+        for dist in distances:
+            if dist < 26 or dist > 38: continue
+            result = _try_place(dist, _mid_ao)
+            if result: return result
+
+        # Phase C: 长距离 40→54, 全角度兜底
+        for dist in distances:
+            if dist < 40: continue
+            result = _try_place(dist, _full_ao)
+            if result: return result
 
         _best_score = -999999999
         _best_result = (_ideal_ang, min(distances), 0)
@@ -1242,6 +1276,36 @@ def _search_placement(weld_pos, lines, text_bboxes, circles, placed_bboxes,
 
     score, result = _search_pass(draw_bbox)
     return 0, result[1], result[0]
+
+
+def _leader_crosses_leader(pos_a, dist_a, angle_a, h_land_a,
+                           pos_b, dist_b, angle_b, h_land_b):
+    """检测两条引线（斜线+水平线）是否交叉。返回 (crosses, cross_angle)。"""
+    rad_a = math.radians(angle_a)
+    ex_a = pos_a[0] + dist_a * math.cos(rad_a)
+    ey_a = pos_a[1] + dist_a * math.sin(rad_a)
+    hx_a = ex_a + h_land_a; hy_a = ey_a
+
+    rad_b = math.radians(angle_b)
+    ex_b = pos_b[0] + dist_b * math.cos(rad_b)
+    ey_b = pos_b[1] + dist_b * math.sin(rad_b)
+    hx_b = ex_b + h_land_b; hy_b = ey_b
+
+    def _seg_intersect(p1, p2, p3, p4):
+        d1 = (p4[1]-p3[1])*(p2[0]-p3[0]) - (p4[0]-p3[0])*(p2[1]-p3[1])
+        d2 = (p4[1]-p3[1])*(p1[0]-p3[0]) - (p4[0]-p3[0])*(p1[1]-p3[1])
+        if d1*d2 >= 0: return False
+        d3 = (p2[1]-p1[1])*(p4[0]-p1[0]) - (p2[0]-p1[0])*(p4[1]-p1[1])
+        d4 = (p2[1]-p1[1])*(p3[0]-p1[0]) - (p2[0]-p1[0])*(p3[1]-p1[1])
+        return d3*d4 < 0
+
+    lines_a = [(pos_a, (ex_a, ey_a)), ((ex_a, ey_a), (hx_a, hy_a))]
+    lines_b = [(pos_b, (ex_b, ey_b)), ((ex_b, ey_b), (hx_b, hy_b))]
+    for (p1, p2) in lines_a:
+        for (p3, p4) in lines_b:
+            if _seg_intersect(p1, p2, p3, p4):
+                return True, abs(angle_a - angle_b) % 180
+    return False, None
 
 
 def _score_placement(wx, wy, angle_deg, dist, lines, text_bboxes, circles,
@@ -1650,6 +1714,35 @@ def _resolve_label_conflicts(msp, lines, text_bboxes, circles,
                     # 文字不重叠，检查引线是否穿过对方文字
                     if not (_leader_crosses_text(pos_i, ds_i, ag_i, gi, tbb_j) or
                             _leader_crosses_text(pos_j, ds_j, ag_j, gj, tbb_i)):
+                        # Also check leader-leader crossing (<45° must fix)
+                        _h_i = PAIR_HORIZ_LAND if gi == 'pair' else HORIZ_LAND
+                        _h_j = PAIR_HORIZ_LAND if gj == 'pair' else HORIZ_LAND
+                        _crosses, _cross_ang = _leader_crosses_leader(
+                            pos_i, ds_i, ag_i, _h_i, pos_j, ds_j, ag_j, _h_j)
+                        if not _crosses or (_cross_ang and _cross_ang >= 45):
+                            continue
+                        # Cross angle < 45° → try to fix
+                        _cross_fixed = False
+                        for target, g, it, lb, pos, dn, ds, ag in [
+                            (j, gj, it_j, lb_j, pos_j, dn_j, ds_j, ag_j),
+                            (i, gi, it_i, lb_i, pos_i, dn_i, ds_i, ag_i),
+                        ]:
+                            for d_a in [15, -15, 30, -30, 45, -45]:
+                                na = ag + d_a
+                                ra = math.radians(na % 360)
+                                if abs(math.sin(ra)) < math.sin(math.radians(20)): continue
+                                if abs(math.cos(ra)) < math.cos(math.radians(70)): continue
+                                result = _adjust_safe(target, pos, dn, ds, na, g, target)
+                                if result:
+                                    nbb, tbb = result
+                                    placements[target] = (g, it, lb, pos, dn, ds, na, nbb)
+                                    placed_text_bboxes[target] = tbb
+                                    _cross_fixed = True
+                                    break
+                            if _cross_fixed: break
+                        if _cross_fixed:
+                            _fixed = True
+                            break
                         continue
 
                 _fixed = False
