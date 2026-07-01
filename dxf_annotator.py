@@ -1041,9 +1041,11 @@ def _search_placement(weld_pos, lines, text_bboxes, circles, placed_bboxes,
         """True if position has any critical conflict (text overlap, line cross, boundary)."""
         rad = math.radians(angle_deg)
         cos_a, sin_a = math.cos(rad), math.sin(rad)
-        # 引线必须有倾角
+        # 引线必须有倾角：拒水平(0/180)和垂直(±90)
         if abs(sin_a) < math.sin(math.radians(20)):
-            return True
+            return True  # too close to horizontal
+        if abs(cos_a) < math.cos(math.radians(70)):
+            return True  # too close to vertical
         ex = wx + dist * cos_a
         ey = wy + dist * sin_a
         h_len = PAIR_HORIZ_LAND if is_pair else HORIZ_LAND
@@ -1150,8 +1152,12 @@ def _search_placement(weld_pos, lines, text_bboxes, circles, placed_bboxes,
         """Local angle fix, then reverse-sweep from shortest distance to find the shortest leader."""
         _ang = angle
         for da in range(-60, 61, 3):
-            if not _has_conflict(angle + da, dist, _db):
-                _ang = angle + da; break
+            na2 = angle + da
+            r2 = math.radians(na2 % 360)
+            if abs(math.sin(r2)) < math.sin(math.radians(20)): continue
+            if abs(math.cos(r2)) < math.cos(math.radians(70)): continue
+            if not _has_conflict(na2, dist, _db):
+                _ang = na2; break
         # 反向扫描：从最短距离(8)向上，试全部角度找最短引线
         _full_ao = [0, 10, -10, 20, -20, 30, -30, 40, -40, 50, -50,
                     60, -60, 70, -70, 80, -80, 90, -90,
@@ -1160,19 +1166,33 @@ def _search_placement(weld_pos, lines, text_bboxes, circles, placed_bboxes,
         for nd in range(8, dist, 2):
             for offset in _full_ao:
                 na = (_ang + offset) % 360
+                r3 = math.radians(na)
+                if abs(math.sin(r3)) < math.sin(math.radians(20)): continue
+                if abs(math.cos(r3)) < math.cos(math.radians(70)): continue
                 if not _has_conflict(na, nd, _db):
                     for da in range(-30, 31, 3):
-                        if not _has_conflict(na + da, nd, _db):
-                            return na + da, nd, 0
+                        na3 = na + da
+                        r3b = math.radians(na3 % 360)
+                        if abs(math.sin(r3b)) < math.sin(math.radians(20)): continue
+                        if abs(math.cos(r3b)) < math.cos(math.radians(70)): continue
+                        if not _has_conflict(na3, nd, _db):
+                            return na3, nd, 0
                     return na, nd, 0
         # 没更短距离，轻微延长
         for nd in range(dist + 2, min(dist + 14, 61), 2):
             for offset in _full_ao:
                 na = (_ang + offset) % 360
+                r4 = math.radians(na)
+                if abs(math.sin(r4)) < math.sin(math.radians(20)): continue
+                if abs(math.cos(r4)) < math.cos(math.radians(70)): continue
                 if not _has_conflict(na, nd, _db):
                     for da in range(-30, 31, 3):
-                        if not _has_conflict(na + da, nd, _db):
-                            return na + da, nd, 0
+                        na4 = na + da
+                        r4b = math.radians(na4 % 360)
+                        if abs(math.sin(r4b)) < math.sin(math.radians(20)): continue
+                        if abs(math.cos(r4b)) < math.cos(math.radians(70)): continue
+                        if not _has_conflict(na4, nd, _db):
+                            return na4, nd, 0
                     return na, nd, 0
         return _ang, dist, 0
 
@@ -1191,6 +1211,9 @@ def _search_placement(weld_pos, lines, text_bboxes, circles, placed_bboxes,
         for dist in distances:
             for offset in angle_offsets:
                 angle = (_ideal_ang + offset) % 360
+                rad = math.radians(angle)
+                if abs(math.sin(rad)) < math.sin(math.radians(20)): continue
+                if abs(math.cos(rad)) < math.cos(math.radians(70)): continue
                 if not _has_conflict(angle, dist, _db):
                     _fa, _fd, _fs = _fine_tune(dist, angle, _db)
                     return _fs, (_fa, _fd, 0)
@@ -1200,6 +1223,9 @@ def _search_placement(weld_pos, lines, text_bboxes, circles, placed_bboxes,
         for dist in distances:
             for _off in range(0, 360, 30):
                 angle = (_ideal_ang + _off) % 360
+                rad = math.radians(angle)
+                if abs(math.sin(rad)) < math.sin(math.radians(20)): continue
+                if abs(math.cos(rad)) < math.cos(math.radians(70)): continue
                 score = _score_placement(wx, wy, angle, dist, lines, text_bboxes,
                                          circles, placed_bboxes, placed_text_bboxes,
                                          vx0, vy0, vx1, vy1,
@@ -1476,6 +1502,13 @@ def _redistribute_groups(groups, centroids, view_bbox=None):
     for pos_key, entries in pos_map.items():
         if len(entries) <= 1:
             continue
+        # Skip redistribution if groups represent different weld pairs
+        _all_pairs = set()
+        for _gi, _gt in entries:
+            _w = groups[_gi][1][0][0]
+            _all_pairs.add(tuple(sorted((_w.get('part1',''), _w.get('part2','')))))
+        if len(_all_pairs) > 1:
+            continue
         wx, wy = pos_key
         _y_step = LABEL_HEIGHT * 5.0
         for i_idx, (gi, gtype) in enumerate(entries):
@@ -1642,6 +1675,9 @@ def _resolve_label_conflicts(msp, lines, text_bboxes, circles,
                     # --- 角度微调 ---
                     for d_a in [1, -1, 2, -2, 3, -3, 5, -5, 8, -8, 12, -12]:
                         na = ag + d_a
+                        r5 = math.radians(na % 360)
+                        if abs(math.sin(r5)) < math.sin(math.radians(20)): continue
+                        if abs(math.cos(r5)) < math.cos(math.radians(70)): continue
                         result = _adjust_safe(target, pos, dn, ds, na, g, target)
                         if result:
                             nbb, tbb = result
@@ -1655,6 +1691,9 @@ def _resolve_label_conflicts(msp, lines, text_bboxes, circles,
                     _opp_ang = (ag + 180) % 360
                     for _oa in [_opp_ang, (_opp_ang-12)%360, (_opp_ang+12)%360,
                                 (_opp_ang-24)%360, (_opp_ang+24)%360]:
+                        r6 = math.radians(_oa)
+                        if abs(math.sin(r6)) < math.sin(math.radians(20)): continue
+                        if abs(math.cos(r6)) < math.cos(math.radians(70)): continue
                         for od in [ds, ds+4, ds-4, ds+8, ds-8]:
                             if od < 8 or od > 60: continue
                             result = _adjust_safe(target, pos, _opp_ang, od, _oa, g, target)

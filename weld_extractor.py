@@ -1090,6 +1090,7 @@ def extract_welds(dxf_path):
     _synth_pairs = set()   # (part1, part2) pairs from synthetic CIRCLE edges, skip pos-refine
     _gussets_3s = set()    # track gussets processed in 3-SIDES/CIRCLE WMs (cross-view dedup)
 
+    _pp_arrow_map = {}  # pp_extra WM arrow positions
     for view_id, weldmarks in wm_by_view.items():
         view_parts = part_lines_map.get(view_id, {})
         if not view_parts:
@@ -1168,6 +1169,15 @@ def extract_welds(dxf_path):
                 gusset_blk_set  = set(gusset_names)  # skip ALL gussets as neighbors
                 ADJ_TOL         = SNAP_TOL + 3.0  # relaxed to catch bottom flange edges
                 MIN_EDGE        = 1.5  # CAD units (<15mm = degenerate stub)
+
+                # 记录 WM 箭头，供 pp_extra 使用
+                if comp == 'CO009':
+                    _g_lbl = part_number_map.get(gusset_name, comp)
+                    _ppe = COMP_CONFIG.get(comp, {}).get('pp_extra', [])
+                    for _pp in _ppe:
+                        if _g_lbl in _pp[:2]:
+                            _k = tuple(sorted(_pp[:2]))
+                            _pp_arrow_map.setdefault(_k, []).append((arrow, view_id))
 
                 _synth = _use_largest_gusset and bool(comp_dims.get('flange_w'))
                 if _synth:
@@ -2339,6 +2349,30 @@ def extract_welds(dxf_path):
                         print(f"    [xv-dedup] removed {len(_rm_xv)} bl-length from duplicate gusset {lbl_g}")
                 else:
                     _gussets_3s.add(lbl_g)
+                # Snap edge x to gusset center for section views (edge-on gusset)
+                _gx_list_gs = [p[0] for _pn in view_parts if part_number_map.get(_pn, comp) == lbl_g
+                               for _pl in view_parts[_pn] for p in (_pl['start'],_pl['end'])]
+                if _gx_list_gs:
+                    _gxmin, _gxmax = min(_gx_list_gs), max(_gx_list_gs)
+                    if _gxmax - _gxmin < 5.0:
+                        for _er in edge_rows:
+                            if abs(_er['dxf_pos'][0] - _gxmax) < 3.0 or abs(_er['dxf_pos'][0] - _gxmin) < 3.0:
+                                _er['dxf_pos'] = ((_gxmin + _gxmax) / 2.0, _er['dxf_pos'][1])
+                # plate→plate edges: use gusset bbox boundary x (section views only)
+                if _gx_list_gs:
+                    _gxmin, _gxmax = min(_gx_list_gs), max(_gx_list_gs)
+                    if _gxmax - _gxmin < 5.0:
+                        for _er in edge_rows:
+                            if _er['part1'] != comp and _er['part2'] != comp:
+                                _other_p = _er['part1'] if _er['part2'] == lbl_g else _er['part2']
+                                _ox = [p[0] for _pn in view_parts
+                                       if part_number_map.get(_pn, comp) == _other_p
+                                       for _pl in view_parts[_pn]
+                                       for p in (_pl['start'], _pl['end'])]
+                                if _ox:
+                                    _ocx = sum(_ox) / len(_ox)
+                                    _target_x = _gxmax if _ocx > (_gxmin + _gxmax) / 2 else _gxmin
+                                    _er['dxf_pos'] = (_target_x, _er['dxf_pos'][1])
                 # TYP symmetric mirroring: when _ext_mul > 1, mirror copy[1..n-1]
                 # x-coordinates about the global component centre.
                 # Mirrored copies get view_id of the cross-view (same gusset label).
@@ -2464,6 +2498,12 @@ def extract_welds(dxf_path):
                     lbl1 = comp
 
             lbl_non_comp = lbl2 if lbl1 == comp else lbl1
+            # 记录正常 WM 箭头，供 pp_extra 使用
+            _ppe_n = COMP_CONFIG.get(comp, {}).get('pp_extra', [])
+            for _pp in _ppe_n:
+                if lbl1 in _pp[:2] or lbl2 in _pp[:2]:
+                    _k = tuple(sorted(_pp[:2]))
+                    _pp_arrow_map.setdefault(_k, []).append((arrow, view_id))
             bom_fallback_count = 1
 
             # BOM fallback: when the WM finds only comp-labeled parts (self-weld),
@@ -3057,20 +3097,19 @@ def extract_welds(dxf_path):
                         if _exists: continue
                         for _dup in (0, 1):  # _dup=0: front face; _dup=1: mirrored back face
                             _mpos = _line_mid(_cln)
-                            # 对 comp→plate 边，用实际接触边中点修正 y
                             _from_contact = False
-                            if {p1, p2} == {comp, _cplbl}:
-                                _wl = _find_weld_line_for_pair(p1, p2, _vid)
-                                if _wl:
-                                    if len(_wl) >= 2:
-                                        _ys = [round(w[2][1], 1) for w in _wl]
-                                        _yc = Counter(_ys)
-                                        _best = min(_wl, key=lambda w: _yc[round(w[2][1], 1)])
-                                        _mpos = (_mpos[0], _best[2][1])
-                                        _from_contact = True
-                                    else:
-                                        _mpos = (_mpos[0], _wl[0][2][1])
-                                        _from_contact = True
+                            _wl = _find_weld_line_for_pair(p1, p2, _vid)
+                            if _wl and len(_wl) >= 2:
+                                _ys = [round(w[2][1], 1) for w in _wl]
+                                if all(abs(_line_mid(_cln)[1] - y) > 5.0 for y in _ys):
+                                    _yc = Counter(_ys)
+                                    _best = min(_wl, key=lambda w: _yc[round(w[2][1], 1)])
+                                    _mpos = (_mpos[0], _best[2][1])
+                                    _from_contact = True
+                            elif _wl:
+                                if abs(_line_mid(_cln)[1] - round(_wl[0][2][1], 1)) > 5.0:
+                                    _mpos = (_mpos[0], _wl[0][2][1])
+                                    _from_contact = True
                             if not _from_contact and not _is_diag:
                                 _from_contact = True
                             if _dup == 1 and _view_center_x:
@@ -4079,10 +4118,13 @@ def extract_welds(dxf_path):
         if _tkey in _triples_covered: continue
         _p1, _p2 = _ppair[0], _ppair[1]
         if _p1.startswith('p') and _p2.startswith('sp'): _p1, _p2 = _p2, _p1
+        _pp_arrow_data = _pp_arrow_map.get(_ppair, [(None, '')])[0]
+        _pp_arrow = _pp_arrow_data[0] if isinstance(_pp_arrow_data, tuple) else _pp_arrow_data
+        _pp_vid = _pp_arrow_data[1] if isinstance(_pp_arrow_data, tuple) else ''
         print(f"    [pp-extra] {_la}/{_lb} weld={_wl}mm hf={_hf} x{_qty}")
         for _rep in range(_qty):
                 for _pos in ('Above', 'Below'):
-                    results.append({'component': comp, 'position': _pos, 'hf': _hf, 'length_mm': _wl, 'annotation': '', 'part1': _p1, 'part2': _p2, 'dxf_pos': None, 'view_id': '', '_synthetic': True})
+                    results.append({'component': comp, 'position': _pos, 'hf': _hf, 'length_mm': _wl, 'annotation': '', 'part1': _p1, 'part2': _p2, 'dxf_pos': _pp_arrow, 'view_id': _pp_vid, '_synthetic': True})
                 _triples_covered.add(_tkey)
 
     # Web-face weld: along column web between flanges.
@@ -4272,6 +4314,23 @@ def extract_welds(dxf_path):
                     _exp = _r['length_mm']
                     _best = min(_wl, key=lambda x: abs(
                         math.hypot(x[1][0]-x[0][0], x[1][1]-x[0][1]) * SCALE - _exp))
+                    _old = _r.get('dxf_pos')
+                    if _old is None:
+                        _cands = [(w, abs(math.hypot(w[1][0]-w[0][0], w[1][1]-w[0][1]) * SCALE - _exp))
+                                  for w in _wl]
+                        _cands.sort(key=lambda x: x[1])
+                        _near = [w for w, d in _cands if d < 5.0]
+                        if _near:
+                            if len(_near) >= 2:
+                                _ys = sorted(round(w[2][1], 1) for w in _near)
+                                _med_y = _ys[len(_ys) // 2]
+                                _best = min(_near, key=lambda w: abs(round(w[2][1], 1) - _med_y))
+                            else:
+                                _best = _near[0]
+                    elif abs(_best[2][1] - _old[1]) < 5.0 and abs(_best[2][0] - _old[0]) < 5.0:
+                        pass  # keep _best
+                    else:
+                        continue  # skip this row
                     _r['dxf_pos'] = _best[2]
                 _r['_no_refine'] = True
         # p127: complement missing Below and deduplicate
@@ -4369,8 +4428,9 @@ def extract_welds(dxf_path):
                 if part_number_map.get(_pn, comp) == _pm('p124'):
                     _xs = [p[0] for ln in _plines for p in (ln['start'], ln['end'])]
                     _ys = [p[1] for ln in _plines for p in (ln['start'], ln['end'])]
-                    if _xs:
-                        _cents.append((sum(_xs)/len(_xs), sum(_ys)/len(_ys)))
+                    if _xs and _ys:
+                        _cents.append((sum(_xs)/len(_xs), min(_ys)))
+                        _cents.append((sum(_xs)/len(_xs), max(_ys)))
             if len(_cents) >= 2:
                 _sc = sorted(_cents, key=lambda c: c[1])
                 _sx = {}
@@ -4381,16 +4441,14 @@ def extract_welds(dxf_path):
                     _sx.setdefault(_xr, []).append(_r)
                 for _xr, _items in _sx.items():
                     if len(_items) >= 2:
-                        # Distribute by x-proximity: closer to lower instance gets lower y
-                        _cx = round(_xr, 0)
-                        _d_lo = abs(_cx - _sc[0][0])
-                        _d_hi = abs(_cx - _sc[1][0])
-                        _yt_first = _sc[0][1] if _d_lo < _d_hi else _sc[1][1]
-                        _yt_rest  = _sc[1][1] if _d_lo < _d_hi else _sc[0][1]
+                        _keep_y = _items[0]['dxf_pos'][1]
+                        _all_ys = [c[1] for c in _cents]
+                        _cy = (min(_all_ys) + max(_all_ys)) / 2 if _all_ys else _keep_y
                         for i, _r in enumerate(_items):
-                            _r['dxf_pos'] = (_r['dxf_pos'][0], _yt_first if i == 0 else _yt_rest)
+                            _target_y = _keep_y if i == 0 else (2 * _cy - _keep_y)
+                            _r['dxf_pos'] = (_r['dxf_pos'][0], _target_y)
                             _r['_no_refine'] = True
-                print(f"    [p124-ydist] distributed duplicates across {len(_cents)} instances")
+                print(f"    [p124-ydist] y-mirrored {len(_p124_cjp)} CJP rows across {len(_cents)} bbox boundaries")
         # p101: move long edge from A-A to C-C, remove short edge from A-A
         _p101_bl = round(part_dims.get('p101', {}).get('bom_len') or 220)
         _p101_aa = [r for r in results if r.get('component') == comp and r.get('part2') == 'p101' and r.get('view_id') == aa]
@@ -4412,12 +4470,6 @@ def extract_welds(dxf_path):
             if not _bl and len(_ab) >= 1:
                 _ab[0]['position'] = 'Below'
                 print(f"    [p100-fix] flipped 313mm Above→Below")
-        # Create p100/p127 from p100/p126
-        _p126_pp = [r for r in results if r.get('component') == comp and r.get('part1') == _p100p and r.get('part2') == _pm('p126')]
-        if _p126_pp and not any(r.get('component') == comp and r.get('part1') == _p100p and r.get('part2') == _pm('p127') for r in results):
-            for _r in _p126_pp:
-                results.append(dict(_r, part2=_pm('p127')))
-            print(f"    [p127-pp] created {_p100p}/{_pm('p127')} from {_p100p}/{_pm('p126')} structure")
 
     if comp == 'CO007':
         _run_column_cleanup(results, comp, part_dims, part_lines_map, part_number_map,
@@ -4427,6 +4479,86 @@ def extract_welds(dxf_path):
         _run_column_cleanup(results, comp, part_dims, part_lines_map, part_number_map,
                             plate_map={'p47':'p92','p100':'p102'}, aa='2162', cc='2425', dd='2476', ee='2544',
                             circle_vid='1800')
+
+    # 通用对称板镜像：对 plate→plate 边，检测对称板并 x-镜像复制
+    _pp_mirrored = 0
+    for _vid, _vparts in part_lines_map.items():
+        _pp_results = [r for r in results if r.get('component') == comp
+                       and r.get('part1') != comp and r.get('part2') != comp
+                       and r.get('view_id') == _vid]
+        if not _pp_results:
+            continue
+        _vx_vals = []
+        _plate_bbox = {}
+        for _pn, _plns in _vparts.items():
+            _plbl = part_number_map.get(_pn, comp)
+            if _plbl == comp: continue
+            _pxs = [p[0] for ln in _plns for p in (ln['start'], ln['end'])]
+            _pys = [p[1] for ln in _plns for p in (ln['start'], ln['end'])]
+            if _pxs:
+                _plate_bbox[_plbl] = (min(_pxs), max(_pxs), min(_pys), max(_pys))
+                _vx_vals.extend([min(_pxs), max(_pxs)])
+        if len(_plate_bbox) < 2:
+            continue
+        _vx_c = (min(_vx_vals) + max(_vx_vals)) / 2 if _vx_vals else 0
+        _pp_pairs = set(tuple(sorted((r['part1'], r['part2']))) for r in _pp_results)
+        for (_pa, _pb) in list(_pp_pairs):
+            _pa_bb = _plate_bbox.get(_pa, (0,0,0,0))
+            _pb_bb = _plate_bbox.get(_pb, (0,0,0,0))
+            _pa_w = abs(_pa_bb[1] - _pa_bb[0]); _pa_h = abs(_pa_bb[3] - _pa_bb[2])
+            _pb_w = abs(_pb_bb[1] - _pb_bb[0]); _pb_h = abs(_pb_bb[3] - _pb_bb[2])
+            _pa_cx = (_pa_bb[0] + _pa_bb[1]) / 2
+            _pb_cx = (_pb_bb[0] + _pb_bb[1]) / 2
+            # Try both plates as anchor
+            for _anchor, _anchor_bb, _anchor_w, _anchor_h, _anchor_cx in [
+                (_pa, _pa_bb, _pa_w, _pa_h, _pa_cx),
+                (_pb, _pb_bb, _pb_w, _pb_h, _pb_cx),
+            ]:
+                if _anchor_w < 1 or _anchor_h < 1: continue
+                for _pc, _pc_bb in _plate_bbox.items():
+                    if _pc in (_pa, _pb): continue
+                    _mirror_pair = tuple(sorted((_anchor, _pc)))
+                    if _mirror_pair in _pp_pairs: continue
+                    _pc_w = abs(_pc_bb[1] - _pc_bb[0])
+                    _pc_h = abs(_pc_bb[3] - _pc_bb[2])
+                    if _pc_w < 1 or _pc_h < 1: continue
+                    _w_d = abs(_anchor_w - _pc_w) / max(_anchor_w, _pc_w, 1)
+                    _h_d = abs(_anchor_h - _pc_h) / max(_anchor_h, _pc_h, 1)
+                    if _w_d + _h_d > 0.4: continue
+                    _pc_cx = (_pc_bb[0] + _pc_bb[1]) / 2
+                    if not ((_anchor_cx < _vx_c and _pc_cx > _vx_c) or (_anchor_cx > _vx_c and _pc_cx < _vx_c)):
+                        continue
+                    _other = _pb if _anchor == _pa else _pa
+                    _other_bb = _plate_bbox.get(_other)
+                    _mir_x_fixed = None
+                    if _other_bb:
+                        _other_cx = (_other_bb[0] + _other_bb[1]) / 2
+                        _mir_x_fixed = _pc_bb[1] if _other_cx > _pc_cx else _pc_bb[0]
+                    for _r in _pp_results:
+                        if {_r['part1'], _r['part2']} != {_pa, _pb}: continue
+                        _src_pos = _r.get('dxf_pos')
+                        if not _src_pos: continue
+                        _nr = dict(_r)
+                        _nr['part1'] = _pc if _r['part1'] == _anchor else _other
+                        _nr['part2'] = _pc if _r['part2'] == _anchor else _other
+                        _mir_x = _mir_x_fixed if _mir_x_fixed is not None else (
+                            2 * ((_anchor_cx + _pc_cx) / 2) - _src_pos[0])
+                        _nr['dxf_pos'] = (_mir_x, _src_pos[1])
+                        _nr['_no_refine'] = True
+                        _nr['_mirrored'] = True
+                        for _pos in ('Above', 'Below'):
+                            _nr2 = dict(_nr, position=_pos)
+                            _exist = any(r2 for r2 in results
+                                         if {r2['part1'], r2['part2']} == {_other, _pc}
+                                         and r2['position'] == _pos
+                                         and abs(r2['length_mm'] - _nr['length_mm']) < 0.5)
+                            if not _exist:
+                                results.append(_nr2)
+                                _pp_mirrored += 1
+                                print(f"    [pp-mirror] {_anchor}/{_other}→{_pc}/{_other} in view {_vid} x-mirrored")
+                        break
+    if _pp_mirrored:
+        print(f"  [pp-mirror] generated {_pp_mirrored} symmetric plate-to-plate edges")
 
     # ARC cleanup: use component config for expected lengths
     _cfg = COMP_CONFIG.get(comp, {})
@@ -4846,12 +4978,14 @@ def extract_welds(dxf_path):
                 break
             _best_idx = min(range(len(_available)),
                            key=lambda j: (_available[j][2][0]-_ox)**2 + (_available[j][2][1]-_oy)**2)
-            _pk2 = (round(_ox, 1), round(_oy, 1))
-            for _sp in _seen_pos:
-                if abs(_sp[0]-_pk2[0])<0.1 and abs(_sp[1]-_pk2[1])<0.1:
-                    _assignments[_sp] = _available[_best_idx][2]
-                    break
-            _available.pop(_best_idx)
+            _best_pos = _available[_best_idx][2]
+            if abs(_best_pos[1] - _oy) < 5.0 and abs(_best_pos[0] - _ox) < 5.0:
+                _pk2 = (round(_ox, 1), round(_oy, 1))
+                for _sp in _seen_pos:
+                    if abs(_sp[0]-_pk2[0])<0.1 and abs(_sp[1]-_pk2[1])<0.1:
+                        _assignments[_sp] = _best_pos
+                        break
+                _available.pop(_best_idx)
 
         for r in _rows:
             _is_c = 'C' if r.get('weld_type','') == 'CJP' else 'F'
