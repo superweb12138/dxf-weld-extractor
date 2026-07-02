@@ -31,7 +31,8 @@ DIAG_STEP = 3              # step increment for collision avoidance
 HORIZ_LAND = 8             # horizontal landing length
 PAIR_GAP = LABEL_HEIGHT * 3.0  # horizontal gap between paired labels
 PAIR_HORIZ_LAND = 18         # horizontal landing length for paired labels
-MAX_DIAG_LEN = 48            # upper limit for diagonal length
+MAX_DIAG_LEN = 24            # upper limit for diagonal length
+MAX_DIAG_LEN_PAIR = 28       # slightly longer allowed for paired labels
 
 # 8-direction system: (name, base_angle_deg, min_angle, max_angle, dx_mult, dy_mult)
 # angles: 0=right, 90=up, -90=down, +/-180=left
@@ -679,9 +680,16 @@ def _annotate_view(msp, welds, view_id, bbox, part_centroids, f_counter, w_count
         circles.append((wp[0], wp[1], _weld_exclusion_radius))
 
     if bbox:
-        cx = (bbox[0] + bbox[2]) / 2
-        cy = (bbox[1] + bbox[3]) / 2
         vx0, vy0, vx1, vy1 = bbox[0], bbox[1], bbox[2], bbox[3]
+        if pos_welds:
+            xs = sorted([p[0] for _, p in pos_welds])
+            ys = sorted([p[1] for _, p in pos_welds])
+            n = len(xs)
+            cx = xs[n//2] if n % 2 else (xs[n//2-1] + xs[n//2]) / 2
+            cy = ys[n//2] if n % 2 else (ys[n//2-1] + ys[n//2]) / 2
+        else:
+            cx = (vx0 + vx1) / 2
+            cy = (vy0 + vy1) / 2
     elif pos_welds:
         xs = [p[0] for _, p in pos_welds]
         ys = [p[1] for _, p in pos_welds]
@@ -1431,7 +1439,7 @@ def _score_placement(wx, wy, angle_deg, dist, lines, text_bboxes, circles,
                 score -= 30
 
     # 文字与已有文字框重叠：扣2000（不可接受）
-    _OVERLAP_MARGIN = 8.0
+    _OVERLAP_MARGIN = 4.0
     for (tx0, tx1, ty0, ty1) in text_bboxes:
         if bx1 > tx0 - _OVERLAP_MARGIN and bx0 < tx1 + _OVERLAP_MARGIN and by1 > ty0 - _OVERLAP_MARGIN and by0 < ty1 + _OVERLAP_MARGIN:
             score -= 2000
@@ -1603,7 +1611,7 @@ def _resolve_label_conflicts(msp, lines, text_bboxes, circles,
                               vx0, vy0, vx1, vy1, draw_bbox, placements, placed_text_bboxes, max_iter=8,
                               hatch_bboxes=None, other_view_bboxes=None):
     """全局后处理：检测标注间的文字重叠并进行综合微调（距离/角度/方向翻转/双向调整）。"""
-    _OVERLAP_MARGIN = 8.0
+    _OVERLAP_MARGIN = 4.0
 
     def _leader_crosses_text(pos, dist, angle, gtype, tb):
         """检查斜引线或水平接地线是否穿过文字框 tb。"""
