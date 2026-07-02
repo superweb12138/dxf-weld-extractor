@@ -592,24 +592,42 @@ def _annotate_one(doc, welds):
             _other_view_bboxes.append((min(_v_ax) - 5, min(_v_ay) - 5,
                                        max(_v_ax) + 5, max(_v_ay) + 5))
 
-    # 检测表格区域（BOM 表格块），作为 hatch_bbox 加入阻挡
+    # 检测表格区域（BOM / 材料表 / 螺栓表），作为 hatch_bbox 加入阻挡
     _table_hatch = []
+    _BOM_KEYWORDS = ('LENGTH', 'WIDTH', 'HEIGHT', 'WEIGHT', 'QTY', 'QUANTITY',
+                     'DESCRIPTION', 'PART', 'MARK', 'MATERIAL', 'REMARK',
+                     'ASSEMBLY BOLT LIST', 'BOLT LIST', 'PAY CODE', 'NO.',
+                     'DIA.', 'GRADE', 'SITE/SHOP', 'MEMBERS LOCATION')
+    _TITLE_KEYWORDS = ('STEEL STRUCTURE DRAWING', 'PROJECT DOCUMENT',
+                       'VENDOR DOCUMENT', 'DOCUMENT CLASS', 'REVISION',
+                       'ISSUE FOR', 'DRAWN BY', 'CHECKED', 'APPROVED')
     for _e in doc.modelspace():
-        if _e.dxftype() == 'INSERT' and _e.dxf.name.startswith('Unknown-'):
+        if _e.dxftype() == 'INSERT' and (_e.dxf.name.startswith('Unknown-') or True):
             _blk = doc.blocks.get(_e.dxf.name)
-            if _blk:
-                _tx, _ty = [], []
-                for _sub in _blk:
-                    if _sub.dxftype() == 'LINE':
-                        _tx.extend([_sub.dxf.start.x, _sub.dxf.end.x])
-                        _ty.extend([_sub.dxf.start.y, _sub.dxf.end.y])
-                    elif _sub.dxftype() in ('TEXT', 'MTEXT', 'ATTRIB', 'ATTDEF'):
-                        try:
-                            _tx.append(_sub.dxf.insert.x)
-                            _ty.append(_sub.dxf.insert.y)
-                        except: pass
-                if _tx:
-                    _table_hatch.append((min(_tx), max(_tx), min(_ty), max(_ty)))
+            if not _blk:
+                continue
+            if not _e.dxf.name.startswith('Unknown-') and re.search(r' - \d+$', _e.dxf.name):
+                continue
+            _tx, _ty = [], []
+            _texts = []
+            for _sub in _blk:
+                if _sub.dxftype() == 'LINE':
+                    _tx.extend([_sub.dxf.start.x, _sub.dxf.end.x])
+                    _ty.extend([_sub.dxf.start.y, _sub.dxf.end.y])
+                elif _sub.dxftype() in ('TEXT', 'MTEXT', 'ATTRIB', 'ATTDEF'):
+                    try:
+                        _tx.append(_sub.dxf.insert.x)
+                        _ty.append(_sub.dxf.insert.y)
+                        _txt = (_sub.dxf.text if hasattr(_sub.dxf, 'text') else '') or ''
+                        _texts.append(_txt.upper())
+                    except: pass
+            if not _tx:
+                continue
+            _all_text = ' '.join(_texts)
+            _bom_hits = sum(1 for _kw in _BOM_KEYWORDS if _kw in _all_text)
+            _title_hits = sum(1 for _kw in _TITLE_KEYWORDS if _kw in _all_text)
+            if _e.dxf.name.startswith('Unknown-') or (_bom_hits >= 1 and _title_hits == 0):
+                _table_hatch.append((min(_tx), max(_tx), min(_ty), max(_ty)))
 
     # 处理每个视图
     for view_id in sorted(welds_by_view.keys(), key=lambda v: int(v) if v.isdigit() else 0):
@@ -1130,18 +1148,6 @@ def _draw_weld_label(msp, label, weld_pos, dname, diag_len, angle_deg, sampled=F
         'lineweight': 30,
     })
 
-    if sampled:
-        _tw = len(label) * LABEL_HEIGHT * 0.6
-        if h_land >= 0:
-            _cx = lx - _tw / 2
-        else:
-            _cx = lx + _tw / 2
-        _cy = hy + LABEL_HEIGHT / 2
-        _rx = _tw / 2 + 1.3
-        _ry = LABEL_HEIGHT / 2 + 1.3
-        msp.add_ellipse(center=(_cx, _cy), major_axis=(_rx, 0),
-                        ratio=_ry / max(_rx, 0.01),
-                        dxfattribs={'layer': LAYER_NAME, 'color': 1})
 
 
 def _draw_paired_weld_label(msp, labels, weld_pos, dname, diag_len, angle_deg, sampled=False):
@@ -1184,18 +1190,6 @@ def _draw_paired_weld_label(msp, labels, weld_pos, dname, diag_len, angle_deg, s
         'lineweight': 30,
     })
 
-    if sampled:
-        _tw = len(paired_text) * LABEL_HEIGHT * 0.6
-        if h_land >= 0:
-            _cx = lx - _tw / 2
-        else:
-            _cx = lx + _tw / 2
-        _cy = hy + LABEL_HEIGHT / 2
-        _rx = _tw / 2 + 1.3
-        _ry = LABEL_HEIGHT / 2 + 1.3
-        msp.add_ellipse(center=(_cx, _cy), major_axis=(_rx, 0),
-                        ratio=_ry / max(_rx, 0.01),
-                        dxfattribs={'layer': LAYER_NAME, 'color': 1})
 
 
 def _search_placement(weld_pos, lines, text_bboxes, circles, placed_bboxes,
@@ -1341,6 +1335,12 @@ def _search_placement(weld_pos, lines, text_bboxes, circles, placed_bboxes,
             for (hx0, hx1, hy0, hy1) in hatch_bboxes:
                 if not (bx1 < hx0 or bx0 > hx1 or by1 < hy0 or by0 > hy1):
                     return True
+        # 文字框内框边距检查：文字不得超出内框 BOUNDARY_MARGIN
+        if _db is not None:
+            _dbx = (_db[0], _db[2]); _dby = (_db[1], _db[3])
+            if bx0 < _dbx[0] + BOUNDARY_MARGIN or bx1 > _dbx[1] - BOUNDARY_MARGIN or \
+               by0 < _dby[0] + BOUNDARY_MARGIN or by1 > _dby[1] - BOUNDARY_MARGIN:
+                return True
         return False
 
     def _fine_tune(dist, angle, _db):
