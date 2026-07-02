@@ -841,7 +841,8 @@ def _annotate_view(msp, welds, view_id, bbox, part_centroids, f_counter, w_count
     # ---- 全局后处理：冲突解决（最多8次迭代） ----
     _resolve_label_conflicts(msp, lines, text_bboxes, circles,
                              vx0, vy0, vx1, vy1, draw_bbox, _placements, placed_text_bboxes, 8,
-                             hatch_bboxes=hatch_bboxes, other_view_bboxes=other_view_bboxes)
+                             hatch_bboxes=hatch_bboxes, other_view_bboxes=other_view_bboxes,
+                             quad_cx=cx, quad_cy=cy)
 
     # ---- 绘制所有标注 ----
     for pd in _placements:
@@ -1740,9 +1741,12 @@ def _bbox_in_boundary(nbb, vx0, vy0, vx1, vy1, draw_bbox):
 
 def _resolve_label_conflicts(msp, lines, text_bboxes, circles,
                               vx0, vy0, vx1, vy1, draw_bbox, placements, placed_text_bboxes, max_iter=8,
-                              hatch_bboxes=None, other_view_bboxes=None):
+                              hatch_bboxes=None, other_view_bboxes=None,
+                              quad_cx=None, quad_cy=None):
     """全局后处理：检测标注间的文字重叠并进行综合微调（距离/角度/方向翻转/双向调整）。"""
-    _OVERLAP_MARGIN = 4.0
+    _OVERLAP_MARGIN = OVERLAP_MARGIN
+    _vcx = quad_cx if quad_cx is not None else (vx0 + vx1) / 2.0
+    _vcy = quad_cy if quad_cy is not None else (vy0 + vy1) / 2.0
 
     def _leader_crosses_text(pos, dist, angle, gtype, tb):
         """检查斜引线或水平接地线是否穿过文字框 tb。"""
