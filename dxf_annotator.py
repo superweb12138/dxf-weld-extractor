@@ -1152,6 +1152,7 @@ def _search_placement(weld_pos, lines, text_bboxes, circles, placed_bboxes,
     if home_q is None:
         home_q = _weld_home_quadrant(wx, wy, _vcx, _vcy)
     _allowed_quads = _allowed_quadrants(home_q, allow_adjacent=False)
+    _max_len = MAX_DIAG_LEN_PAIR if is_pair else MAX_DIAG_LEN
 
     def _has_conflict(angle_deg, dist, _db):
         """True if position has any critical conflict (text overlap, line cross, boundary, quadrant)."""
@@ -1283,7 +1284,7 @@ def _search_placement(weld_pos, lines, text_bboxes, circles, placed_bboxes,
                     60, -60, 70, -70, 80, -80, 90, -90,
                     100, -100, 110, -110, 120, -120, 130, -130,
                     140, -140, 150, -150, 160, -160, 170, -170, 180]
-        for nd in range(8, dist, 2):
+        for nd in range(6, dist, 2):
             for offset in _full_ao:
                 na = (_ang + offset) % 360
                 r3 = math.radians(na)
@@ -1299,7 +1300,7 @@ def _search_placement(weld_pos, lines, text_bboxes, circles, placed_bboxes,
                             return na3, nd, 0
                     return na, nd, 0
         # 没更短距离，轻微延长
-        for nd in range(dist + 2, min(dist + 14, 61), 2):
+        for nd in range(dist + 2, min(dist + 14, _max_len + 1), 2):
             for offset in _full_ao:
                 na = (_ang + offset) % 360
                 r4 = math.radians(na)
@@ -1320,7 +1321,7 @@ def _search_placement(weld_pos, lines, text_bboxes, circles, placed_bboxes,
         """三阶段搜索，归属象限内搜索最佳位置。"""
         nonlocal _allowed_quads
         _allowed_quads = _allowed_quadrants(home_q, allow_adjacent=allow_adjacent)
-        distances = list(range(8, 56, 2))
+        distances = list(range(8, _max_len + 1, 2))
         if is_pair:
             distances = [d + 4 for d in distances]
         _full_ao = [0, 5, -5, 10, -10, 15, -15, 20, -20, 25, -25, 30, -30,
@@ -1727,14 +1728,14 @@ def _redistribute_groups(groups, centroids, view_bbox=None):
 
 
 def _bbox_in_boundary(nbb, vx0, vy0, vx1, vy1, draw_bbox):
-    """检查 bbox (x0,x1,y0,y1) 在视图边界内（margin=30）且在图纸边界内（margin=0）。"""
+    """检查 bbox (x0,x1,y0,y1) 在视图边界内（margin=30）且在图纸边界内（margin=BOUNDARY_MARGIN）。"""
     if not (vx0 - 30 <= nbb[0] and nbb[1] <= vx1 + 30 and
             vy0 - 30 <= nbb[2] and nbb[3] <= vy1 + 30):
         return False
     if draw_bbox is not None:
         dx0, dy0, dx1, dy1 = draw_bbox
-        if not (dx0 <= nbb[0] and nbb[1] <= dx1 and
-                dy0 <= nbb[2] and nbb[3] <= dy1):
+        if not (dx0 + BOUNDARY_MARGIN <= nbb[0] and nbb[1] <= dx1 - BOUNDARY_MARGIN and
+                dy0 + BOUNDARY_MARGIN <= nbb[2] and nbb[3] <= dy1 - BOUNDARY_MARGIN):
             return False
     return True
 
