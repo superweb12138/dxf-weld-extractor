@@ -660,7 +660,7 @@ def _clean_original_labels(doc):
     Removes Mark-, MarkSet-, StraightDimension-, AngleDimension- block inserts.
     Preserves SectionMark, WeldMark, Unknown (BOM/title block), Part blocks."""
     msp = doc.modelspace()
-    _remove_prefixes = ('Mark-', 'MarkSet-', 'StraightDimension-', 'AngleDimension-')
+    _remove_prefixes = ('Mark-', 'MarkSet-', 'StraightDimension-', 'AngleDimension-', 'Cloud-', 'Text-')
     _removed = 0
     for e in list(msp):
         if e.dxftype() == 'INSERT':
@@ -1150,6 +1150,19 @@ def _draw_weld_label(msp, label, weld_pos, dname, diag_len, angle_deg, sampled=F
         'lineweight': 30,
     })
 
+    if sampled:
+        _tw = len(label) * LABEL_HEIGHT * 0.6
+        if h_land >= 0:
+            _cx = lx - _tw / 2
+        else:
+            _cx = lx + _tw / 2
+        _cy = hy + LABEL_HEIGHT / 2
+        _rx = _tw / 2 + 1.3
+        _ry = LABEL_HEIGHT / 2 + 1.3
+        msp.add_ellipse(center=(_cx, _cy), major_axis=(_rx, 0),
+                        ratio=_ry / max(_rx, 0.01),
+                        dxfattribs={'layer': LAYER_NAME, 'color': 1})
+
 
 
 def _draw_paired_weld_label(msp, labels, weld_pos, dname, diag_len, angle_deg, sampled=False):
@@ -1191,6 +1204,19 @@ def _draw_paired_weld_label(msp, labels, weld_pos, dname, diag_len, angle_deg, s
         'style': 'Arial Narrow',
         'lineweight': 30,
     })
+
+    if sampled:
+        _tw = len(paired_text) * LABEL_HEIGHT * 0.6
+        if h_land >= 0:
+            _cx = lx - _tw / 2
+        else:
+            _cx = lx + _tw / 2
+        _cy = hy + LABEL_HEIGHT / 2
+        _rx = _tw / 2 + 1.3
+        _ry = LABEL_HEIGHT / 2 + 1.3
+        msp.add_ellipse(center=(_cx, _cy), major_axis=(_rx, 0),
+                        ratio=_ry / max(_rx, 0.01),
+                        dxfattribs={'layer': LAYER_NAME, 'color': 1})
 
 
 
