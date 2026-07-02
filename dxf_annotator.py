@@ -1982,6 +1982,61 @@ def _resolve_label_conflicts(msp, lines, text_bboxes, circles,
         if not _any_fix:
             break
 
+    # ---- 标注-WM文字重叠专项修复 ----
+    if text_bboxes:
+        for _wm_iter in range(4):
+            _wm_fixed = False
+            n = len(placements)
+            for ki in range(n):
+                gi, iti, lbi, pi, dni, dsi, agi = placements[ki][:7]
+                tbbi = placed_text_bboxes[ki]
+                _wm_over = False
+                for (tx0, tx1, ty0, ty1) in text_bboxes:
+                    if not (tbbi[1] < tx0 - OVERLAP_MARGIN or
+                            tbbi[0] > tx1 + OVERLAP_MARGIN or
+                            tbbi[3] < ty0 - OVERLAP_MARGIN or
+                            tbbi[2] > ty1 + OVERLAP_MARGIN):
+                        _wm_over = True; break
+                if not _wm_over: continue
+                _max_len = MAX_DIAG_LEN_PAIR if gi == 'pair' else MAX_DIAG_LEN
+                for d_dist in [1, -1, 2, -2, 4, -4, 8, -8, 12, -12, 16, -16, 20, -20, 24]:
+                    nd = dsi + d_dist
+                    if nd < 6 or nd > _max_len: continue
+                    result = _adjust_safe(ki, pi, dni, nd, agi, gi, ki)
+                    if result:
+                        nbb, tbb = result
+                        placements[ki] = (gi, iti, lbi, pi, dni, nd, agi, nbb)
+                        placed_text_bboxes[ki] = tbb
+                        _wm_fixed = True; break
+                if _wm_fixed: continue
+                for d_a in [1, -1, 2, -2, 3, -3, 5, -5, 8, -8, 12, -12, 15, -15, 20, -20, 30, -30]:
+                    na = agi + d_a
+                    r5 = math.radians(na % 360)
+                    if abs(math.sin(r5)) < math.sin(math.radians(ANGLE_MIN)): continue
+                    if abs(math.cos(r5)) < math.cos(math.radians(ANGLE_MAX)): continue
+                    result = _adjust_safe(ki, pi, dni, dsi, na, gi, ki)
+                    if result:
+                        nbb, tbb = result
+                        placements[ki] = (gi, iti, lbi, pi, dni, dsi, na, nbb)
+                        placed_text_bboxes[ki] = tbb
+                        _wm_fixed = True; break
+                if _wm_fixed: continue
+                _dn, _ds, _ag = _search_placement(
+                    pi, lines, text_bboxes, circles,
+                    [p[7] for p in placements], placed_text_bboxes,
+                    vx0, vy0, vx1, vy1, draw_bbox,
+                    is_pair=(gi == 'pair'), hatch_bboxes=hatch_bboxes, other_view_bboxes=other_view_bboxes,
+                    home_q=_weld_home_quadrant(pi[0], pi[1], _vcx, _vcy),
+                    quad_cx=_vcx, quad_cy=_vcy)
+                _re_result = _adjust_safe(ki, pi, _dn, _ds, _ag, gi, ki)
+                if _re_result:
+                    _nbb, _tbb = _re_result
+                    placements[ki] = (gi, iti, lbi, pi, _dn, _ds, _ag, _nbb)
+                    placed_text_bboxes[ki] = _tbb
+                    _wm_fixed = True
+            if not _wm_fixed:
+                break
+
     # 最终安全兜底：超出边界的标注逐步缩短距离，找到不超边界且不重叠 hatch 的最短距离
     for k, pd in enumerate(placements):
         gk, it_k, lb_k, pk, dnk, dsk, agk, bbk = pd
