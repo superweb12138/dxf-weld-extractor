@@ -552,21 +552,37 @@ def _annotate_one(doc, welds):
     f_counter = [0]
     w_counter = [0]
 
-    # 计算每个视图的真实边界（仅 Part 块，不含 Mark/WeldMark 标注元素）
+    # 计算每个视图的扩展边界（含 Part/WeldMark/Mark/SectionMark 全部块，所有实体类型）
     _other_view_bboxes = []
+    _BLOCK_PREFIXES = ('Part', 'WeldMark', 'Mark', 'SectionMark')
     for _vid in view_bboxes.keys():
         _v_xs, _v_ys = [], []
         for _blk in doc.blocks:
             _bn = _blk.name
-            if not _bn.startswith('Part'):
+            if not any(_bn.startswith(p) for p in _BLOCK_PREFIXES):
                 continue
             if _bn.endswith(f' - {_vid}') or f' - {_vid}' in _bn:
                 for _e in _blk:
-                    if _e.dxftype() == 'LINE':
+                    _et = _e.dxftype()
+                    if _et == 'LINE':
                         _v_xs.extend([_e.dxf.start.x, _e.dxf.end.x])
                         _v_ys.extend([_e.dxf.start.y, _e.dxf.end.y])
+                    elif _et == 'LWPOLYLINE':
+                        try:
+                            for _pt in _e.get_points():
+                                _v_xs.append(_pt[0]); _v_ys.append(_pt[1])
+                        except: pass
+                    elif _et in ('TEXT', 'MTEXT', 'ATTRIB', 'ATTDEF'):
+                        try:
+                            _v_xs.append(_e.dxf.insert.x); _v_ys.append(_e.dxf.insert.y)
+                        except: pass
+                    elif _et in ('CIRCLE', 'ARC'):
+                        try:
+                            _v_xs.append(_e.dxf.center.x); _v_ys.append(_e.dxf.center.y)
+                        except: pass
         if _v_xs:
-            _other_view_bboxes.append((min(_v_xs), min(_v_ys), max(_v_xs), max(_v_ys)))
+            _other_view_bboxes.append((min(_v_xs) - 5, min(_v_ys) - 5,
+                                       max(_v_xs) + 5, max(_v_ys) + 5))
 
     # 检测表格区域（BOM 表格块），作为 hatch_bbox 加入阻挡
     _table_hatch = []
