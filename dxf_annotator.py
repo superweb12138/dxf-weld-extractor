@@ -552,37 +552,45 @@ def _annotate_one(doc, welds):
     f_counter = [0]
     w_counter = [0]
 
-    # 计算每个视图的扩展边界（含 Part/WeldMark/Mark/SectionMark 全部块，所有实体类型）
-    _other_view_bboxes = []
-    _BLOCK_PREFIXES = ('Part', 'WeldMark', 'Mark', 'SectionMark')
+    # 计算每个视图的边界（Part块用于硬阻挡，全块用于渐进惩罚）
+    _other_view_part_bboxes = []   # Part-only，_has_conflict 用
+    _other_view_bboxes = []        # Part+WM+Mark+SectionMark，_score_placement 用
     for _vid in view_bboxes.keys():
-        _v_xs, _v_ys = [], []
+        _v_px, _v_py = [], []
+        _v_ax, _v_ay = [], []
         for _blk in doc.blocks:
             _bn = _blk.name
-            if not any(_bn.startswith(p) for p in _BLOCK_PREFIXES):
+            if not (_bn.startswith('Part') or _bn.startswith('WeldMark') or
+                    _bn.startswith('Mark') or _bn.startswith('SectionMark')):
                 continue
             if _bn.endswith(f' - {_vid}') or f' - {_vid}' in _bn:
                 for _e in _blk:
                     _et = _e.dxftype()
                     if _et == 'LINE':
-                        _v_xs.extend([_e.dxf.start.x, _e.dxf.end.x])
-                        _v_ys.extend([_e.dxf.start.y, _e.dxf.end.y])
+                        _v_ax.extend([_e.dxf.start.x, _e.dxf.end.x])
+                        _v_ay.extend([_e.dxf.start.y, _e.dxf.end.y])
+                        if _bn.startswith('Part'):
+                            _v_px.extend([_e.dxf.start.x, _e.dxf.end.x])
+                            _v_py.extend([_e.dxf.start.y, _e.dxf.end.y])
                     elif _et == 'LWPOLYLINE':
                         try:
                             for _pt in _e.get_points():
-                                _v_xs.append(_pt[0]); _v_ys.append(_pt[1])
+                                _v_ax.append(_pt[0]); _v_ay.append(_pt[1])
                         except: pass
                     elif _et in ('TEXT', 'MTEXT', 'ATTRIB', 'ATTDEF'):
                         try:
-                            _v_xs.append(_e.dxf.insert.x); _v_ys.append(_e.dxf.insert.y)
+                            _v_ax.append(_e.dxf.insert.x); _v_ay.append(_e.dxf.insert.y)
                         except: pass
                     elif _et in ('CIRCLE', 'ARC'):
                         try:
-                            _v_xs.append(_e.dxf.center.x); _v_ys.append(_e.dxf.center.y)
+                            _v_ax.append(_e.dxf.center.x); _v_ay.append(_e.dxf.center.y)
                         except: pass
-        if _v_xs:
-            _other_view_bboxes.append((min(_v_xs) - 5, min(_v_ys) - 5,
-                                       max(_v_xs) + 5, max(_v_ys) + 5))
+        if _v_px:
+            _other_view_part_bboxes.append((min(_v_px) - 5, min(_v_py) - 5,
+                                            max(_v_px) + 5, max(_v_py) + 5))
+        if _v_ax:
+            _other_view_bboxes.append((min(_v_ax) - 5, min(_v_ay) - 5,
+                                       max(_v_ax) + 5, max(_v_ay) + 5))
 
     # 检测表格区域（BOM 表格块），作为 hatch_bbox 加入阻挡
     _table_hatch = []
@@ -595,6 +603,11 @@ def _annotate_one(doc, welds):
                     if _sub.dxftype() == 'LINE':
                         _tx.extend([_sub.dxf.start.x, _sub.dxf.end.x])
                         _ty.extend([_sub.dxf.start.y, _sub.dxf.end.y])
+                    elif _sub.dxftype() in ('TEXT', 'MTEXT', 'ATTRIB', 'ATTDEF'):
+                        try:
+                            _tx.append(_sub.dxf.insert.x)
+                            _ty.append(_sub.dxf.insert.y)
+                        except: pass
                 if _tx:
                     _table_hatch.append((min(_tx), max(_tx), min(_ty), max(_ty)))
 
@@ -609,7 +622,7 @@ def _annotate_one(doc, welds):
         # 加入表格阻挡
         if _table_hatch:
             hatch_bboxes = list(hatch_bboxes) + _table_hatch
-        _annotate_view(msp, vw, view_id, bbox, centroids, f_counter, w_counter, part_lines, draw_bbox, hatch_bboxes=hatch_bboxes if hatch_bboxes else None, other_view_bboxes=_other_view_bboxes, sampled_labels=sampled_labels)
+        _annotate_view(msp, vw, view_id, bbox, centroids, f_counter, w_counter, part_lines, draw_bbox, hatch_bboxes=hatch_bboxes if hatch_bboxes else None, other_view_bboxes=_other_view_bboxes, sampled_labels=sampled_labels, other_view_part_bboxes=_other_view_part_bboxes if _other_view_part_bboxes else None)
 
     # Handle welds without view_id
     if welds_no_view:
@@ -700,7 +713,7 @@ def _compute_view_bboxes(doc):
     return view_bboxes, dict(view_part_centroids)
 
 
-def _annotate_view(msp, welds, view_id, bbox, part_centroids, f_counter, w_counter, obstacles, draw_bbox=None, hatch_bboxes=None, other_view_bboxes=None, sampled_labels=None):
+def _annotate_view(msp, welds, view_id, bbox, part_centroids, f_counter, w_counter, obstacles, draw_bbox=None, hatch_bboxes=None, other_view_bboxes=None, sampled_labels=None, other_view_part_bboxes=None):
     """Annotate all welds in a single view.
     相同位置的 Above+Below 焊缝对共用一根引线，标号并排在横线末端。CJP(W*) 和 FW(F*) 不混合。"""
     if sampled_labels is None:
@@ -827,7 +840,8 @@ def _annotate_view(msp, welds, view_id, bbox, part_centroids, f_counter, w_count
                 wp_a, lines, text_bboxes, circles, placed_bboxes,
                 placed_text_bboxes, vx0, vy0, vx1, vy1, draw_bbox, is_pair=True,
                 hatch_bboxes=hatch_bboxes, other_view_bboxes=other_view_bboxes,
-                home_q=_home_q, quad_cx=cx, quad_cy=cy)
+                home_q=_home_q, quad_cx=cx, quad_cy=cy,
+                other_view_part_bboxes=other_view_part_bboxes)
             bx0, bx1, by0, by1 = _paired_bbox(wp_a, dname, diag_len, angle)
             bbox = (min(bx0, wp_a[0])-1, max(bx1, wp_a[0])+1,
                     min(by0, wp_a[1])-1, max(by1, wp_a[1])+1)
@@ -844,7 +858,8 @@ def _annotate_view(msp, welds, view_id, bbox, part_centroids, f_counter, w_count
                 wp, lines, text_bboxes, circles, placed_bboxes,
                 placed_text_bboxes, vx0, vy0, vx1, vy1, draw_bbox,
                 hatch_bboxes=hatch_bboxes, other_view_bboxes=other_view_bboxes,
-                home_q=_home_q, quad_cx=cx, quad_cy=cy)
+                home_q=_home_q, quad_cx=cx, quad_cy=cy,
+                other_view_part_bboxes=other_view_part_bboxes)
             bx0, bx1, by0, by1 = _single_bbox(wp, dname, diag_len, angle)
             bbox = (min(bx0, wp[0])-1, max(bx1, wp[0])+1,
                     min(by0, wp[1])-1, max(by1, wp[1])+1)
@@ -858,7 +873,8 @@ def _annotate_view(msp, welds, view_id, bbox, part_centroids, f_counter, w_count
     _resolve_label_conflicts(msp, lines, text_bboxes, circles,
                              vx0, vy0, vx1, vy1, draw_bbox, _placements, placed_text_bboxes, 8,
                              hatch_bboxes=hatch_bboxes, other_view_bboxes=other_view_bboxes,
-                             quad_cx=cx, quad_cy=cy)
+                             quad_cx=cx, quad_cy=cy,
+                             other_view_part_bboxes=other_view_part_bboxes)
 
     # ---- 最终清理：检测并微调残留重叠 ----
     for _cln_iter in range(5):
@@ -1185,7 +1201,8 @@ def _draw_paired_weld_label(msp, labels, weld_pos, dname, diag_len, angle_deg, s
 def _search_placement(weld_pos, lines, text_bboxes, circles, placed_bboxes,
                       placed_text_bboxes, vx0, vy0, vx1, vy1, draw_bbox=None, is_pair=False,
                       hatch_bboxes=None, other_view_bboxes=None,
-                      home_q=None, quad_cx=None, quad_cy=None):
+                      home_q=None, quad_cx=None, quad_cy=None,
+                      other_view_part_bboxes=None):
     """在360°连续角度中搜索最佳标注位置。"""
     wx, wy = weld_pos
 
@@ -1235,12 +1252,13 @@ def _search_placement(weld_pos, lines, text_bboxes, circles, placed_bboxes,
                min(wy, ey, by0), max(wy, ey, by1))
         if not _bbox_in_boundary(nbb, vx0, vy0, vx1, vy1, _db):
             return True
-        # 跨视图边界检查：标注不能与其他视图区域重叠
-        if other_view_bboxes:
-            for _ovb in other_view_bboxes:
+        # 跨视图边界检查：只用 Part 块做硬阻挡，margin=20
+        _ov_check = other_view_part_bboxes if other_view_part_bboxes is not None else other_view_bboxes
+        if _ov_check:
+            for _ovb in _ov_check:
                 if _ovb == (vx0, vy0, vx1, vy1):
                     continue
-                _M = 40
+                _M = 20
                 if nbb[1] > _ovb[0] - _M and nbb[0] < _ovb[2] + _M and nbb[3] > _ovb[1] - _M and nbb[2] < _ovb[3] + _M:
                     return True
         for otb in placed_text_bboxes:
@@ -1825,7 +1843,8 @@ def _bbox_in_boundary(nbb, vx0, vy0, vx1, vy1, draw_bbox):
 def _resolve_label_conflicts(msp, lines, text_bboxes, circles,
                               vx0, vy0, vx1, vy1, draw_bbox, placements, placed_text_bboxes, max_iter=8,
                               hatch_bboxes=None, other_view_bboxes=None,
-                              quad_cx=None, quad_cy=None):
+                              quad_cx=None, quad_cy=None,
+                              other_view_part_bboxes=None):
     """全局后处理：检测标注间的文字重叠并进行综合微调（距离/角度/方向翻转/双向调整）。"""
     _OVERLAP_MARGIN = OVERLAP_MARGIN
     _vcx = quad_cx if quad_cx is not None else (vx0 + vx1) / 2.0
@@ -2050,7 +2069,8 @@ def _resolve_label_conflicts(msp, lines, text_bboxes, circles,
                         pos, lines, text_bboxes, circles,
                         [p[7] for p in placements], placed_text_bboxes,
                         vx0, vy0, vx1, vy1, draw_bbox,
-                        is_pair=(g == 'pair'), hatch_bboxes=hatch_bboxes, other_view_bboxes=other_view_bboxes)
+                        is_pair=(g == 'pair'), hatch_bboxes=hatch_bboxes, other_view_bboxes=other_view_bboxes,
+                        other_view_part_bboxes=other_view_part_bboxes)
                     _re_result = _adjust_safe(target, pos, _dn, _ds, _ag, g, target)
                     if _re_result:
                         _nbb, _tbb = _re_result
@@ -2109,7 +2129,8 @@ def _resolve_label_conflicts(msp, lines, text_bboxes, circles,
                     vx0, vy0, vx1, vy1, draw_bbox,
                     is_pair=(gi == 'pair'), hatch_bboxes=hatch_bboxes, other_view_bboxes=other_view_bboxes,
                     home_q=_weld_home_quadrant(pi[0], pi[1], _vcx, _vcy),
-                    quad_cx=_vcx, quad_cy=_vcy)
+                    quad_cx=_vcx, quad_cy=_vcy,
+                    other_view_part_bboxes=other_view_part_bboxes)
                 _re_result = _adjust_safe(ki, pi, _dn, _ds, _ag, gi, ki)
                 if _re_result:
                     _nbb, _tbb = _re_result
