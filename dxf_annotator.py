@@ -788,18 +788,30 @@ def _annotate_view(msp, welds, view_id, bbox, part_centroids, f_counter, w_count
     placed_bboxes = []          # 引线+文字整体包围盒
     placed_text_bboxes = []     # 纯文字包围盒（用于文字重叠检测）
     _placements = []
+    _quadrant_used_angles = {1: [], 2: [], 3: [], 4: []}
+
+    def _next_hint_for_quadrant(q, used_angles):
+        a0, a1 = QUAD_ANGLE_RANGES[q]
+        n = len(used_angles)
+        if n == 0:
+            return a1
+        return a1 - (a1 - a0) * n / (n + 1)
 
     for gtype, items in groups:
+        _hint = None
         if gtype == 'pair':
             ww_a, wp_a = items[0]
             ww_b, wp_b = items[1]
             labels = [_next_label(ww_a, f_counter, w_counter),
                       _next_label(ww_b, f_counter, w_counter)]
+            _home_q = _weld_home_quadrant(wp_a[0], wp_a[1], _vcx, _vcy)
+            if _quadrant_used_angles.get(_home_q):
+                _hint = _next_hint_for_quadrant(_home_q, _quadrant_used_angles[_home_q])
             dname, diag_len, angle = _search_placement(
                 wp_a, lines, text_bboxes, circles, placed_bboxes,
                 placed_text_bboxes, vx0, vy0, vx1, vy1, draw_bbox, is_pair=True,
                 hatch_bboxes=hatch_bboxes, other_view_bboxes=other_view_bboxes,
-                quad_cx=cx, quad_cy=cy)
+                home_q=_home_q, quad_cx=cx, quad_cy=cy)
             bx0, bx1, by0, by1 = _paired_bbox(wp_a, dname, diag_len, angle)
             bbox = (min(bx0, wp_a[0])-1, max(bx1, wp_a[0])+1,
                     min(by0, wp_a[1])-1, max(by1, wp_a[1])+1)
@@ -809,17 +821,22 @@ def _annotate_view(msp, welds, view_id, bbox, part_centroids, f_counter, w_count
         else:
             ww, wp = items[0]
             label = _next_label(ww, f_counter, w_counter)
+            _home_q = _weld_home_quadrant(wp[0], wp[1], _vcx, _vcy)
+            if _quadrant_used_angles.get(_home_q):
+                _hint = _next_hint_for_quadrant(_home_q, _quadrant_used_angles[_home_q])
             dname, diag_len, angle = _search_placement(
                 wp, lines, text_bboxes, circles, placed_bboxes,
                 placed_text_bboxes, vx0, vy0, vx1, vy1, draw_bbox,
                 hatch_bboxes=hatch_bboxes, other_view_bboxes=other_view_bboxes,
-                quad_cx=cx, quad_cy=cy)
+                home_q=_home_q, quad_cx=cx, quad_cy=cy)
             bx0, bx1, by0, by1 = _single_bbox(wp, dname, diag_len, angle)
             bbox = (min(bx0, wp[0])-1, max(bx1, wp[0])+1,
                     min(by0, wp[1])-1, max(by1, wp[1])+1)
             _placements.append((gtype, items, [label], wp, dname, diag_len, angle, bbox))
             placed_bboxes.append(bbox)
             placed_text_bboxes.append(_text_bbox(wp, dname, diag_len, angle, is_pair=False))
+
+        _quadrant_used_angles.setdefault(_home_q, []).append(angle)
 
     # ---- 全局后处理：冲突解决（最多8次迭代） ----
     _resolve_label_conflicts(msp, lines, text_bboxes, circles,
