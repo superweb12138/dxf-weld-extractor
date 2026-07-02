@@ -897,7 +897,7 @@ def _annotate_view(msp, welds, view_id, bbox, part_centroids, f_counter, w_count
                              other_view_part_bboxes=other_view_part_bboxes)
 
     # ---- 最终清理：检测并微调残留重叠 ----
-    for _cln_iter in range(5):
+    for _cln_iter in range(10):
         _any_cln = False
         for ki in range(len(_placements)):
             for kj in range(ki + 1, len(_placements)):
@@ -909,10 +909,10 @@ def _annotate_view(msp, welds, view_id, bbox, part_centroids, f_counter, w_count
                     gk, itk, lbk, pk, dnk, dsk, agk = _placements[target][:7]
                     hqk = _weld_home_quadrant(pk[0], pk[1], _vcx, _vcy)
                     _max_k = MAX_DIAG_LEN_PAIR if gk == 'pair' else MAX_DIAG_LEN
-                    for d_dist in [4, 8, 12, 16, 20, 24, -4, -8]:
+                    for d_dist in [4, 8, 12, 16, 20, 24, 28, 32, -4, -8, -12, -16]:
                         nd = dsk + d_dist
                         if nd < 6 or nd > _max_k: continue
-                        for d_a in [-10, -5, 0, 5, 10]:
+                        for d_a in [-15, -10, -5, 0, 5, 10, 15, 20]:
                             na = agk + d_a
                             if not _angle_in_quadrant(na, hqk): continue
                             tnbb = _paired_bbox(pk, dnk, nd, na) if gk == 'pair' else _single_bbox(pk, dnk, nd, na)
