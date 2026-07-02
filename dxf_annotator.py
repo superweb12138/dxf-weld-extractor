@@ -1543,7 +1543,7 @@ def _score_placement(wx, wy, angle_deg, dist, lines, text_bboxes, circles,
     # 水平接地线穿过已放置标注：扣80
     for (pbx0, pbx1, pby0, pby1) in placed_bboxes:
         if _seg_cross_rect((ex, ey), (hx, hy), pbx0, pbx1, pby0, pby1):
-            score -= 80
+            score -= 200
 
     # 斜引线穿过文字框：扣60
     for (tx0, tx1, ty0, ty1) in text_bboxes:
@@ -1558,7 +1558,7 @@ def _score_placement(wx, wy, angle_deg, dist, lines, text_bboxes, circles,
     # 斜引线穿过已放置标注文字：扣2000（硬性惩罚）
     for k, otb in enumerate(placed_text_bboxes):
         if _seg_cross_rect((wx, wy), (ex, ey), otb[0], otb[1], otb[2], otb[3]):
-            score -= 2000
+            score -= 15000
 
     # 斜引线靠近文字框但不穿过：扣30
     _DIAG_PROX_MARGIN = 3.0
@@ -1574,12 +1574,12 @@ def _score_placement(wx, wy, angle_deg, dist, lines, text_bboxes, circles,
     _OVERLAP_MARGIN = 4.0
     for (tx0, tx1, ty0, ty1) in text_bboxes:
         if bx1 > tx0 - _OVERLAP_MARGIN and bx0 < tx1 + _OVERLAP_MARGIN and by1 > ty0 - _OVERLAP_MARGIN and by0 < ty1 + _OVERLAP_MARGIN:
-            score -= 2000
+            score -= 15000
 
     # 文字与已放置标注文字重叠：扣2000（不可接受）
     for (pbx0, pbx1, pby0, pby1) in placed_text_bboxes:
         if bx1 > pbx0 - _OVERLAP_MARGIN and bx0 < pbx1 + _OVERLAP_MARGIN and by1 > pby0 - _OVERLAP_MARGIN and by0 < pby1 + _OVERLAP_MARGIN:
-            score -= 2000
+            score -= 15000
  
     # 文字与几何线过近：扣30（检测4个角点+4条边中点）
     _LINE_MARGIN = 4.0
@@ -1603,7 +1603,7 @@ def _score_placement(wx, wy, angle_deg, dist, lines, text_bboxes, circles,
     for (sx, sy), (ex2, ey2) in _near_lines:
         for (_s, _e) in _txt_edges:
             if _segments_cross_(_s, _e, (sx, sy), (ex2, ey2)):
-                score -= 500
+                score -= 1500
                 break
 
     # 射线法（优化）：只检查可能跨过射线的线
@@ -1623,7 +1623,7 @@ def _score_placement(wx, wy, angle_deg, dist, lines, text_bboxes, circles,
         if _cnt % 2 == 1:
             _odd += 1
     if _odd >= 3:
-        score -= 2000
+        score -= 15000
 
     _min_center_dist = 999
     for (sx, sy), (ex2, ey2) in _near_lines:
@@ -1631,7 +1631,7 @@ def _score_placement(wx, wy, angle_deg, dist, lines, text_bboxes, circles,
         if d < _min_center_dist:
             _min_center_dist = d
     if _min_center_dist < 1.5:
-        score -= 80
+        score -= 200
 
     # 文字与圆/弧重叠：扣30
     for (ccx, ccy, cr) in circles:
