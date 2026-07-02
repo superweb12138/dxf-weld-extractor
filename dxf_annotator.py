@@ -1896,10 +1896,11 @@ def _resolve_label_conflicts(msp, lines, text_bboxes, circles,
                     (j, gj, it_j, lb_j, pos_j, dn_j, ds_j, ag_j),
                     (i, gi, it_i, lb_i, pos_i, dn_i, ds_i, ag_i),
                 ]:
+                    _max_len = MAX_DIAG_LEN_PAIR if g == 'pair' else MAX_DIAG_LEN
                     # --- 距离微调 ---
                     for d_dist in [1, -1, 2, -2, 4, -4, 8, -8, 12, -12, 16, -16, 20, -20, 24]:
                         nd = ds + d_dist
-                        if nd < 8 or nd > 60: continue
+                        if nd < 6 or nd > _max_len: continue
                         result = _adjust_safe(target, pos, dn, nd, ag, g, target)
                         if result:
                             nbb, tbb = result
@@ -1910,7 +1911,7 @@ def _resolve_label_conflicts(msp, lines, text_bboxes, circles,
                     if _fixed: break
 
                     # --- 角度微调 ---
-                    for d_a in [1, -1, 2, -2, 3, -3, 5, -5, 8, -8, 12, -12]:
+                    for d_a in [1, -1, 2, -2, 3, -3, 5, -5, 8, -8, 12, -12, 15, -15, 20, -20, 25, -25, 30, -30]:
                         na = ag + d_a
                         r5 = math.radians(na % 360)
                         if abs(math.sin(r5)) < math.sin(math.radians(20)): continue
@@ -1922,6 +1923,25 @@ def _resolve_label_conflicts(msp, lines, text_bboxes, circles,
                             placed_text_bboxes[target] = tbb
                             _fixed = True
                             break
+                    if _fixed: break
+
+                    # 距离增大 + 角度偏移 组合尝试
+                    for d_dist in [4, 8, 12, 16, 20, 24]:
+                        nd = ds + d_dist
+                        if nd < 6 or nd > _max_len: continue
+                        for d_a in [-15, -10, -5, 5, 10, 15, 20, 25, 30]:
+                            na = ag + d_a
+                            r6 = math.radians(na % 360)
+                            if abs(math.sin(r6)) < math.sin(math.radians(ANGLE_MIN)): continue
+                            if abs(math.cos(r6)) < math.cos(math.radians(ANGLE_MAX)): continue
+                            result = _adjust_safe(target, pos, dn, nd, na, g, target)
+                            if result:
+                                nbb, tbb = result
+                                placements[target] = (g, it, lb, pos, dn, nd, na, nbb)
+                                placed_text_bboxes[target] = tbb
+                                _fixed = True
+                                break
+                        if _fixed: break
                     if _fixed: break
 
                     # --- 方向翻转（角度+180°）---
