@@ -1559,7 +1559,33 @@ def _score_placement(wx, wy, angle_deg, dist, lines, text_bboxes, circles,
         _extra_y_g = max(by1 - dby1, dby0 - by0, 0)
         _extra_g = max(_extra_x_g, _extra_y_g)
         if _extra_g > 0:
-            score -= _extra_g * 2000
+            score -= _extra_g * 100000
+        # 渐进边界近距惩罚：离内框越近扣分越多
+        _prox_x = max(0, dbx1 - bx1, bx0 - dbx0)
+        _prox_y = max(0, dby1 - by1, by0 - dby0)
+        _prox = min(_prox_x, _prox_y)
+        if 0 < _prox < BOUNDARY_MARGIN:
+            score -= (BOUNDARY_MARGIN - _prox) * 500
+
+    # 跨视图重叠惩罚：渐进式距离惩罚，越接近其他视图边界扣分越多
+    if other_view_bboxes:
+        nbb = (min(wx, ex, bx0), max(wx, ex, bx1),
+               min(wy, ey, by0), max(wy, ey, by1))
+        _OV_MARGIN = 25
+        _OV_PROX = 60
+        for _ovb in other_view_bboxes:
+            if _ovb == (vx0, vy0, vx1, vy1):
+                continue
+            _ov_x_in = max(0, min(nbb[1], _ovb[2] + _OV_MARGIN) - max(nbb[0], _ovb[0] - _OV_MARGIN))
+            _ov_y_in = max(0, min(nbb[3], _ovb[3] + _OV_MARGIN) - max(nbb[2], _ovb[1] - _OV_MARGIN))
+            if _ov_x_in > 0 and _ov_y_in > 0:
+                score -= max(100000, _ov_x_in * _ov_y_in * 8)
+            else:
+                _dx = max(0, _ovb[0] - _OV_MARGIN - nbb[1], nbb[0] - _ovb[2] - _OV_MARGIN)
+                _dy = max(0, _ovb[1] - _OV_MARGIN - nbb[3], nbb[2] - _ovb[3] - _OV_MARGIN)
+                _prox = math.hypot(_dx, _dy)
+                if _prox < _OV_PROX:
+                    score -= (_OV_PROX - _prox) * 100
 
     # 跨视图重叠惩罚（完整标注包围盒 vs 其他视图边界）
     if other_view_bboxes:
