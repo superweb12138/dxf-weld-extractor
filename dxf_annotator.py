@@ -34,6 +34,33 @@ PAIR_HORIZ_LAND = 18         # horizontal landing length for paired labels
 MAX_DIAG_LEN = 24            # upper limit for diagonal length
 MAX_DIAG_LEN_PAIR = 28       # slightly longer allowed for paired labels
 
+# Preferred leader angles (right side / left side)
+PREFERRED_ANGLES_RIGHT = (30, 45)
+PREFERRED_ANGLES_LEFT = (135, 150)
+ANGLE_MIN = 25
+ANGLE_MAX = 75
+
+# Cluster-aware fan-out parameters
+CLUSTER_RADIUS = 28.0        # welds within this radius are considered a dense cluster
+CLUSTER_MIN_SIZE = 3         # minimum number of labels to trigger fan-out assignment
+
+# Quadrant angle ranges relative to view center (degrees, CCW from +X)
+# Q1 (upper-right), Q2 (upper-left), Q3 (lower-left), Q4 (lower-right)
+QUAD_ANGLE_RANGES = {
+    1: (25, 75),      # Q1 右上方 25-75°
+    2: (105, 155),    # Q2 左上方 105-155°
+    3: (205, 255),    # Q3 左下方 205-255°
+    4: (285, 335),    # Q4 右下方 285-335°
+}
+
+QUADRANT_ANGLE_TOL = 3.0
+OVERLAP_MARGIN = 2.0
+CLUSTER_OVERLAP_MARGIN = 3.0
+
+# Hard exclusion margins
+BOM_MARGIN = 0               # margin around BOM table (Unknown-* blocks)
+BOUNDARY_MARGIN = 8          # margin around drawing inner frame (hard)
+
 # 8-direction system: (name, base_angle_deg, min_angle, max_angle, dx_mult, dy_mult)
 # angles: 0=right, 90=up, -90=down, +/-180=left
 # ezdxf text alignment: 0=left, 1=center, 2=right
@@ -700,8 +727,8 @@ def _annotate_view(msp, welds, view_id, bbox, part_centroids, f_counter, w_count
         cx = cy = vx0 = vy0 = vx1 = vy1 = 0
 
     # 扇形分区排序：跨扇区交替放置，避免跨半球引线交叉
-    _vcx = (vx0 + vx1) / 2
-    _vcy = (vy0 + vy1) / 2
+    _vcx = cx
+    _vcy = cy
     _N_SECTORS = 12
     _sectors = [[] for _ in range(_N_SECTORS)]
     for i, (w, pi) in enumerate(pos_welds):
@@ -771,7 +798,8 @@ def _annotate_view(msp, welds, view_id, bbox, part_centroids, f_counter, w_count
             dname, diag_len, angle = _search_placement(
                 wp_a, lines, text_bboxes, circles, placed_bboxes,
                 placed_text_bboxes, vx0, vy0, vx1, vy1, draw_bbox, is_pair=True,
-                hatch_bboxes=hatch_bboxes, other_view_bboxes=other_view_bboxes)
+                hatch_bboxes=hatch_bboxes, other_view_bboxes=other_view_bboxes,
+                quad_cx=cx, quad_cy=cy)
             bx0, bx1, by0, by1 = _paired_bbox(wp_a, dname, diag_len, angle)
             bbox = (min(bx0, wp_a[0])-1, max(bx1, wp_a[0])+1,
                     min(by0, wp_a[1])-1, max(by1, wp_a[1])+1)
@@ -784,7 +812,8 @@ def _annotate_view(msp, welds, view_id, bbox, part_centroids, f_counter, w_count
             dname, diag_len, angle = _search_placement(
                 wp, lines, text_bboxes, circles, placed_bboxes,
                 placed_text_bboxes, vx0, vy0, vx1, vy1, draw_bbox,
-                hatch_bboxes=hatch_bboxes, other_view_bboxes=other_view_bboxes)
+                hatch_bboxes=hatch_bboxes, other_view_bboxes=other_view_bboxes,
+                quad_cx=cx, quad_cy=cy)
             bx0, bx1, by0, by1 = _single_bbox(wp, dname, diag_len, angle)
             bbox = (min(bx0, wp[0])-1, max(bx1, wp[0])+1,
                     min(by0, wp[1])-1, max(by1, wp[1])+1)
@@ -836,6 +865,52 @@ def _annotate_view(msp, welds, view_id, bbox, part_centroids, f_counter, w_count
                 'hf': w.get('hf', ''), 'annotation': w.get('annotation', ''),
             })
     return sampled_labels
+
+
+def _weld_home_quadrant(wx, wy, vcx, vcy):
+    """焊点相对视图中心归属象限 Q1–Q4。"""
+    if wx >= vcx and wy >= vcy:
+        return 1
+    if wx < vcx and wy >= vcy:
+        return 2
+    if wx < vcx and wy < vcy:
+        return 3
+    return 4
+
+
+def _pos_home_quadrant(px, py, vcx, vcy):
+    return _weld_home_quadrant(px, py, vcx, vcy)
+
+
+def _allowed_quadrants(home_q, allow_adjacent=False):
+    if allow_adjacent:
+        _half = {1: {1, 4}, 2: {2, 3}, 3: {2, 3}, 4: {1, 4}}
+        _adj = {1: {1, 2, 4}, 2: {2, 1, 3}, 3: {3, 2, 4}, 4: {4, 1, 3}}
+        return _adj.get(home_q, {home_q}) & _half.get(home_q, {home_q})
+    return {home_q}
+
+
+def _angle_in_quadrant(angle_deg, quad, tol=QUADRANT_ANGLE_TOL):
+    a0, a1 = QUAD_ANGLE_RANGES[quad]
+    a = angle_deg % 360
+    return (a0 - tol) <= a <= (a1 + tol)
+
+
+def _quadrant_angle_offsets(home_q, ideal_ang, step=3):
+    """归属象限内的角度 offset 列表（相对 ideal_ang）。"""
+    a0, a1 = QUAD_ANGLE_RANGES[home_q]
+    return [a - ideal_ang for a in range(int(a0), int(a1) + 1, step)]
+
+
+def _label_text_width(labels, is_pair=False):
+    if is_pair:
+        if isinstance(labels, (list, tuple)):
+            text = f"{labels[0]},{labels[1]}"
+        else:
+            text = str(labels)
+    else:
+        text = labels if isinstance(labels, str) else str(labels)
+    return max(LABEL_HEIGHT, len(text) * LABEL_HEIGHT * 0.6)
 
 
 def _single_bbox(weld_pos, dname, diag_len, angle_deg):
@@ -1035,7 +1110,8 @@ def _draw_paired_weld_label(msp, labels, weld_pos, dname, diag_len, angle_deg, s
 
 def _search_placement(weld_pos, lines, text_bboxes, circles, placed_bboxes,
                       placed_text_bboxes, vx0, vy0, vx1, vy1, draw_bbox=None, is_pair=False,
-                      hatch_bboxes=None, other_view_bboxes=None):
+                      hatch_bboxes=None, other_view_bboxes=None,
+                      home_q=None, quad_cx=None, quad_cy=None):
     """在360°连续角度中搜索最佳标注位置。"""
     wx, wy = weld_pos
 
@@ -1051,20 +1127,26 @@ def _search_placement(weld_pos, lines, text_bboxes, circles, placed_bboxes,
             for _gy in range(_gy0, _gy1 + 1):
                 _line_grid.setdefault((_gx, _gy), []).append((_s, _e))
 
-    # 预计算理想引线方向（半区原则用）
-    _vcx = (vx0 + vx1) / 2
-    _vcy = (vy0 + vy1) / 2
+    # 预计算理想引线方向（象限用）
+    _vcx = quad_cx if quad_cx is not None else (vx0 + vx1) / 2
+    _vcy = quad_cy if quad_cy is not None else (vy0 + vy1) / 2
     _ideal_ang = math.degrees(math.atan2(wy - _vcy, wx - _vcx)) % 360
+    if home_q is None:
+        home_q = _weld_home_quadrant(wx, wy, _vcx, _vcy)
+    _allowed_quads = _allowed_quadrants(home_q, allow_adjacent=False)
 
     def _has_conflict(angle_deg, dist, _db):
-        """True if position has any critical conflict (text overlap, line cross, boundary)."""
+        """True if position has any critical conflict (text overlap, line cross, boundary, quadrant)."""
         rad = math.radians(angle_deg)
         cos_a, sin_a = math.cos(rad), math.sin(rad)
-        # 引线必须有倾角：拒水平(0/180)和垂直(±90)
-        if abs(sin_a) < math.sin(math.radians(20)):
-            return True  # too close to horizontal
-        if abs(cos_a) < math.cos(math.radians(70)):
-            return True  # too close to vertical
+        # 引线必须有倾角：拒水平和垂直
+        if abs(sin_a) < math.sin(math.radians(ANGLE_MIN)):
+            return True
+        if abs(cos_a) < math.cos(math.radians(ANGLE_MAX)):
+            return True
+        # 象限检查：角度必须在允许象限内
+        if not any(_angle_in_quadrant(angle_deg, q) for q in _allowed_quads):
+            return True
         ex = wx + dist * cos_a
         ey = wy + dist * sin_a
         h_len = PAIR_HORIZ_LAND if is_pair else HORIZ_LAND
@@ -1078,20 +1160,21 @@ def _search_placement(weld_pos, lines, text_bboxes, circles, placed_bboxes,
                min(wy, ey, by0), max(wy, ey, by1))
         if not _bbox_in_boundary(nbb, vx0, vy0, vx1, vy1, _db):
             return True
-        # 跨视图终点检查：标注文字不能落入其他视图的 Part 包围盒
+        # 跨视图边界检查：标注不能与其他视图区域重叠
         if other_view_bboxes:
             for _ovb in other_view_bboxes:
                 if _ovb == (vx0, vy0, vx1, vy1):
                     continue
-                # 用完整标注包围盒 nbb（含引线+文字），10px margin
-                _M = 10
+                _M = 40
                 if nbb[1] > _ovb[0] - _M and nbb[0] < _ovb[2] + _M and nbb[3] > _ovb[1] - _M and nbb[2] < _ovb[3] + _M:
                     return True
         for otb in placed_text_bboxes:
-            if not (bx1 < otb[0] - 8 or bx0 > otb[1] + 8 or by1 < otb[2] - 8 or by0 > otb[3] + 8):
+            if not (bx1 < otb[0] - OVERLAP_MARGIN or bx0 > otb[1] + OVERLAP_MARGIN or
+                    by1 < otb[2] - OVERLAP_MARGIN or by0 > otb[3] + OVERLAP_MARGIN):
                 return True
         for (tx0, tx1, ty0, ty1) in text_bboxes:
-            if not (bx1 < tx0 - 8 or bx0 > tx1 + 8 or by1 < ty0 - 8 or by0 > ty1 + 8):
+            if not (bx1 < tx0 - OVERLAP_MARGIN or bx0 > tx1 + OVERLAP_MARGIN or
+                    by1 < ty0 - OVERLAP_MARGIN or by0 > ty1 + OVERLAP_MARGIN):
                 return True
         for (tx0, tx1, ty0, ty1) in text_bboxes:
             if _seg_cross_rect((wx, wy), (ex, ey), tx0, tx1, ty0, ty1):
@@ -1215,8 +1298,10 @@ def _search_placement(weld_pos, lines, text_bboxes, circles, placed_bboxes,
                     return na, nd, 0
         return _ang, dist, 0
 
-    def _search_pass(_db):
-        """三阶段搜索：短距放宽角→中距正常角→长距兜底。"""
+    def _search_pass(_db, allow_adjacent=False):
+        """三阶段搜索，归属象限内搜索最佳位置。"""
+        nonlocal _allowed_quads
+        _allowed_quads = _allowed_quadrants(home_q, allow_adjacent=allow_adjacent)
         distances = list(range(8, 56, 2))
         if is_pair:
             distances = [d + 4 for d in distances]
@@ -1232,8 +1317,8 @@ def _search_placement(weld_pos, lines, text_bboxes, circles, placed_bboxes,
             for offset in ao_list:
                 angle = (_ideal_ang + offset) % 360
                 rad = math.radians(angle)
-                if abs(math.sin(rad)) < math.sin(math.radians(20)): continue
-                if abs(math.cos(rad)) < math.cos(math.radians(70)): continue
+                if abs(math.sin(rad)) < math.sin(math.radians(ANGLE_MIN)): continue
+                if abs(math.cos(rad)) < math.cos(math.radians(ANGLE_MAX)): continue
                 if not _has_conflict(angle, dist, _db):
                     _fa, _fd, _fs = _fine_tune(dist, angle, _db)
                     return _fs, (_fa, _fd, 0)
@@ -1282,8 +1367,22 @@ def _search_placement(weld_pos, lines, text_bboxes, circles, placed_bboxes,
         _fa, _fd, _fs = _fine_tune(_bdst, _bd, _db)
         return _fs, (_fa, _fd, 0)
 
-    score, result = _search_pass(draw_bbox)
-    return 0, result[1], result[0]
+    score, result = _search_pass(draw_bbox, allow_adjacent=False)
+    _fa, _fd, _ = result
+    if _score_placement(wx, wy, _fa, _fd, lines, text_bboxes,
+                        circles, placed_bboxes, placed_text_bboxes,
+                        vx0, vy0, vx1, vy1, draw_bbox, is_pair=is_pair,
+                        line_grid=_line_grid, hatch_bboxes=hatch_bboxes,
+                        other_view_bboxes=other_view_bboxes,
+                        home_q=home_q) < -10000:
+        print(f"    [warn] quadrant-fallback at ({wx:.1f},{wy:.1f}) home_q={home_q}")
+        score, result = _search_pass(draw_bbox, allow_adjacent=True)
+    # 硬象限钳制：确保返回的角度一定在 home_q 象限范围内
+    _fa, _fd = result[0], result[1]
+    _a0, _a1 = QUAD_ANGLE_RANGES[home_q]
+    if not (_a0 - QUADRANT_ANGLE_TOL <= _fa % 360 <= _a1 + QUADRANT_ANGLE_TOL):
+        _fa = _a1 if (_fa % 360) < (_a0 + _a1) / 2 else _a0
+    return 0, _fd, _fa
 
 
 def _leader_crosses_leader(pos_a, dist_a, angle_a, h_land_a,
@@ -1319,7 +1418,8 @@ def _leader_crosses_leader(pos_a, dist_a, angle_a, h_land_a,
 def _score_placement(wx, wy, angle_deg, dist, lines, text_bboxes, circles,
                      placed_bboxes, placed_text_bboxes, vx0, vy0, vx1, vy1,
                      draw_bbox=None, is_pair=False, min_score=None, line_grid=None,
-                     hatch_bboxes=None, other_view_bboxes=None):
+                     hatch_bboxes=None, other_view_bboxes=None,
+                     home_q=None, quad_cx=None, quad_cy=None):
     """对 (角度, 距离) 位置评分。分值越高越推荐，正分表示无冲突，负分表示冲突严重。"""
     score = 0
     rad = math.radians(angle_deg)
@@ -1340,6 +1440,20 @@ def _score_placement(wx, wy, angle_deg, dist, lines, text_bboxes, circles,
     else:
         bx0, bx1 = hx, hx + lw
     by0, by1 = hy, hy + lh
+
+    # 视图中点（用于象限判断）
+    _vcx_s = quad_cx if quad_cx is not None else (vx0 + vx1) / 2.0
+    _vcy_s = quad_cy if quad_cy is not None else (vy0 + vy1) / 2.0
+    _cx_cand = (bx0 + bx1) / 2.0
+    _cy_cand = (by0 + by1) / 2.0
+    if home_q is not None:
+        _allowed = _allowed_quadrants(home_q, allow_adjacent=False)
+        if not any(_angle_in_quadrant(angle_deg, q) for q in _allowed):
+            score -= 50000
+        if _pos_home_quadrant(_cx_cand, _cy_cand, _vcx_s, _vcy_s) not in _allowed:
+            score -= 50000
+        elif _pos_home_quadrant(_cx_cand, _cy_cand, _vcx_s, _vcy_s) == home_q:
+            score += 80
 
     # 候选标注整体包围盒：用于近邻线过滤（大幅提升性能）
     _cand_x0 = min(wx, ex, hx, bx0)
