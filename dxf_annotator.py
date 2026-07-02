@@ -602,32 +602,34 @@ def _annotate_one(doc, welds):
                        'VENDOR DOCUMENT', 'DOCUMENT CLASS', 'REVISION',
                        'ISSUE FOR', 'DRAWN BY', 'CHECKED', 'APPROVED')
     for _e in doc.modelspace():
-        if _e.dxftype() == 'INSERT' and (_e.dxf.name.startswith('Unknown-') or True):
-            _blk = doc.blocks.get(_e.dxf.name)
-            if not _blk:
-                continue
-            if not _e.dxf.name.startswith('Unknown-') and re.search(r' - \d+$', _e.dxf.name):
-                continue
-            _tx, _ty = [], []
-            _texts = []
-            for _sub in _blk:
-                if _sub.dxftype() == 'LINE':
-                    _tx.extend([_sub.dxf.start.x, _sub.dxf.end.x])
-                    _ty.extend([_sub.dxf.start.y, _sub.dxf.end.y])
-                elif _sub.dxftype() in ('TEXT', 'MTEXT', 'ATTRIB', 'ATTDEF'):
-                    try:
-                        _tx.append(_sub.dxf.insert.x)
-                        _ty.append(_sub.dxf.insert.y)
-                        _txt = (_sub.dxf.text if hasattr(_sub.dxf, 'text') else '') or ''
-                        _texts.append(_txt.upper())
-                    except: pass
-            if not _tx:
-                continue
-            _all_text = ' '.join(_texts)
-            _bom_hits = sum(1 for _kw in _BOM_KEYWORDS if _kw in _all_text)
-            _title_hits = sum(1 for _kw in _TITLE_KEYWORDS if _kw in _all_text)
-            if _e.dxf.name.startswith('Unknown-') or (_bom_hits >= 1 and _title_hits == 0):
-                _table_hatch.append((min(_tx), max(_tx), min(_ty), max(_ty)))
+        if _e.dxftype() != 'INSERT':
+            continue
+        _blk = doc.blocks.get(_e.dxf.name)
+        if not _blk:
+            continue
+        # 跳过带视图ID后缀的块（剖面标记、视图标签等）
+        if re.search(r' - \d+$', _e.dxf.name):
+            continue
+        _tx, _ty = [], []
+        _texts = []
+        for _sub in _blk:
+            if _sub.dxftype() == 'LINE':
+                _tx.extend([_sub.dxf.start.x, _sub.dxf.end.x])
+                _ty.extend([_sub.dxf.start.y, _sub.dxf.end.y])
+            elif _sub.dxftype() in ('TEXT', 'MTEXT', 'ATTRIB', 'ATTDEF'):
+                try:
+                    _tx.append(_sub.dxf.insert.x)
+                    _ty.append(_sub.dxf.insert.y)
+                    _txt = (_sub.dxf.text if hasattr(_sub.dxf, 'text') else '') or ''
+                    _texts.append(_txt.upper())
+                except: pass
+        if not _tx:
+            continue
+        _all_text = ' '.join(_texts)
+        _bom_hits = sum(1 for _kw in _BOM_KEYWORDS if _kw in _all_text)
+        _title_hits = sum(1 for _kw in _TITLE_KEYWORDS if _kw in _all_text)
+        if _e.dxf.name.startswith('Unknown-') or (_bom_hits >= 1 and _title_hits == 0):
+            _table_hatch.append((min(_tx), max(_tx), min(_ty), max(_ty)))
 
     # 处理每个视图
     for view_id in sorted(welds_by_view.keys(), key=lambda v: int(v) if v.isdigit() else 0):
@@ -1335,11 +1337,11 @@ def _search_placement(weld_pos, lines, text_bboxes, circles, placed_bboxes,
             for (hx0, hx1, hy0, hy1) in hatch_bboxes:
                 if not (bx1 < hx0 or bx0 > hx1 or by1 < hy0 or by0 > hy1):
                     return True
-        # 文字框内框边距检查：文字不得超出内框 BOUNDARY_MARGIN
-        if _db is not None:
-            _dbx = (_db[0], _db[2]); _dby = (_db[1], _db[3])
-            if bx0 < _dbx[0] + BOUNDARY_MARGIN or bx1 > _dbx[1] - BOUNDARY_MARGIN or \
-               by0 < _dby[0] + BOUNDARY_MARGIN or by1 > _dby[1] - BOUNDARY_MARGIN:
+        # 文字框内框边距检查：文字不得超出有效边界 BOUNDARY_MARGIN
+        _bx_boundary = (_db[0], _db[2]) if _db is not None else (vx0, vx1)
+        _by_boundary = (_db[1], _db[3]) if _db is not None else (vy0, vy1)
+        if bx0 < _bx_boundary[0] + BOUNDARY_MARGIN or bx1 > _bx_boundary[1] - BOUNDARY_MARGIN or \
+           by0 < _by_boundary[0] + BOUNDARY_MARGIN or by1 > _by_boundary[1] - BOUNDARY_MARGIN:
                 return True
         return False
 
@@ -1446,6 +1448,7 @@ def _search_placement(weld_pos, lines, text_bboxes, circles, placed_bboxes,
                 rad = math.radians(angle)
                 if abs(math.sin(rad)) < math.sin(math.radians(20)): continue
                 if abs(math.cos(rad)) < math.cos(math.radians(70)): continue
+                if _has_conflict(angle, dist, _db): continue
                 score = _score_placement(wx, wy, angle, dist, lines, text_bboxes,
                                          circles, placed_bboxes, placed_text_bboxes,
                                          vx0, vy0, vx1, vy1,
