@@ -844,6 +844,46 @@ def _annotate_view(msp, welds, view_id, bbox, part_centroids, f_counter, w_count
                              hatch_bboxes=hatch_bboxes, other_view_bboxes=other_view_bboxes,
                              quad_cx=cx, quad_cy=cy)
 
+    # ---- 最终清理：检测并微调残留重叠 ----
+    for _cln_iter in range(5):
+        _any_cln = False
+        for ki in range(len(_placements)):
+            for kj in range(ki + 1, len(_placements)):
+                tba, tbb = placed_text_bboxes[ki], placed_text_bboxes[kj]
+                ox = max(0, min(tba[1], tbb[1]) - max(tba[0], tbb[0]))
+                oy = max(0, min(tba[3], tbb[3]) - max(tba[2], tbb[2]))
+                if ox <= 0 or oy <= 0: continue
+                for target in [kj, ki]:
+                    gk, itk, lbk, pk, dnk, dsk, agk = _placements[target][:7]
+                    hqk = _weld_home_quadrant(pk[0], pk[1], _vcx, _vcy)
+                    _max_k = MAX_DIAG_LEN_PAIR if gk == 'pair' else MAX_DIAG_LEN
+                    for d_dist in [4, 8, 12, 16, 20, 24, -4, -8]:
+                        nd = dsk + d_dist
+                        if nd < 6 or nd > _max_k: continue
+                        for d_a in [-10, -5, 0, 5, 10]:
+                            na = agk + d_a
+                            if not _angle_in_quadrant(na, hqk): continue
+                            tnbb = _paired_bbox(pk, dnk, nd, na) if gk == 'pair' else _single_bbox(pk, dnk, nd, na)
+                            ttbb = _text_bbox(pk, dnk, nd, na, is_pair=(gk == 'pair'))
+                            _ck = True
+                            for kk in range(len(_placements)):
+                                if kk == target: continue
+                                otb = placed_text_bboxes[kk]
+                                if not (ttbb[1] < otb[0] - 1 or ttbb[0] > otb[1] + 1 or
+                                        ttbb[3] < otb[2] - 1 or ttbb[2] > otb[3] + 1):
+                                    _ck = False; break
+                            if not _ck: continue
+                            for (tx0, tx1, ty0, ty1) in text_bboxes:
+                                if not (ttbb[1] < tx0 - 1 or ttbb[0] > tx1 + 1 or
+                                        ttbb[3] < ty0 - 1 or ttbb[2] > ty1 + 1):
+                                    _ck = False; break
+                            if not _ck: continue
+                            _placements[target] = (gk, itk, lbk, pk, dnk, nd, na, tnbb)
+                            placed_text_bboxes[target] = ttbb
+                            _any_cln = True; break
+                        if _any_cln: break
+        if not _any_cln: break
+
     # ---- 绘制所有标注 ----
     for pd in _placements:
         gtype, items, labels, pos, dname, diag_len, angle = pd[:7]
