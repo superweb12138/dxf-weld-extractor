@@ -60,8 +60,9 @@ def _bom_bbox(doc):
     bboxes = []
     BOM_KEYWORDS = ('LENGTH', 'WIDTH', 'HEIGHT', 'WEIGHT', 'QTY', 'QUANTITY',
                     'DESCRIPTION', 'PART', 'MARK', 'MATERIAL', 'REMARK',
-                    'ASSEMBLY BOLT LIST', 'BOLT LIST', 'PAY CODE', 'NO.',
-                    'DIA.', 'GRADE', 'SITE/SHOP', 'MEMBERS LOCATION')
+                    'ASSEMBLY BOLT LIST', 'BOLT LIST', 'PAY CODE', 'PAY CAT',
+                    'PART LIST', 'NO.', 'DIA.', 'GRADE', 'SITE/SHOP',
+                    'MEMBERS LOCATION')
     TITLE_KEYWORDS = ('STEEL STRUCTURE DRAWING', 'PROJECT DOCUMENT',
                       'VENDOR DOCUMENT', 'DOCUMENT CLASS', 'REVISION',
                       'ISSUE FOR', 'DRAWN BY', 'CHECKED', 'APPROVED')

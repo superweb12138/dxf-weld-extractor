@@ -883,23 +883,82 @@ def extract_welds(dxf_path):
         if _lbl not in part_dims:
             part_dims[_lbl] = _dim
 
-    # Helper: compute midpoint of merged edge fragments (proper centroid of all fragments)
+    # Helper: compute midpoint of merged edge fragments
+    # Prefer longest horizontal, then longest vertical, else length-weighted centroid
     def _merged_edge_mid(frags):
-        total_w = 0.0
-        cx = 0.0
-        cy = 0.0
+        if not frags:
+            return (0, 0)
+        h_frags, v_frags, all_frags = [], [], []
         for gf in frags:
             dx = gf['end'][0] - gf['start'][0]
             dy = gf['end'][1] - gf['start'][1]
             length = math.hypot(dx, dy)
             if length < 1e-12:
                 continue
+            all_frags.append((gf, length))
+            if abs(dy) / length < 0.15:
+                h_frags.append((gf, length))
+            elif abs(dx) / length < 0.15:
+                v_frags.append((gf, length))
+        pick = None
+        if h_frags:
+            pick = max(h_frags, key=lambda t: t[1])[0]
+        elif v_frags:
+            pick = max(v_frags, key=lambda t: t[1])[0]
+        if pick is not None:
+            return ((pick['start'][0] + pick['end'][0]) / 2,
+                    (pick['start'][1] + pick['end'][1]) / 2)
+        total_w = 0.0
+        cx = 0.0
+        cy = 0.0
+        for gf, length in all_frags:
             cx += (gf['start'][0] + gf['end'][0]) / 2 * length
             cy += (gf['start'][1] + gf['end'][1]) / 2 * length
             total_w += length
         if total_w < 1e-12:
             return (0, 0)
         return (cx / total_w, cy / total_w)
+
+    def _edge_is_diagonal(gf):
+        dx = gf['end'][0] - gf['start'][0]
+        dy = gf['end'][1] - gf['start'][1]
+        length = math.hypot(dx, dy)
+        if length < 1e-12:
+            return False
+        return abs(dy) / length >= 0.15 and abs(dx) / length >= 0.15
+
+    def _frags_are_all_diagonal(frags):
+        ok = False
+        for gf in frags or []:
+            ok = True
+            if not _edge_is_diagonal(gf):
+                return False
+        return ok
+
+    def _snap_diag_mid_to_horiz(mid, plate_lines):
+        """Snap diagonal-edge mid to nearest same-plate horizontal mid (prefer above)."""
+        if not plate_lines or not mid:
+            return mid, False
+        h_mids = []
+        for ln in plate_lines:
+            dx = ln['end'][0] - ln['start'][0]
+            dy = ln['end'][1] - ln['start'][1]
+            length = math.hypot(dx, dy)
+            if length < 1.5:
+                continue
+            if abs(dy) / length >= 0.15:
+                continue  # not horizontal
+            hm = ((ln['start'][0] + ln['end'][0]) / 2,
+                  (ln['start'][1] + ln['end'][1]) / 2)
+            h_mids.append(hm)
+        if not h_mids:
+            return mid, False
+        above = [h for h in h_mids if h[1] >= mid[1] - 0.5]
+        pool = above if above else h_mids
+        best = min(pool, key=lambda h: (h[0] - mid[0]) ** 2 + (h[1] - mid[1]) ** 2)
+        if abs(best[0] - mid[0]) < 1e-9 and abs(best[1] - mid[1]) < 1e-9:
+            return mid, False
+        return best, True
 
     # Helper: find weld line geometry between two part labels in a given view
     def _find_weld_line_for_pair(lbl_a, lbl_b, view_id, snap_tol=SNAP_TOL):
@@ -1014,6 +1073,12 @@ def extract_welds(dxf_path):
                                     mid = (_ix, _iy)
                         if touching:
                             # 标注位置统一使用 ln_a（lbl_a 的边）的中点
+                            # 跳过斜边中点，避免 pos-refine 吸回倒角
+                            _adx = ea[0] - sa[0]
+                            _ady = ea[1] - sa[1]
+                            _alen = math.hypot(_adx, _ady)
+                            if _alen > 1e-12 and abs(_ady) / _alen >= 0.15 and abs(_adx) / _alen >= 0.15:
+                                continue
                             mid = ((sa[0]+ea[0])/2, (sa[1]+ea[1])/2)
                             _mk = (round(mid[0], 1), round(mid[1], 1))
                             if _mk not in seen_mids:
@@ -1640,6 +1705,16 @@ def extract_welds(dxf_path):
                         for _cln in _cplns:
                             if _cln['length'] < MIN_EDGE:
                                 continue
+                            # Skip diagonal/chamfer edges as weld-row anchors (BE021 F1-4)
+                            _dx = _cln['end'][0] - _cln['start'][0]
+                            _dy = _cln['end'][1] - _cln['start'][1]
+                            _elen = math.hypot(_dx, _dy)
+                            if _elen < 1e-12:
+                                continue
+                            _is_horiz = abs(_dy) / _elen < 0.15
+                            _is_vert = abs(_dx) / _elen < 0.15
+                            if not (_is_horiz or _is_vert):
+                                continue
                             _cp_s = None; _cps_d = ADJ_TOL
                             _cp_e = None; _cpe_d = ADJ_TOL
                             for _opn, _olns in view_parts.items():
@@ -1670,6 +1745,9 @@ def extract_welds(dxf_path):
                             elif _cp_e and _e_gust:
                                 _ce_list.append((_cln['length'], _cp_e, [_cln]))
                         if _ce_list:
+                            # 2 SIDES: keep the two longest H/V edges per plate
+                            if is_two_sides and expected_edges == 2 and len(_ce_list) > 2:
+                                _ce_list = sorted(_ce_list, key=lambda t: t[0], reverse=True)[:2]
                             _cp_edges[_cpn] = _ce_list
                     if _cp_edges:
                         weld_edges_by_gusset = _cp_edges
@@ -1898,6 +1976,11 @@ def extract_welds(dxf_path):
                 for edge_len, other_part, cur_gusset, edge_frags in weld_edges_all:
                     # Edge midpoint for DXF annotation — use full merged edge centroid
                     _edge_mid = _merged_edge_mid(edge_frags)
+                    _diag_snapped = False
+                    # Single-fragment (or all-diagonal) chamfers → snap to plate H mid above
+                    if _frags_are_all_diagonal(edge_frags):
+                        _plate_lns = view_parts.get(cur_gusset, [])
+                        _edge_mid, _diag_snapped = _snap_diag_mid_to_horiz(_edge_mid, _plate_lns)
                     # CO009: 以 WM 箭头为基准计算边中点（仅对箭头所在的接触边）
                     if comp == 'CO009' and not _use_largest_gusset:
                         _lbl_other = part_number_map.get(other_part, comp)
@@ -1924,7 +2007,7 @@ def extract_welds(dxf_path):
                         _edge_mid = (_edge_mid[0] + 0.1, _edge_mid[1])
                         _edge_snapped = True
                     else:
-                        _edge_snapped = False
+                        _edge_snapped = _diag_snapped
                     _seen_mids.append(_edge_mid)
                     lbl_o       = part_number_map.get(other_part, comp)
                     geo_len_mm  = round(edge_len * SCALE, 1)
@@ -2244,6 +2327,7 @@ def extract_welds(dxf_path):
                               'annotation': '', 'part1': p1, 'part2': p2,
                               'dxf_pos': _edge_mid, 'view_id': view_id,
                               '_snapped': _edge_snapped,
+                              '_no_refine': _diag_snapped,
                                })
                 # Record peer data for post-processing replication
                 if lbl_g != comp and lbl_g in part_dims and not _synth:
@@ -3098,6 +3182,9 @@ def extract_welds(dxf_path):
                         for _dup in (0, 1):  # _dup=0: front face; _dup=1: mirrored back face
                             _mpos = _line_mid(_cln)
                             _from_contact = False
+                            _diag_fix = False
+                            if _is_diag:
+                                _mpos, _diag_fix = _snap_diag_mid_to_horiz(_mpos, _cplns)
                             _wl = _find_weld_line_for_pair(p1, p2, _vid)
                             if _wl and len(_wl) >= 2:
                                 _ys = [round(w[2][1], 1) for w in _wl]
@@ -3120,7 +3207,7 @@ def extract_welds(dxf_path):
                                 'annotation': '', 'part1': p1, 'part2': p2,
                                 'dxf_pos': _mpos, 'view_id': _vid,
                                 '_mirrored': (_dup == 1),
-                                '_no_refine': _from_contact,
+                                '_no_refine': _from_contact or _diag_fix,
                             })
 
     # Post-processing: BOM-based comp→plate enumeration for CO components.
@@ -5150,6 +5237,8 @@ def write_excel(all_results, all_skipped, output_path):
 # Entry point
 # ============================================================
 if __name__ == '__main__':
+    import time as _time
+    _t_pipeline0 = _time.perf_counter()
     dxf_files = sorted([f for f in glob.glob(os.path.join(FOLDER, "*.dxf")) if '(2)' not in f])
     if not dxf_files:
         print("No DXF files found. Run convert_dwg_to_dxf.py first.")
@@ -5159,6 +5248,10 @@ if __name__ == '__main__':
     all_skipped = []
 
     for dxf_path in dxf_files:
+        # Skip CO010 extract (not annotated; saves wall-clock toward ~3min target)
+        if 'CO010' in os.path.basename(dxf_path):
+            print(f"\nSKIP extract {os.path.basename(dxf_path)} (not annotated)")
+            continue
         try:
             results, skipped = extract_welds(dxf_path)
             all_results.extend(results)
@@ -5178,3 +5271,5 @@ if __name__ == '__main__':
     except Exception as exc:
         import traceback
         print(f"\nDXF annotation failed: {exc}\n{traceback.format_exc()}")
+
+    print(f"\nPipeline wall: {_time.perf_counter() - _t_pipeline0:.1f}s")

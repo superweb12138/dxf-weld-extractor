@@ -20,7 +20,14 @@ FOLDER = os.path.dirname(os.path.abspath(__file__))
 ANNOTATED_DIR = os.path.join(FOLDER, "annotated")
 
 SCALE = 10          # 1 CAD unit = 10 mm
-LABEL_HEIGHT = 2.5  # text height in CAD units
+LABEL_HEIGHT = 2.5  # text height in CAD units (default / sparse views)
+LABEL_HEIGHT_DENSE = 1.6
+LABEL_HEIGHT_VERY_DENSE = 1.35
+DENSE_VIEW_N = 5              # label groups >= this → shrink text
+VERY_DENSE_VIEW_N = 10
+DENSE_CLUSTER_N = 2           # local weld cluster size → dense
+VERY_DENSE_CLUSTER_N = 3      # larger local cluster → very dense
+_ACTIVE_LABEL_HEIGHT = LABEL_HEIGHT
 LAYER_NAME = "WELD_LABELS"
 LABEL_COLOR = 5       # blue (ACI 5)
 LABEL_OFFSET = 38.0   # fallback offset for no-coordinate labels
@@ -28,11 +35,8 @@ LABEL_OFFSET = 38.0   # fallback offset for no-coordinate labels
 # Two-segment leader line: diagonal + horizontal landing
 DIAG_BASE = 15             # base diagonal length in CAD units (increased from 10)
 DIAG_STEP = 3              # step increment for collision avoidance
-HORIZ_LAND = LABEL_HEIGHT * 2.2   # horizontal landing = single-label text width
-PAIR_GAP = LABEL_HEIGHT * 3.0  # horizontal gap between paired labels
-PAIR_HORIZ_LAND = LABEL_HEIGHT * 5.0  # horizontal landing = paired-label text width
-MAX_DIAG_LEN = 80            # upper limit for diagonal length (increased for dense drawings)
-MAX_DIAG_LEN_PAIR = 96       # slightly longer allowed for paired labels
+MAX_DIAG_LEN = 50            # upper limit for diagonal length
+MAX_DIAG_LEN_PAIR = 50       # paired labels share the same hard cap
 
 # Preferred leader angles (right side / left side)
 PREFERRED_ANGLES_RIGHT = (30, 45)
@@ -41,8 +45,10 @@ ANGLE_MIN = 20
 ANGLE_MAX = 75
 
 # Cluster-aware fan-out parameters
-CLUSTER_RADIUS = 28.0        # welds within this radius are considered a dense cluster
-CLUSTER_MIN_SIZE = 3         # minimum number of labels to trigger fan-out assignment
+CLUSTER_RADIUS = 36.0        # welds within this radius are considered a dense cluster
+CLUSTER_MIN_SIZE = 2         # min near-group size for divergent prefer_ang pairing
+DIVERGE_ANGLE_MIN = 30.0     # near neighbors with smaller angle gap → re-search
+DIVERGE_SCORE_CLOSE = 35.0   # angle gap below this → score penalty
 
 # Quadrant angle ranges relative to view center (degrees, CCW from +X)
 # Q1 (upper-right), Q2 (upper-left), Q3 (lower-left), Q4 (lower-right)
@@ -53,22 +59,232 @@ QUAD_ANGLE_RANGES = {
     4: (280, 340),    # Q4 右下方 280-340°
 }
 
+# Same-half divergent pairs (no cross half-plane): right Q1↔Q4, left Q2↔Q3
+DIVERGE_PREF_RIGHT = (65.0, 295.0)   # Q1 upper, Q4 lower
+DIVERGE_PREF_LEFT = (135.0, 225.0)   # Q2 upper, Q3 lower
+
 QUADRANT_ANGLE_TOL = 3.0
 OVERLAP_MARGIN = 4.0
 CLUSTER_OVERLAP_MARGIN = 4.0
-LINE_CLEARANCE = 5.0       # min distance from label text to part edges (~50mm)
+LINE_CLEARANCE = 6.5       # min distance from label text to part edges
 
-MIN_HORIZ_LAND = LABEL_HEIGHT * 3.0   # 水平段最小可见长度
-MIN_DIAG_LEN = 10                      # 斜段最小长度
-PREFERRED_DIAG_SOFT = 32               # 软偏好：短于此距离的引线优先
-PREFERRED_DIAG_HARD = 48               # 超过此距离开始明显扣分
-Y_SLOT_HEIGHT = LABEL_HEIGHT * 3.0     # 同高度标注错开步距
-WM_TEXT_MARGIN = 6.0                   # WM / 3 SIDES TYP 避让边距
-WM_SYMBOL_RADIUS = 8.0               # 焊缝符号禁区半径
+MIN_DIAG_LEN = 10                      # 斜段绝对硬下限
+PREFERRED_DIAG_MIN = 18                # 低于此视为过短
+PREFERRED_DIAG_SOFT = 24               # 甜区中心偏短侧
+PREFERRED_DIAG_HARD = 38               # 超过开始明显偏长
+WM_TEXT_MARGIN = 8.0                   # WM / 3 SIDES TYP 避让边距
+WM_SYMBOL_RADIUS = 18.0              # 焊缝符号禁区半径（紧凑符号区，不含长引线）
+WM_SYMBOL_LINE_MAX = 35.0            # 计入符号 AABB 的短线最大长度
+WM_SYMBOL_CLUSTER_R = 45.0           # 短线相对 WM 文字中心的聚类半径
 
 # Hard exclusion margins
-BOM_MARGIN = 0               # margin around BOM table (Unknown-* blocks)
+BOM_MARGIN = 10              # margin around BOM / title / bolt tables
 BOUNDARY_MARGIN = 8          # margin around drawing inner frame (hard)
+
+
+def _lh():
+    """Current view label text height (may shrink in dense views)."""
+    return _ACTIVE_LABEL_HEIGHT
+
+
+def _set_active_label_height(h):
+    global _ACTIVE_LABEL_HEIGHT
+    _ACTIVE_LABEL_HEIGHT = h
+
+
+def _y_slot_height():
+    return _lh() * 3.0
+
+
+def _max_local_cluster_size(positions, radius=None):
+    """Largest number of points within radius of each other (inclusive self)."""
+    if not positions:
+        return 0
+    r = CLUSTER_RADIUS if radius is None else radius
+    n = len(positions)
+    best = 1
+    for i in range(n):
+        xi, yi = positions[i]
+        cnt = 1
+        for j in range(n):
+            if i == j:
+                continue
+            xj, yj = positions[j]
+            if math.hypot(xj - xi, yj - yi) <= r:
+                cnt += 1
+        if cnt > best:
+            best = cnt
+    return best
+
+
+def _local_cluster_size_at(pos, positions, radius=None):
+    """How many welds (incl. self) lie within radius of pos."""
+    if not positions:
+        return 0
+    r = CLUSTER_RADIUS if radius is None else radius
+    px, py = pos[0], pos[1]
+    return sum(1 for x, y in positions if math.hypot(x - px, y - py) <= r)
+
+
+def _height_from_cluster_n(n):
+    if n >= VERY_DENSE_CLUSTER_N:
+        return LABEL_HEIGHT_VERY_DENSE
+    if n >= DENSE_CLUSTER_N:
+        return LABEL_HEIGHT_DENSE
+    return LABEL_HEIGHT
+
+
+def _choose_view_label_height(groups):
+    """Pick label height from group count and local weld density."""
+    positions = []
+    for _gtype, items in groups:
+        pos = items[0][1]
+        positions.append((pos[0], pos[1]))
+    n = len(groups)
+    cluster = _max_local_cluster_size(positions)
+    if n >= VERY_DENSE_VIEW_N or cluster >= VERY_DENSE_CLUSTER_N:
+        return LABEL_HEIGHT_VERY_DENSE
+    if n >= DENSE_VIEW_N or cluster >= DENSE_CLUSTER_N:
+        return LABEL_HEIGHT_DENSE
+    return LABEL_HEIGHT
+
+
+def _group_label_heights(groups):
+    """Per-group height from local cluster; busy views also floor the size."""
+    positions = [(items[0][1][0], items[0][1][1]) for _gtype, items in groups]
+    n = len(groups)
+    if n >= VERY_DENSE_VIEW_N:
+        view_floor = LABEL_HEIGHT_VERY_DENSE
+    elif n >= DENSE_VIEW_N:
+        view_floor = LABEL_HEIGHT_DENSE
+    else:
+        view_floor = LABEL_HEIGHT
+    heights = []
+    for pos in positions:
+        local_h = _height_from_cluster_n(_local_cluster_size_at(pos, positions))
+        heights.append(min(local_h, view_floor))
+    return heights, positions
+
+
+def _angle_delta_deg(a, b):
+    """Smallest absolute angle difference in degrees [0, 180]."""
+    d = abs((a - b) % 360)
+    return d if d <= 180 else 360 - d
+
+
+def _diverge_prefer_angs(pos_a, pos_b, vcx, vcy):
+    """Same-half divergent prefer angles: high→upper quad, low→lower quad."""
+    (xa, ya), (xb, yb) = pos_a, pos_b
+    right = ((xa + xb) / 2.0) >= vcx
+    up_ang, dn_ang = DIVERGE_PREF_RIGHT if right else DIVERGE_PREF_LEFT
+    if ya >= yb:
+        return up_ang, dn_ang
+    return dn_ang, up_ang
+
+
+def _halfplane_complement(ang):
+    """Opposite corner on the nearest same-half diverge pair (no cross half)."""
+    comps = {
+        135.0: 225.0, 225.0: 135.0,   # left Q2↔Q3
+        65.0: 295.0, 295.0: 65.0,     # right Q1↔Q4
+        45.0: 315.0, 315.0: 45.0,
+    }
+    best_k, best_gap = 135.0, 999.0
+    for k in comps:
+        g = _angle_delta_deg(ang, k)
+        if g < best_gap:
+            best_gap = g
+            best_k = k
+    return comps[best_k]
+
+
+def _maximin_corner_ang(neighbor_angs, prefer=None, home_q=None):
+    """Same-half corner maximizing min angle gap to neighbors."""
+    # stay in one half-plane to avoid leaders crossing the part
+    if home_q in (1, 4) or (prefer is not None and (
+            _angle_delta_deg(prefer, 45) < 50 or _angle_delta_deg(prefer, 315) < 50
+            or _angle_delta_deg(prefer, 65) < 50 or _angle_delta_deg(prefer, 295) < 50)):
+        corners = [65.0, 295.0, 45.0, 315.0]
+    elif home_q in (2, 3) or (prefer is not None and (
+            _angle_delta_deg(prefer, 135) < 50 or _angle_delta_deg(prefer, 225) < 50)):
+        corners = [135.0, 225.0]
+    else:
+        # infer from first neighbor angle
+        seed = neighbor_angs[0] if neighbor_angs else (prefer or 135.0)
+        if _angle_delta_deg(seed, 45) < 90 or _angle_delta_deg(seed, 315) < 90:
+            corners = [65.0, 295.0, 45.0, 315.0]
+        else:
+            corners = [135.0, 225.0]
+    if prefer is not None:
+        corners = [prefer % 360] + [c for c in corners if _angle_delta_deg(c, prefer) > 1]
+    if not neighbor_angs:
+        return corners[0]
+    best_a, best_sc = corners[0], -1.0
+    for c in corners:
+        sc = min(_angle_delta_deg(c, a) for a in neighbor_angs)
+        if sc > best_sc:
+            best_sc, best_a = sc, c
+    if best_sc >= DIVERGE_ANGLE_MIN:
+        return best_a
+    seed = neighbor_angs[0]
+    for da in (40, -40, 55, -55, 70, -70):
+        c = (seed + da) % 360
+        # keep candidate in same half as corners[0]
+        half_right = corners[0] in (45.0, 65.0, 295.0, 315.0)
+        c_right = (0 <= (c % 360) < 90) or (270 < (c % 360) <= 360)
+        if half_right != c_right:
+            continue
+        sc = min(_angle_delta_deg(c, a) for a in neighbor_angs)
+        if sc > best_sc:
+            best_sc, best_a = sc, c
+    return best_a
+
+
+def _pair_near_groups(groups, vcx, vcy, radius=None):
+    """Greedy near-neighbor pairing → (prefer_ang map, partner index map)."""
+    r = CLUSTER_RADIUS if radius is None else radius
+    n = len(groups)
+    if n < CLUSTER_MIN_SIZE:
+        return {}, {}
+    positions = [(items[0][1][0], items[0][1][1]) for _gtype, items in groups]
+    candidates = []
+    for i in range(n):
+        xi, yi = positions[i]
+        for j in range(i + 1, n):
+            xj, yj = positions[j]
+            d = math.hypot(xj - xi, yj - yi)
+            if d <= r and d > 0.5:
+                candidates.append((d, i, j))
+    candidates.sort()
+    used = set()
+    prefer = {}
+    partners = {}
+    for _d, i, j in candidates:
+        if i in used or j in used:
+            continue
+        ai, aj = _diverge_prefer_angs(positions[i], positions[j], vcx, vcy)
+        prefer[i] = ai
+        prefer[j] = aj
+        partners[i] = j
+        partners[j] = i
+        used.add(i)
+        used.add(j)
+    return prefer, partners
+
+
+def _txt_sample_points(bx0, bx1, by0, by1):
+    """Dense sample points on text bbox for line-clearance checks."""
+    mx, my = (bx0 + bx1) / 2.0, (by0 + by1) / 2.0
+    qx0, qx1 = bx0 + (bx1 - bx0) * 0.25, bx0 + (bx1 - bx0) * 0.75
+    qy0, qy1 = by0 + (by1 - by0) * 0.25, by0 + (by1 - by0) * 0.75
+    return [
+        (bx0, by0), (bx1, by0), (bx0, by1), (bx1, by1),
+        (mx, by0), (mx, by1), (bx0, my), (bx1, my), (mx, my),
+        (qx0, by0), (qx1, by0), (qx0, by1), (qx1, by1),
+        (bx0, qy0), (bx0, qy1), (bx1, qy0), (bx1, qy1),
+        (qx0, qy0), (qx1, qy0), (qx0, qy1), (qx1, qy1),
+    ]
+
 
 # 8-direction system: (name, base_angle_deg, min_angle, max_angle, dx_mult, dy_mult)
 # angles: 0=right, 90=up, -90=down, +/-180=left
@@ -87,6 +303,64 @@ MT_MIDDLE_RIGHT = 6
 MT_BOTTOM_LEFT = 7
 MT_BOTTOM_CENTER = 8
 MT_BOTTOM_RIGHT = 9
+
+
+def _add_wm_hard_zones(blk, wm_text_bboxes, circles, hatch_bboxes):
+    """Hard zones for WeldMark block TEXT + compact symbol (no long leaders)."""
+    _wm_pts = []
+    _short = []
+    for _sub in blk:
+        _st = _sub.dxftype()
+        if _st in ('TEXT', 'ATTDEF', 'ATTRIB'):
+            try:
+                _atx, _aty = _sub.dxf.insert.x, _sub.dxf.insert.y
+                _ath = getattr(_sub.dxf, 'height', 2.0)
+                _atxt = (_sub.dxf.text or '').strip() if hasattr(_sub.dxf, 'text') else ''
+                if _atxt:
+                    _wm_pts.append((_atx, _aty, _ath, _atxt))
+            except Exception:
+                pass
+        elif _st == 'MTEXT':
+            try:
+                _atx, _aty = _sub.dxf.insert.x, _sub.dxf.insert.y
+                _ath = getattr(_sub.dxf, 'char_height', 2.0)
+                _atxt = (_sub.text or '').strip() if hasattr(_sub, 'text') else ''
+                if _atxt:
+                    _wm_pts.append((_atx, _aty, _ath, _atxt.replace('\\n', ' ')))
+            except Exception:
+                pass
+        elif _st == 'LINE':
+            try:
+                _s, _e = _sub.dxf.start, _sub.dxf.end
+                _ln = math.hypot(_e.x - _s.x, _e.y - _s.y)
+                if _ln <= WM_SYMBOL_LINE_MAX:
+                    _short.append((_s.x, _s.y, _e.x, _e.y, (_s.x + _e.x) / 2, (_s.y + _e.y) / 2))
+            except Exception:
+                pass
+    if not _wm_pts:
+        return
+    _axs, _ays = [], []
+    for _atx, _aty, _ath, _atxt in _wm_pts:
+        _atw = _ath * max(len(_atxt), 1) * 0.95
+        _mrg = WM_TEXT_MARGIN
+        _axs.extend([_atx - _mrg, _atx + _atw + _mrg])
+        _ays.extend([_aty - _mrg, _aty + _ath + _mrg])
+    wm_text_bboxes.append((min(_axs), max(_axs), min(_ays), max(_ays)))
+
+    _cx = sum(p[0] for p in _wm_pts) / len(_wm_pts)
+    _cy = sum(p[1] for p in _wm_pts) / len(_wm_pts)
+    _sx, _sy = list(_axs), list(_ays)
+    for _x0, _y0, _x1, _y1, _mx, _my in _short:
+        if math.hypot(_mx - _cx, _my - _cy) <= WM_SYMBOL_CLUSTER_R:
+            _sx.extend([_x0, _x1])
+            _sy.extend([_y0, _y1])
+    _pad = max(2.0, WM_TEXT_MARGIN * 0.5)
+    _hb = (min(_sx) - _pad, max(_sx) + _pad, min(_sy) - _pad, max(_sy) + _pad)
+    hatch_bboxes.append(_hb)
+    _scx = (_hb[0] + _hb[1]) / 2
+    _scy = (_hb[2] + _hb[3]) / 2
+    _r = max(WM_SYMBOL_RADIUS, 0.5 * max(_hb[1] - _hb[0], _hb[3] - _hb[2]))
+    circles.append((_scx, _scy, min(_r, WM_SYMBOL_RADIUS * 1.4)))
 
 
 def _collect_all_obstacles(doc, view_id, view_bbox=None):
@@ -154,7 +428,11 @@ def _collect_all_obstacles(doc, view_id, view_bbox=None):
                 if all_pts:
                     xs = [p[0] for p in all_pts]
                     ys = [p[1] for p in all_pts]
-                    hatch_bboxes.append((min(xs), max(xs), min(ys), max(ys)))
+                    _hb = (min(xs), max(xs), min(ys), max(ys))
+                    # Skip tiny fill fragments — they flood hot-path conflict scans
+                    _hw, _hh = _hb[1] - _hb[0], _hb[3] - _hb[2]
+                    if _hw * _hh >= 4.0 and max(_hw, _hh) >= 2.0:
+                        hatch_bboxes.append(_hb)
             except Exception:
                 pass
         elif t == 'LEADER':
@@ -195,27 +473,30 @@ def _collect_all_obstacles(doc, view_id, view_bbox=None):
             except Exception:
                 pass
         elif t == 'SOLID':
+            # SOLID fill edges as line obstacles (no full AABB hard box)
             try:
-                pts = [(e.dxf.vch1.x, e.dxf.vch1.y),
-                       (e.dxf.vch2.x, e.dxf.vch2.y),
-                       (e.dxf.vch3.x, e.dxf.vch3.y),
-                       (e.dxf.vch4.x, e.dxf.vch4.y)]
-                xs = [p[0] for p in pts if p[0] is not None]
-                ys = [p[1] for p in pts if p[1] is not None]
-                if xs and ys:
-                    hatch_bboxes.append((min(xs), max(xs), min(ys), max(ys)))
+                pts = []
+                for _vn in ('vtx0', 'vtx1', 'vtx2', 'vtx3'):
+                    _pt = getattr(e.dxf, _vn, None)
+                    if _pt is not None and getattr(_pt, 'x', None) is not None:
+                        pts.append((_pt.x, _pt.y))
+                if len(pts) >= 3:
+                    for i in range(len(pts)):
+                        j = (i + 1) % len(pts)
+                        lines.append((pts[i], pts[j]))
             except Exception:
                 pass
         elif t == '3DFACE':
             try:
-                pts = [(e.dxf.vch1.x, e.dxf.vch1.y),
-                       (e.dxf.vch2.x, e.dxf.vch2.y),
-                       (e.dxf.vch3.x, e.dxf.vch3.y),
-                       (e.dxf.vch4.x, e.dxf.vch4.y)]
-                xs = [p[0] for p in pts if p[0] is not None]
-                ys = [p[1] for p in pts if p[1] is not None]
-                if xs and ys:
-                    hatch_bboxes.append((min(xs), max(xs), min(ys), max(ys)))
+                pts = []
+                for _vn in ('vtx0', 'vtx1', 'vtx2', 'vtx3'):
+                    _pt = getattr(e.dxf, _vn, None)
+                    if _pt is not None and getattr(_pt, 'x', None) is not None:
+                        pts.append((_pt.x, _pt.y))
+                if len(pts) >= 3:
+                    for i in range(len(pts)):
+                        j = (i + 1) % len(pts)
+                        lines.append((pts[i], pts[j]))
             except Exception:
                 pass
         elif t == 'MLEADER':
@@ -247,33 +528,82 @@ def _collect_all_obstacles(doc, view_id, view_bbox=None):
             else:
                 add_entity(sub)
 
-    # 1) Part blocks in this view
+    def _accum_geom_xy(blk2, _xs, _ys, depth=0):
+        """Collect geometry extents from LINE/LWPOLYLINE/POLYLINE/SOLID/CIRCLE/ARC/TEXT."""
+        if depth > 5:
+            return
+        for _sub in blk2:
+            _st = _sub.dxftype()
+            if _st == 'LINE':
+                _xs.append(_sub.dxf.start.x); _xs.append(_sub.dxf.end.x)
+                _ys.append(_sub.dxf.start.y); _ys.append(_sub.dxf.end.y)
+            elif _st == 'LWPOLYLINE':
+                try:
+                    for _pt in _sub.get_points():
+                        _xs.append(_pt[0]); _ys.append(_pt[1])
+                except Exception:
+                    pass
+            elif _st == 'POLYLINE':
+                try:
+                    for _v in _sub.vertices:
+                        _xs.append(_v.dxf.location.x); _ys.append(_v.dxf.location.y)
+                except Exception:
+                    pass
+            elif _st in ('SOLID', '3DFACE'):
+                try:
+                    for _vn in ('vtx0', 'vtx1', 'vtx2', 'vtx3'):
+                        _pt = getattr(_sub.dxf, _vn, None)
+                        if _pt is not None and _pt[0] is not None:
+                            _xs.append(_pt[0]); _ys.append(_pt[1])
+                except Exception:
+                    pass
+            elif _st in ('CIRCLE', 'ARC'):
+                try:
+                    _ccx, _ccy = _sub.dxf.center.x, _sub.dxf.center.y
+                    _cr = getattr(_sub.dxf, 'radius', 1.0)
+                    _xs.extend([_ccx - _cr, _ccx + _cr])
+                    _ys.extend([_ccy - _cr, _ccy + _cr])
+                except Exception:
+                    pass
+            elif _st in ('TEXT', 'ATTDEF', 'ATTRIB'):
+                try:
+                    _tx, _ty = _sub.dxf.insert.x, _sub.dxf.insert.y
+                    _th = getattr(_sub.dxf, 'height', 2.0)
+                    _txt = ''
+                    if hasattr(_sub.dxf, 'text') and _sub.dxf.text:
+                        _txt = _sub.dxf.text.strip()
+                    _tw = _th * max(len(_txt), 2) * 0.8
+                    _xs.extend([_tx, _tx + _tw]); _ys.extend([_ty, _ty + _th])
+                except Exception:
+                    pass
+            elif _st == 'MTEXT':
+                try:
+                    _tx, _ty = _sub.dxf.insert.x, _sub.dxf.insert.y
+                    _th = getattr(_sub.dxf, 'char_height', 2.0)
+                    _txt = _sub.text.strip() if hasattr(_sub, 'text') else ''
+                    _max_line = max((len(l) for l in _txt.split('\\n')), default=4)
+                    _tw = _th * _max_line * 0.7
+                    _xs.extend([_tx, _tx + _tw]); _ys.extend([_ty, _ty + _th])
+                except Exception:
+                    pass
+            elif _st == 'INSERT':
+                _sblk = doc.blocks.get(_sub.dxf.name)
+                if _sblk:
+                    _accum_geom_xy(_sblk, _xs, _ys, depth + 1)
+
+    # 1) Part blocks in this view — lines/text only; do NOT hard-block with Part AABB
     for blk in doc.blocks:
         if blk.name.startswith('Part') and re.search(rf' - {view_id}$', blk.name):
             _add_block_entities(blk)
-            # Add Part's overall line bbox to hatch_bboxes (catches I-beam/stiffener overlaps that ray casting misses)
-            def _part_lines(blk2, _xs, _ys):
-                for _sub in blk2:
-                    if _sub.dxftype() == 'LINE':
-                        _xs.append(_sub.dxf.start.x); _xs.append(_sub.dxf.end.x)
-                        _ys.append(_sub.dxf.start.y); _ys.append(_sub.dxf.end.y)
-                    elif _sub.dxftype() == 'INSERT':
-                        _sblk = doc.blocks.get(_sub.dxf.name)
-                        if _sblk:
-                            _part_lines(_sblk, _xs, _ys)
-            _pxs, _pys = [], []
-            _part_lines(blk, _pxs, _pys)
-            if _pxs and _pys:
-                _pw = max(_pxs) - min(_pxs); _ph = max(_pys) - min(_pys)
-                _pb = (min(_pxs), max(_pxs), min(_pys), max(_pys))
-                if _pb[0] < _pb[1] and _pb[2] < _pb[3]:
-                    hatch_bboxes.append(_pb)
 
-    # 2) WeldMark and Mark blocks in this view (original symbols, leader lines)
+    # 2) WeldMark / Mark / SectionMark in this view
     for blk in doc.blocks:
-        if (blk.name.startswith('WeldMark') or blk.name.startswith('Mark')):
+        if (blk.name.startswith('WeldMark') or blk.name.startswith('Mark')
+                or blk.name.startswith('SectionMark')):
             if re.search(rf' - {view_id}$', blk.name):
                 _add_block_entities(blk)
+                if blk.name.startswith('WeldMark'):
+                    _add_wm_hard_zones(blk, wm_text_bboxes, circles, hatch_bboxes)
 
     # 3) Modelspace entities (dimensions, title blocks, general annotations)
     _MARGIN = 100  # buffer zone around view bbox
@@ -318,7 +648,7 @@ def _collect_all_obstacles(doc, view_id, view_bbox=None):
             blk = doc.blocks.get(e.dxf.name)
             if blk:
                 _add_block_entities(blk)
-                # 提取 WM INSERT 上的 ATTRIB 属性值（3 SIDES、TYP. 等注释）
+                # 提取 WM INSERT 上的 ATTRIB（少见）；块内 TEXT 已由 _add_wm_hard_zones 覆盖
                 if blk.name.startswith('WeldMark'):
                     _wm_pts = []
                     for _attrib in e.attribs:
@@ -333,21 +663,40 @@ def _collect_all_obstacles(doc, view_id, view_bbox=None):
                     if _wm_pts:
                         _axs = []; _ays = []
                         for _atx, _aty, _ath, _atxt in _wm_pts:
-                            _atw = _ath * len(_atxt) * 0.8
+                            _atw = _ath * len(_atxt) * 0.95
                             _mrg = WM_TEXT_MARGIN
                             _axs.extend([_atx - _mrg, _atx + _atw + _mrg])
                             _ays.extend([_aty - _mrg, _aty + _ath + _mrg])
                         wm_text_bboxes.append((min(_axs), max(_axs), min(_ays), max(_ays)))
-                    circles.append((e.dxf.insert.x, e.dxf.insert.y, WM_SYMBOL_RADIUS))
+                        _cx = sum(p[0] for p in _wm_pts) / len(_wm_pts)
+                        _cy = sum(p[1] for p in _wm_pts) / len(_wm_pts)
+                        circles.append((_cx, _cy, WM_SYMBOL_RADIUS))
+                        _r = WM_SYMBOL_RADIUS
+                        hatch_bboxes.append((_cx - _r, _cx + _r, _cy - _r, _cy + _r))
         else:
             add_entity(e)
 
     return lines, text_bboxes, wm_text_bboxes, circles, hatch_bboxes
 
 
+def _build_line_grid(lines, cell=50):
+    """Spatial hash of lines for near-neighbor conflict checks."""
+    grid = {}
+    for _s, _e in lines:
+        _gx0 = int(min(_s[0], _e[0]) / cell)
+        _gx1 = int(max(_s[0], _e[0]) / cell)
+        _gy0 = int(min(_s[1], _e[1]) / cell)
+        _gy1 = int(max(_s[1], _e[1]) / cell)
+        for _gx in range(_gx0, _gx1 + 1):
+            for _gy in range(_gy0, _gy1 + 1):
+                grid.setdefault((_gx, _gy), []).append((_s, _e))
+    return grid
+
+
 def annotate(results, dxf_paths=None):
     """Main entry point. Annotates DXF files with weld labels.
     Returns list of sampled weld label entries for Excel output."""
+    import time
     os.makedirs(ANNOTATED_DIR, exist_ok=True)
 
     by_comp = defaultdict(list)
@@ -359,6 +708,7 @@ def annotate(results, dxf_paths=None):
         dxf_paths = sorted([f for f in glob.glob(os.path.join(FOLDER, "*.dxf")) if '(2)' not in f])
 
     all_sampled_labels = []
+    _t_all0 = time.perf_counter()
 
     for dxf_path in dxf_paths:
         comp_m = re.search(r'-(BE\d+|CO\d+)_', os.path.basename(dxf_path), re.I)
@@ -379,7 +729,11 @@ def annotate(results, dxf_paths=None):
             continue
 
         try:
+            if hasattr(_search_placement, '_fb_seen'):
+                _search_placement._fb_seen.clear()
+            _t0 = time.perf_counter()
             sampled_labels = _annotate_one(doc, comp_welds)
+            print(f"    annotate wall: {time.perf_counter() - _t0:.1f}s")
             all_sampled_labels.extend(sampled_labels)
             out_path = os.path.join(ANNOTATED_DIR, os.path.basename(dxf_path))
             for _retry in range(3):
@@ -388,7 +742,7 @@ def annotate(results, dxf_paths=None):
                     break
                 except OSError:
                     if _retry < 2:
-                        import time; time.sleep(0.5)
+                        time.sleep(0.5)
                     else:
                         raise
 
@@ -407,6 +761,7 @@ def annotate(results, dxf_paths=None):
             print(f"    ERROR annotating {comp}: {e}")
             traceback.print_exc()
 
+    print(f"  All annotate wall: {time.perf_counter() - _t_all0:.1f}s")
     return all_sampled_labels
 
 
@@ -548,6 +903,7 @@ def _annotate_one(doc, welds):
         draw_bbox = _compute_drawing_bbox(doc)
 
     _global_wm_text_bboxes = []
+    _global_hatch_bboxes = []
     _drawn_label_registry = []
 
     # Group welds by view_id
@@ -604,12 +960,13 @@ def _annotate_one(doc, welds):
             _other_view_bboxes.append((min(_v_ax) - 5, min(_v_ay) - 5,
                                        max(_v_ax) + 5, max(_v_ay) + 5))
 
-    # 检测表格区域（BOM / 材料表 / 螺栓表），作为 hatch_bbox 加入阻挡
+    # 检测表格区域（BOM / 材料表 / 螺栓表 / 标题栏），作为 hatch_bbox 加入阻挡
     _table_hatch = []
     _BOM_KEYWORDS = ('LENGTH', 'WIDTH', 'HEIGHT', 'WEIGHT', 'QTY', 'QUANTITY',
                      'DESCRIPTION', 'PART', 'MARK', 'MATERIAL', 'REMARK',
-                     'ASSEMBLY BOLT LIST', 'BOLT LIST', 'PAY CODE', 'NO.',
-                     'DIA.', 'GRADE', 'SITE/SHOP', 'MEMBERS LOCATION')
+                     'ASSEMBLY BOLT LIST', 'BOLT LIST', 'PAY CODE', 'PAY CAT',
+                     'PART LIST', 'NO.', 'DIA.', 'GRADE', 'SITE/SHOP',
+                     'MEMBERS LOCATION')
     _TITLE_KEYWORDS = ('STEEL STRUCTURE DRAWING', 'PROJECT DOCUMENT',
                        'VENDOR DOCUMENT', 'DOCUMENT CLASS', 'REVISION',
                        'ISSUE FOR', 'DRAWN BY', 'CHECKED', 'APPROVED')
@@ -628,20 +985,43 @@ def _annotate_one(doc, welds):
             if _sub.dxftype() == 'LINE':
                 _tx.extend([_sub.dxf.start.x, _sub.dxf.end.x])
                 _ty.extend([_sub.dxf.start.y, _sub.dxf.end.y])
+            elif _sub.dxftype() == 'LWPOLYLINE':
+                try:
+                    for _v in _sub.get_points():
+                        _tx.append(_v[0]); _ty.append(_v[1])
+                except Exception:
+                    pass
             elif _sub.dxftype() in ('TEXT', 'MTEXT', 'ATTRIB', 'ATTDEF'):
                 try:
-                    _tx.append(_sub.dxf.insert.x)
-                    _ty.append(_sub.dxf.insert.y)
-                    _txt = (_sub.dxf.text if hasattr(_sub.dxf, 'text') else '') or ''
-                    _texts.append(_txt.upper())
-                except: pass
+                    _ix = _sub.dxf.insert.x
+                    _iy = _sub.dxf.insert.y
+                    if _sub.dxftype() == 'MTEXT':
+                        _th = getattr(_sub.dxf, 'char_height', 2.0)
+                        _txt = (_sub.text if hasattr(_sub, 'text') else '') or ''
+                    else:
+                        _th = getattr(_sub.dxf, 'height', 2.0)
+                        _txt = (_sub.dxf.text if hasattr(_sub.dxf, 'text') else '') or ''
+                    _txt_u = _txt.upper()
+                    _texts.append(_txt_u)
+                    _tw = _th * max(len(_txt.strip()), 2) * 0.6
+                    _tx.extend([_ix, _ix + _tw])
+                    _ty.extend([_iy, _iy + _th])
+                except Exception:
+                    pass
         if not _tx:
             continue
         _all_text = ' '.join(_texts)
         _bom_hits = sum(1 for _kw in _BOM_KEYWORDS if _kw in _all_text)
         _title_hits = sum(1 for _kw in _TITLE_KEYWORDS if _kw in _all_text)
-        if _e.dxf.name.startswith('Unknown-') or (_bom_hits >= 1 and _title_hits == 0):
-            _table_hatch.append((min(_tx), max(_tx), min(_ty), max(_ty)))
+        _is_bom = (_bom_hits >= 2 and _title_hits == 0) or (
+            _e.dxf.name.startswith('Unknown-') and _bom_hits >= 1 and _title_hits == 0)
+        _is_title = _title_hits >= 1
+        _is_bolt = 'BOLT LIST' in _all_text
+        if _is_bom or _is_title or _is_bolt or (
+                _e.dxf.name.startswith('Unknown-') and (_bom_hits >= 1 or _title_hits >= 1)):
+            _m = BOM_MARGIN
+            _table_hatch.append((min(_tx) - _m, max(_tx) + _m,
+                                 min(_ty) - _m, max(_ty) + _m))
 
     # 处理每个视图
     for view_id in sorted(welds_by_view.keys(), key=lambda v: int(v) if v.isdigit() else 0):
@@ -656,6 +1036,8 @@ def _annotate_one(doc, welds):
         # 加入表格阻挡
         if _table_hatch:
             hatch_bboxes = hatch_bboxes + _table_hatch
+        if hatch_bboxes:
+            _global_hatch_bboxes.extend(hatch_bboxes)
         part_only = view_part_bboxes.get(view_id)
         _annotate_view(msp, vw, view_id, bbox, centroids, f_counter, w_counter, part_lines,
                        draw_bbox, hatch_bboxes=hatch_bboxes if hatch_bboxes else None,
@@ -670,10 +1052,12 @@ def _annotate_one(doc, welds):
         _annotate_welds_no_view(msp, welds_no_view, welds, f_counter, w_counter)
 
     _fix_global_label_overlaps(msp, _collect_part_lines(doc), draw_bbox,
-                               _global_wm_text_bboxes, _drawn_label_registry)
+                               _global_wm_text_bboxes, _drawn_label_registry,
+                               hatch_bboxes=_global_hatch_bboxes)
 
     _enforce_inner_frame_labels(msp, draw_bbox, _collect_part_lines(doc),
-                                _global_wm_text_bboxes, _drawn_label_registry)
+                                _global_wm_text_bboxes, _drawn_label_registry,
+                                hatch_bboxes=_global_hatch_bboxes)
 
     # Zoom modelspace view to extents including all labels
     _set_model_view_to_extents(doc)
@@ -787,7 +1171,8 @@ def _annotate_view(msp, welds, view_id, bbox, part_centroids, f_counter, w_count
                 bx0, bx1 = ins.x - w, ins.x
             else:
                 bx0, bx1 = ins.x, ins.x + w
-            cross_view_text_bboxes.append((bx0, bx1, ins.y, ins.y + LABEL_HEIGHT))
+            _eh = getattr(e.dxf, 'char_height', LABEL_HEIGHT)
+            cross_view_text_bboxes.append((bx0, bx1, ins.y, ins.y + _eh))
     if wm_text_bboxes is None:
         wm_text_bboxes = []
     pos_welds = [(w, w['dxf_pos']) for w in welds if w.get('dxf_pos')]
@@ -822,6 +1207,9 @@ def _annotate_view(msp, welds, view_id, bbox, part_centroids, f_counter, w_count
 
     part_view_bbox = part_bbox if part_bbox else (vx0, vy0, vx1, vy1)
     _down_bbox = part_only_bbox if part_only_bbox else part_view_bbox
+    # 空白环评分必须用 Part-only bbox，不是整视图框
+    _score_part_bbox = part_only_bbox if part_only_bbox else part_view_bbox
+    _view_line_grid = _build_line_grid(lines, 50)
     _vcx = cx
     _vcy = cy
     _N_SECTORS = 12
@@ -890,10 +1278,458 @@ def _annotate_view(msp, welds, view_id, bbox, part_centroids, f_counter, w_count
     if part_centroids and len(set(part_centroids)) >= 2:
         _redistribute_groups(groups, part_centroids, (vx0, vy0, vx1, vy1))
 
+    # 密集视图/局部簇：缩小字号（按组局部密度，整视图取最密作为下界）
+    _group_heights, _weld_positions = _group_label_heights(groups)
+    _view_h = min(_group_heights) if _group_heights else LABEL_HEIGHT
+    _set_active_label_height(_view_h)
+
+    try:
+        _annotate_view_place(
+            msp, groups, no_pos_welds, lines, text_bboxes, circles,
+            cross_view_text_bboxes, wm_text_bboxes, hatch_bboxes,
+            other_view_bboxes, other_view_part_bboxes,
+            vx0, vy0, vx1, vy1, cx, cy, draw_bbox, bbox,
+            _down_bbox, _score_part_bbox, _view_line_grid,
+            f_counter, w_counter, sampled_labels, drawn_registry,
+            group_heights=_group_heights, weld_positions=_weld_positions)
+    finally:
+        _set_active_label_height(LABEL_HEIGHT)
+
+
+def _fix_codirectional_neighbors(placements, placed_bboxes, placed_text_bboxes,
+                                   lines, text_bboxes, circles,
+                                   vx0, vy0, vx1, vy1, draw_bbox, hatch_bboxes,
+                                   other_view_bboxes, other_view_part_bboxes,
+                                   wm_text_bboxes, cx, cy, part_bbox, down_bbox,
+                                   line_grid, cross_view_text_bboxes, prefer_by_gi):
+    """If near neighbors share nearly the same leader angle, re-search the later one."""
+    n = len(placements)
+    if n < 2:
+        return
+
+    def _near_angles(idx):
+        pt = placements[idx][3]
+        out = []
+        for k in range(n):
+            if k == idx:
+                continue
+            pk, ak = placements[k][3], placements[k][6]
+            if math.hypot(pk[0] - pt[0], pk[1] - pt[1]) <= CLUSTER_RADIUS:
+                out.append((pk, ak))
+        return out
+
+    def _gap_ok(ang, peer_ang, idx, require_all):
+        if _angle_delta_deg(ang, peer_ang) < DIVERGE_ANGLE_MIN:
+            return False
+        if not require_all:
+            return True
+        for _pk, ak in _near_angles(idx):
+            if _angle_delta_deg(ang, ak) < DIVERGE_ANGLE_MIN:
+                return False
+        return True
+
+    # 近邻过多时：仍做一轮，但收窄搜索
+    _dense = n > 20
+    for _round in range(2 if not _dense else 1):
+        moved = False
+        for i in range(n):
+            for j in range(i + 1, n):
+                pi, agi = placements[i][3], placements[i][6]
+                pj, agj = placements[j][3], placements[j][6]
+                if math.hypot(pi[0] - pj[0], pi[1] - pj[1]) > CLUSTER_RADIUS:
+                    continue
+                if _angle_delta_deg(agi, agj) >= DIVERGE_ANGLE_MIN:
+                    continue
+                # rewrite the later placement toward same-half complement of the earlier one
+                target, other = j, i
+                gt, itt, lbt, pt, ltt, dst, agt = placements[target][:7]
+                go, _, _, po, _, _, ago = placements[other][:7]
+                pref_for_pt, pref_for_po = _diverge_prefer_angs(pt, po, cx, cy)
+                hq = _weld_home_quadrant(pt[0], pt[1], cx, cy)
+                nbrs = _near_angles(target)
+                nbr_angs = [a for _p, a in nbrs]
+                _comp = _halfplane_complement(ago)
+                prefer_try = [
+                    _comp,
+                    pref_for_pt,
+                    _maximin_corner_ang(nbr_angs, prefer=_comp, home_q=hq),
+                ]
+                # same-half seeds
+                _half_seeds = (135.0, 225.0) if hq in (2, 3) else (65.0, 295.0)
+                for a in _half_seeds:
+                    if a not in prefer_try:
+                        prefer_try.append(a)
+                for da in (40, -40, 55, -55):
+                    prefer_try.append((ago + da) % 360)
+                if _dense:
+                    prefer_try = prefer_try[:5]
+                is_pair = (gt == 'pair')
+                others_bb = [placed_bboxes[k] for k in range(n) if k != target]
+                others_tb = ([placed_text_bboxes[k] for k in range(n) if k != target]
+                             + list(cross_view_text_bboxes or []))
+                _max_len = MAX_DIAG_LEN_PAIR if is_pair else MAX_DIAG_LEN
+                applied = False
+                for require_all in (True, False):
+                    for prefer in prefer_try:
+                        _, nd, na = _search_placement(
+                            pt, lines, text_bboxes, circles, others_bb, others_tb,
+                            vx0, vy0, vx1, vy1, draw_bbox, is_pair=is_pair,
+                            hatch_bboxes=hatch_bboxes, other_view_bboxes=other_view_bboxes,
+                            home_q=hq, quad_cx=cx, quad_cy=cy,
+                            other_view_part_bboxes=other_view_part_bboxes,
+                            label_text=ltt, wm_text_bboxes=wm_text_bboxes,
+                            part_bbox=part_bbox,
+                            prefer_down=False,
+                            line_grid=line_grid, allow_adjacent=True,
+                            prefer_ang=prefer,
+                            neighbor_angles=nbrs,
+                            max_dist=_max_len, cross_ok=False)
+                        if not _gap_ok(na, ago, target, require_all):
+                            found = False
+                            for dist in range(PREFERRED_DIAG_MIN, min(_max_len, 36) + 1, 4):
+                                for da in (0, 12, -12, 25, -25, 40, -40):
+                                    cand_a = (prefer + da) % 360
+                                    if not _gap_ok(cand_a, ago, target, require_all):
+                                        continue
+                                    if not any(_angle_in_quadrant(cand_a, q)
+                                               for q in _allowed_quadrants(hq, allow_adjacent=True)):
+                                        continue
+                                    r = math.radians(cand_a)
+                                    if abs(math.sin(r)) < math.sin(math.radians(ANGLE_MIN)):
+                                        continue
+                                    if abs(math.cos(r)) < math.cos(math.radians(ANGLE_MAX)):
+                                        continue
+                                    cand_t = _text_bbox(pt, dist, cand_a, ltt, is_pair=is_pair)
+                                    if _text_near_lines(cand_t, lines):
+                                        continue
+                                    if draw_bbox is not None and not _text_in_inner_frame(cand_t, draw_bbox):
+                                        continue
+                                    if any(_text_overlaps(cand_t, otb, OVERLAP_MARGIN) for otb in others_tb):
+                                        continue
+                                    if hatch_bboxes and any(
+                                            _text_overlaps(cand_t, htb, OVERLAP_MARGIN)
+                                            for htb in hatch_bboxes):
+                                        continue
+                                    nd, na = dist, cand_a
+                                    found = True
+                                    break
+                                if found:
+                                    break
+                            if not found:
+                                continue
+                        ttbb = _text_bbox(pt, nd, na, ltt, is_pair=is_pair)
+                        if _text_near_lines(ttbb, lines):
+                            continue
+                        if draw_bbox is not None and not _text_in_inner_frame(ttbb, draw_bbox):
+                            continue
+                        if not _gap_ok(na, ago, target, require_all):
+                            continue
+                        tnbb = (_paired_bbox(pt, nd, na, ltt) if is_pair
+                                else _single_bbox(pt, nd, na, ltt))
+                        placements[target] = (gt, itt, lbt, pt, ltt, nd, na, tnbb)
+                        placed_bboxes[target] = (min(tnbb[0], pt[0]) - 1, max(tnbb[1], pt[0]) + 1,
+                                                 min(tnbb[2], pt[1]) - 1, max(tnbb[3], pt[1]) + 1)
+                        placed_text_bboxes[target] = ttbb
+                        applied = True
+                        moved = True
+                        break
+                    if applied:
+                        break
+                if not applied:
+                    continue
+        if not moved:
+            break
+
+
+def _fix_inverted_label_order(placements, placed_bboxes, placed_text_bboxes,
+                                lines, text_bboxes, circles,
+                                vx0, vy0, vx1, vy1, draw_bbox, hatch_bboxes,
+                                other_view_bboxes, other_view_part_bboxes,
+                                wm_text_bboxes, cx, cy, part_bbox, down_bbox,
+                                line_grid, cross_view_text_bboxes):
+    """焊点上下相对、标签 Y 颠倒时，把后放者重搜回归属象限偏好角。"""
+    n = len(placements)
+    for i in range(n):
+        for j in range(i + 1, n):
+            pi, pj = placements[i][3], placements[j][3]
+            if math.hypot(pi[0] - pj[0], pi[1] - pj[1]) > CLUSTER_RADIUS * 1.8:
+                continue
+            dy_w = pi[1] - pj[1]
+            if abs(dy_w) < 4:
+                continue
+            ci = (placed_text_bboxes[i][2] + placed_text_bboxes[i][3]) / 2
+            cj = (placed_text_bboxes[j][2] + placed_text_bboxes[j][3]) / 2
+            if (dy_w > 0 and ci >= cj - 1) or (dy_w < 0 and ci <= cj + 1):
+                continue  # 顺序正常
+            # 颠倒：重搜 j（后放）到其 home 偏好角
+            target = j
+            gt, itt, lbt, pt, ltt, dst, agt = placements[target][:7]
+            is_pair = (gt == 'pair')
+            hq = _weld_home_quadrant(pt[0], pt[1], cx, cy)
+            prefer = {1: 55, 2: 135, 3: 225, 4: 315}.get(hq, agt)
+            others_bb = [placed_bboxes[k] for k in range(n) if k != target]
+            others_tb = ([placed_text_bboxes[k] for k in range(n) if k != target]
+                         + list(cross_view_text_bboxes or []))
+            _max_len = MAX_DIAG_LEN_PAIR if is_pair else MAX_DIAG_LEN
+            _, nd, na = _search_placement(
+                pt, lines, text_bboxes, circles, others_bb, others_tb,
+                vx0, vy0, vx1, vy1, draw_bbox, is_pair=is_pair,
+                hatch_bboxes=hatch_bboxes, other_view_bboxes=other_view_bboxes,
+                home_q=hq, quad_cx=cx, quad_cy=cy,
+                other_view_part_bboxes=other_view_part_bboxes,
+                label_text=ltt, wm_text_bboxes=wm_text_bboxes,
+                part_bbox=part_bbox,
+                prefer_down=_prefer_downward_weld(pt[0], pt[1], down_bbox) if down_bbox else False,
+                line_grid=line_grid, allow_adjacent=True,
+                prefer_ang=prefer, max_dist=_max_len, cross_ok=False)
+            ttbb = _text_bbox(pt, nd, na, ltt, is_pair=is_pair)
+            cy_new = (ttbb[2] + ttbb[3]) / 2
+            # 接受能纠正相对顺序的位姿
+            if (dy_w > 0 and cy_new < cj) or (dy_w < 0 and cy_new > cj):
+                nbb = (_paired_bbox(pt, nd, na, ltt) if is_pair
+                       else _single_bbox(pt, nd, na, ltt))
+                placements[target] = (gt, itt, lbt, pt, ltt, nd, na, nbb)
+                placed_bboxes[target] = nbb
+                placed_text_bboxes[target] = ttbb
+
+
+def _separate_close_text_labels(placements, placed_bboxes, placed_text_bboxes,
+                                lines, text_bboxes, circles,
+                                vx0, vy0, vx1, vy1, draw_bbox, hatch_bboxes,
+                                other_view_bboxes, other_view_part_bboxes,
+                                wm_text_bboxes, cx, cy, part_bbox, down_bbox,
+                                line_grid, cross_view_text_bboxes):
+    """强制拉开文字中心过近或 AABB 重叠的标签（含 W1/W5）。"""
+    n = len(placements)
+    min_cy = max(_lh() * 1.5, 2.8)
+    for _round in range(5):
+        moved = False
+        for i in range(n):
+            for j in range(i + 1, n):
+                tba, tbb = placed_text_bboxes[i], placed_text_bboxes[j]
+                ox = max(0, min(tba[1], tbb[1]) - max(tba[0], tbb[0]))
+                oy = max(0, min(tba[3], tbb[3]) - max(tba[2], tbb[2]))
+                cxi = (tba[0] + tba[1]) / 2
+                cyi = (tba[2] + tba[3]) / 2
+                cxj = (tbb[0] + tbb[1]) / 2
+                cyj = (tbb[2] + tbb[3]) / 2
+                pi, pj = placements[i][3], placements[j][3]
+                weld_near = math.hypot(pi[0] - pj[0], pi[1] - pj[1]) < 8.0
+                x_close = abs(cxi - cxj) < _lh() * 4.0
+                y_close = abs(cyi - cyj) < min_cy
+                overlap = ox > 0 and oy > 0
+                li = str(placements[i][4])
+                lj = str(placements[j][4])
+                both_w = li.startswith('W') and lj.startswith('W')
+                if not (overlap or (x_close and y_close) or
+                        (both_w and x_close and abs(cyi - cyj) < min_cy * 1.4) or
+                        (weld_near and x_close and y_close)):
+                    continue
+                # 后放者重搜；近焊点 / W 对强制上下半区分向
+                target = j
+                gt, itt, lbt, pt, ltt, dst, agt = placements[target][:7]
+                is_pair = (gt == 'pair')
+                hq = _weld_home_quadrant(pt[0], pt[1], cx, cy)
+                others_bb = [placed_bboxes[k] for k in range(n) if k != target]
+                others_tb = ([placed_text_bboxes[k] for k in range(n) if k != target]
+                             + list(cross_view_text_bboxes or []))
+                _max_len = MAX_DIAG_LEN_PAIR if is_pair else MAX_DIAG_LEN
+                # 同半区上下角强制分向
+                if hq in (1, 4):
+                    _up, _dn = 55.0, 315.0
+                else:
+                    _up, _dn = 135.0, 225.0
+                # 后放者：若 peer 偏上则自己走下，反之
+                if cyj >= cyi:
+                    prefer_list = [_dn, _dn + 15, _dn - 15, _up + 20, agt + 40, agt - 40]
+                else:
+                    prefer_list = [_up, _up + 15, _up - 15, _dn - 20, agt + 40, agt - 40]
+                if both_w or weld_near:
+                    # W / 近焊点：先试对面半区角
+                    prefer_list = [_dn if cyj >= cyi else _up] + prefer_list
+                applied = False
+                for prefer in prefer_list:
+                    _, nd, na = _search_placement(
+                        pt, lines, text_bboxes, circles, others_bb, others_tb,
+                        vx0, vy0, vx1, vy1, draw_bbox, is_pair=is_pair,
+                        hatch_bboxes=hatch_bboxes, other_view_bboxes=other_view_bboxes,
+                        home_q=hq, quad_cx=cx, quad_cy=cy,
+                        other_view_part_bboxes=other_view_part_bboxes,
+                        label_text=ltt, wm_text_bboxes=wm_text_bboxes,
+                        part_bbox=part_bbox,
+                        prefer_down=True,
+                        line_grid=line_grid, allow_adjacent=True,
+                        prefer_ang=prefer % 360, max_dist=_max_len, cross_ok=False)
+                    ttbb = _text_bbox(pt, nd, na, ltt, is_pair=is_pair)
+                    if _text_overlaps(ttbb, tba, OVERLAP_MARGIN):
+                        continue
+                    cy_new = (ttbb[2] + ttbb[3]) / 2
+                    cx_new = (ttbb[0] + ttbb[1]) / 2
+                    if abs(cy_new - cyi) < min_cy and abs(cx_new - cxi) < _lh() * 3.5:
+                        continue
+                    nbb = (_paired_bbox(pt, nd, na, ltt) if is_pair
+                           else _single_bbox(pt, nd, na, ltt))
+                    placements[target] = (gt, itt, lbt, pt, ltt, nd, na, nbb)
+                    placed_bboxes[target] = nbb
+                    placed_text_bboxes[target] = ttbb
+                    applied = True
+                    moved = True
+                    break
+                if applied:
+                    continue
+                # 硬拉开：同半区对面角 + 逐步加长，忽略部分几何近线（仍保内框/互不重叠）
+                _force_ang = _dn if cyj >= cyi else _up
+                for nd in range(PREFERRED_DIAG_MIN, _max_len + 1, 2):
+                    for da in (0, 8, -8, 15, -15, 25, -25):
+                        na = _force_ang + da
+                        if not any(_angle_in_quadrant(na, q) for q in
+                                   _allowed_quadrants(hq, allow_adjacent=True)):
+                            continue
+                        r = math.radians(na % 360)
+                        if abs(math.sin(r)) < math.sin(math.radians(ANGLE_MIN)):
+                            continue
+                        if abs(math.cos(r)) < math.cos(math.radians(ANGLE_MAX)):
+                            continue
+                        ttbb = _text_bbox(pt, nd, na, ltt, is_pair=is_pair)
+                        if draw_bbox is not None and not _text_in_inner_frame(ttbb, draw_bbox):
+                            continue
+                        if _text_overlaps(ttbb, tba, OVERLAP_MARGIN):
+                            continue
+                        if any(_text_overlaps(ttbb, placed_text_bboxes[k], OVERLAP_MARGIN)
+                               for k in range(n) if k not in (i, target)):
+                            continue
+                        cy_new = (ttbb[2] + ttbb[3]) / 2
+                        if abs(cy_new - cyi) < min_cy:
+                            continue
+                        nbb = (_paired_bbox(pt, nd, na, ltt) if is_pair
+                               else _single_bbox(pt, nd, na, ltt))
+                        placements[target] = (gt, itt, lbt, pt, ltt, nd, na, nbb)
+                        placed_bboxes[target] = nbb
+                        placed_text_bboxes[target] = ttbb
+                        moved = True
+                        applied = True
+                        break
+                    if applied:
+                        break
+        if not moved:
+            break
+
+
+def _relocate_text_on_geometry(placements, placed_bboxes, placed_text_bboxes,
+                               lines, text_bboxes, circles,
+                               vx0, vy0, vx1, vy1, draw_bbox, hatch_bboxes,
+                               other_view_bboxes, other_view_part_bboxes,
+                               wm_text_bboxes, cx, cy, part_bbox, down_bbox,
+                               line_grid, cross_view_text_bboxes):
+    """Re-place labels whose text still sits on part geometry; prefer longer leaders."""
+    n = len(placements)
+    for i in range(n):
+        gi, iti, lbi, pi, lti, dsi, agi = placements[i][:7]
+        is_pair = (gi == 'pair')
+        tbb = placed_text_bboxes[i]
+        if not _text_near_lines(tbb, lines):
+            continue
+        hq = _weld_home_quadrant(pi[0], pi[1], cx, cy)
+        others_bb = [placed_bboxes[k] for k in range(n) if k != i]
+        others_tb = ([placed_text_bboxes[k] for k in range(n) if k != i]
+                     + list(cross_view_text_bboxes or []))
+        neighbor_angles = [(placements[k][3], placements[k][6])
+                           for k in range(n) if k != i]
+        _max_len = MAX_DIAG_LEN_PAIR if is_pair else MAX_DIAG_LEN
+        # keep divergence from near neighbors: only accept poses that stay away
+        def _keeps_diverge(ang):
+            for npos, nang in neighbor_angles:
+                if math.hypot(npos[0] - pi[0], npos[1] - pi[1]) > CLUSTER_RADIUS:
+                    continue
+                if _angle_delta_deg(ang, nang) < DIVERGE_ANGLE_MIN:
+                    return False
+            return True
+
+        _, nd, na = _search_placement(
+            pi, lines, text_bboxes, circles, others_bb, others_tb,
+            vx0, vy0, vx1, vy1, draw_bbox, is_pair=is_pair,
+            hatch_bboxes=hatch_bboxes, other_view_bboxes=other_view_bboxes,
+            home_q=hq, quad_cx=cx, quad_cy=cy,
+            other_view_part_bboxes=other_view_part_bboxes,
+            label_text=lti, wm_text_bboxes=wm_text_bboxes,
+            part_bbox=part_bbox,
+            prefer_down=False,
+            line_grid=line_grid, allow_adjacent=True,
+            prefer_ang=agi, neighbor_angles=neighbor_angles,
+            max_dist=_max_len, cross_ok=False)
+        ttbb = _text_bbox(pi, nd, na, lti, is_pair=is_pair)
+        if _text_near_lines(ttbb, lines) or not _keeps_diverge(na):
+            # brute: lengthen first, keep diverge from neighbors
+            fixed = False
+            for dist in range(max(PREFERRED_DIAG_SOFT, int(dsi) + 4), _max_len + 1, 2):
+                for da in (0, 8, -8, 15, -15, 25, -25, 35, -35, 45, -45):
+                    ang = (agi + da) % 360
+                    r = math.radians(ang)
+                    if abs(math.sin(r)) < math.sin(math.radians(ANGLE_MIN)):
+                        continue
+                    if abs(math.cos(r)) < math.cos(math.radians(ANGLE_MAX)):
+                        continue
+                    if not any(_angle_in_quadrant(ang, q)
+                               for q in _allowed_quadrants(hq, allow_adjacent=True)):
+                        continue
+                    if not _keeps_diverge(ang):
+                        continue
+                    cand = _text_bbox(pi, dist, float(ang), lti, is_pair=is_pair)
+                    if _text_near_lines(cand, lines):
+                        continue
+                    if draw_bbox is not None and not _text_in_inner_frame(cand, draw_bbox):
+                        continue
+                    _ov = False
+                    for otb in others_tb:
+                        if _text_overlaps(cand, otb, OVERLAP_MARGIN):
+                            _ov = True
+                            break
+                    if _ov:
+                        continue
+                    if hatch_bboxes:
+                        for htb in hatch_bboxes:
+                            if _text_overlaps(cand, htb, OVERLAP_MARGIN):
+                                _ov = True
+                                break
+                    if _ov:
+                        continue
+                    nd, na, ttbb = dist, float(ang), cand
+                    fixed = True
+                    break
+                if fixed:
+                    break
+            if not fixed:
+                continue
+        elif draw_bbox is not None and not _text_in_inner_frame(ttbb, draw_bbox):
+            continue
+        if not _keeps_diverge(na):
+            continue
+        tnbb = (_paired_bbox(pi, nd, na, lti) if is_pair
+                else _single_bbox(pi, nd, na, lti))
+        placements[i] = (gi, iti, lbi, pi, lti, nd, na, tnbb)
+        placed_bboxes[i] = (min(tnbb[0], pi[0]) - 1, max(tnbb[1], pi[0]) + 1,
+                            min(tnbb[2], pi[1]) - 1, max(tnbb[3], pi[1]) + 1)
+        placed_text_bboxes[i] = ttbb
+
+
+def _annotate_view_place(msp, groups, no_pos_welds, lines, text_bboxes, circles,
+                         cross_view_text_bboxes, wm_text_bboxes, hatch_bboxes,
+                         other_view_bboxes, other_view_part_bboxes,
+                         vx0, vy0, vx1, vy1, cx, cy, draw_bbox, bbox,
+                         _down_bbox, _score_part_bbox, _view_line_grid,
+                         f_counter, w_counter, sampled_labels, drawn_registry,
+                         group_heights=None, weld_positions=None):
+    """Placement + draw body for one view (runs under active label height)."""
     placed_bboxes = []          # 引线+文字整体包围盒
     placed_text_bboxes = []     # 纯文字包围盒（用于文字重叠检测）
     _placements = []
     _quadrant_used_angles = {1: [], 2: [], 3: [], 4: []}
+    _placed_angles = []         # [(weld_pos, angle), ...] for diverge scoring
+    if group_heights is None:
+        group_heights = [_lh()] * len(groups)
+    if weld_positions is None:
+        weld_positions = [(items[0][1][0], items[0][1][1]) for _, items in groups]
+    _prefer_by_gi, _partner_by_gi = _pair_near_groups(groups, cx, cy)
 
     def _text_obstacles():
         return cross_view_text_bboxes + placed_text_bboxes
@@ -905,18 +1741,46 @@ def _annotate_view(msp, welds, view_id, bbox, part_centroids, f_counter, w_count
             return a1
         return a1 - (a1 - a0) * n / (n + 1)
 
-    for gtype, items in groups:
-        _hint = None
+    for _gi, (gtype, items) in enumerate(groups):
+        _set_active_label_height(group_heights[_gi] if _gi < len(group_heights) else _lh())
+        _prefer_ang = _prefer_by_gi.get(_gi)
+        _partner = _partner_by_gi.get(_gi)
+        if (_partner is not None and _partner < len(_placed_angles)
+                and _gi in _prefer_by_gi):
+            # partner already placed → same-half opposite
+            _prefer_ang = _halfplane_complement(_placed_angles[_partner][1])
+        if _prefer_ang is None and _quadrant_used_angles:
+            pass  # filled below after home_q known
+        _diverge = _gi in _prefer_by_gi
         if gtype == 'pair':
             ww_a, wp_a = items[0]
             ww_b, wp_b = items[1]
             labels = [_next_label(ww_a, f_counter, w_counter),
                       _next_label(ww_b, f_counter, w_counter)]
             _label_txt = _placement_label_text('pair', labels)
-            _prefer_down = _prefer_downward_weld(wp_a[0], wp_a[1], _down_bbox)
+            # prefer 与近邻已放角度过近 → 同半面 maximin 扇出
             _home_q = _weld_home_quadrant(wp_a[0], wp_a[1], cx, cy)
-            if _quadrant_used_angles.get(_home_q):
-                _hint = _next_hint_for_quadrant(_home_q, _quadrant_used_angles[_home_q])
+            if _prefer_ang is not None and _placed_angles:
+                _nangs = []
+                _confl = False
+                for npos, nang in _placed_angles:
+                    nd = math.hypot(npos[0] - wp_a[0], npos[1] - wp_a[1])
+                    if nd <= CLUSTER_RADIUS and nd > 0.5:
+                        _nangs.append(nang)
+                        if _angle_delta_deg(_prefer_ang, nang) < DIVERGE_ANGLE_MIN:
+                            _confl = True
+                if _confl:
+                    _prefer_ang = _maximin_corner_ang(
+                        _nangs, prefer=_halfplane_complement(_nangs[0]),
+                        home_q=_home_q)
+                    _diverge = True
+            _prefer_down = _prefer_downward_weld(wp_a[0], wp_a[1], _down_bbox)
+            _dense_q = len(_quadrant_used_angles.get(_home_q, [])) >= 2
+            if _prefer_ang is None and _quadrant_used_angles.get(_home_q):
+                _prefer_ang = _next_hint_for_quadrant(_home_q, _quadrant_used_angles[_home_q])
+            _allow_adj = _dense_q or _diverge
+            # 近距分向时勿用 prefer_down 评分偏向，避免把上下互补拉成同向下
+            _pd_use = _prefer_down and not _diverge
             _, diag_len, angle = _search_placement(
                 wp_a, lines, text_bboxes, circles, placed_bboxes,
                 _text_obstacles(), vx0, vy0, vx1, vy1, draw_bbox, is_pair=True,
@@ -924,27 +1788,49 @@ def _annotate_view(msp, welds, view_id, bbox, part_centroids, f_counter, w_count
                 home_q=_home_q, quad_cx=cx, quad_cy=cy,
                 other_view_part_bboxes=other_view_part_bboxes,
                 label_text=_label_txt, wm_text_bboxes=wm_text_bboxes,
-                part_bbox=part_view_bbox, prefer_down=_prefer_down)
-            diag_len, angle = _maybe_retry_downward_placement(
-                wp_a, diag_len, angle, _label_txt, True,
-                lines, text_bboxes, circles, placed_bboxes, _text_obstacles(),
-                vx0, vy0, vx1, vy1, draw_bbox, hatch_bboxes, other_view_bboxes,
-                _home_q, cx, cy, other_view_part_bboxes, wm_text_bboxes,
-                part_view_bbox, _prefer_down)
+                part_bbox=_score_part_bbox, prefer_down=_pd_use,
+                line_grid=_view_line_grid, allow_adjacent=_allow_adj,
+                prefer_ang=_prefer_ang, neighbor_angles=_placed_angles,
+                cross_ok=False)
+            if not _diverge:
+                diag_len, angle = _maybe_retry_downward_placement(
+                    wp_a, diag_len, angle, _label_txt, True,
+                    lines, text_bboxes, circles, placed_bboxes, _text_obstacles(),
+                    vx0, vy0, vx1, vy1, draw_bbox, hatch_bboxes, other_view_bboxes,
+                    _home_q, cx, cy, other_view_part_bboxes, wm_text_bboxes,
+                    _score_part_bbox, _prefer_down, line_grid=_view_line_grid)
             bx0, bx1, by0, by1 = _paired_bbox(wp_a, diag_len, angle, _label_txt)
             bbox = (min(bx0, wp_a[0])-1, max(bx1, wp_a[0])+1,
                     min(by0, wp_a[1])-1, max(by1, wp_a[1])+1)
             _placements.append((gtype, items, labels, wp_a, _label_txt, diag_len, angle, bbox))
             placed_bboxes.append(bbox)
             placed_text_bboxes.append(_text_bbox(wp_a, diag_len, angle, _label_txt, is_pair=True))
+            _placed_angles.append((wp_a, angle))
         else:
             ww, wp = items[0]
             label = _next_label(ww, f_counter, w_counter)
             _label_txt = label
-            _prefer_down = _prefer_downward_weld(wp[0], wp[1], _down_bbox)
             _home_q = _weld_home_quadrant(wp[0], wp[1], cx, cy)
-            if _quadrant_used_angles.get(_home_q):
-                _hint = _next_hint_for_quadrant(_home_q, _quadrant_used_angles[_home_q])
+            if _prefer_ang is not None and _placed_angles:
+                _nangs = []
+                _confl = False
+                for npos, nang in _placed_angles:
+                    nd = math.hypot(npos[0] - wp[0], npos[1] - wp[1])
+                    if nd <= CLUSTER_RADIUS and nd > 0.5:
+                        _nangs.append(nang)
+                        if _angle_delta_deg(_prefer_ang, nang) < DIVERGE_ANGLE_MIN:
+                            _confl = True
+                if _confl:
+                    _prefer_ang = _maximin_corner_ang(
+                        _nangs, prefer=_halfplane_complement(_nangs[0]),
+                        home_q=_home_q)
+                    _diverge = True
+            _prefer_down = _prefer_downward_weld(wp[0], wp[1], _down_bbox)
+            _dense_q = len(_quadrant_used_angles.get(_home_q, [])) >= 2
+            if _prefer_ang is None and _quadrant_used_angles.get(_home_q):
+                _prefer_ang = _next_hint_for_quadrant(_home_q, _quadrant_used_angles[_home_q])
+            _allow_adj = _dense_q or _diverge
+            _pd_use = _prefer_down and not _diverge
             _, diag_len, angle = _search_placement(
                 wp, lines, text_bboxes, circles, placed_bboxes,
                 _text_obstacles(), vx0, vy0, vx1, vy1, draw_bbox,
@@ -952,56 +1838,116 @@ def _annotate_view(msp, welds, view_id, bbox, part_centroids, f_counter, w_count
                 home_q=_home_q, quad_cx=cx, quad_cy=cy,
                 other_view_part_bboxes=other_view_part_bboxes,
                 label_text=_label_txt, wm_text_bboxes=wm_text_bboxes,
-                part_bbox=part_view_bbox, prefer_down=_prefer_down)
-            diag_len, angle = _maybe_retry_downward_placement(
-                wp, diag_len, angle, _label_txt, False,
-                lines, text_bboxes, circles, placed_bboxes, _text_obstacles(),
-                vx0, vy0, vx1, vy1, draw_bbox, hatch_bboxes, other_view_bboxes,
-                _home_q, cx, cy, other_view_part_bboxes, wm_text_bboxes,
-                part_view_bbox, _prefer_down)
+                part_bbox=_score_part_bbox, prefer_down=_pd_use,
+                line_grid=_view_line_grid, allow_adjacent=_allow_adj,
+                prefer_ang=_prefer_ang, neighbor_angles=_placed_angles,
+                cross_ok=False)
+            if not _diverge:
+                diag_len, angle = _maybe_retry_downward_placement(
+                    wp, diag_len, angle, _label_txt, False,
+                    lines, text_bboxes, circles, placed_bboxes, _text_obstacles(),
+                    vx0, vy0, vx1, vy1, draw_bbox, hatch_bboxes, other_view_bboxes,
+                    _home_q, cx, cy, other_view_part_bboxes, wm_text_bboxes,
+                    _score_part_bbox, _prefer_down, line_grid=_view_line_grid)
             bx0, bx1, by0, by1 = _single_bbox(wp, diag_len, angle, _label_txt)
             bbox = (min(bx0, wp[0])-1, max(bx1, wp[0])+1,
                     min(by0, wp[1])-1, max(by1, wp[1])+1)
             _placements.append((gtype, items, [label], wp, _label_txt, diag_len, angle, bbox))
             placed_bboxes.append(bbox)
             placed_text_bboxes.append(_text_bbox(wp, diag_len, angle, _label_txt, is_pair=False))
+            _placed_angles.append((wp, angle))
 
         _quadrant_used_angles.setdefault(_home_q, []).append(angle)
+
+    # 同向近邻轻量纠偏：角差过小则对较低/后放者强制互补 prefer_ang 重搜
+    _fix_codirectional_neighbors(
+        _placements, placed_bboxes, placed_text_bboxes, lines, text_bboxes, circles,
+        vx0, vy0, vx1, vy1, draw_bbox, hatch_bboxes, other_view_bboxes,
+        other_view_part_bboxes, wm_text_bboxes, cx, cy, _score_part_bbox,
+        _down_bbox, _view_line_grid, cross_view_text_bboxes, _prefer_by_gi)
+
+    # 上下焊点标签 Y 颠倒 → 重搜回归属象限
+    _fix_inverted_label_order(
+        _placements, placed_bboxes, placed_text_bboxes, lines, text_bboxes, circles,
+        vx0, vy0, vx1, vy1, draw_bbox, hatch_bboxes, other_view_bboxes,
+        other_view_part_bboxes, wm_text_bboxes, cx, cy, _score_part_bbox,
+        _down_bbox, _view_line_grid, cross_view_text_bboxes)
+
+    # W/近距文字强制分槽（解决 W1/W5 等叠字）
+    _separate_close_text_labels(
+        _placements, placed_bboxes, placed_text_bboxes, lines, text_bboxes, circles,
+        vx0, vy0, vx1, vy1, draw_bbox, hatch_bboxes, other_view_bboxes,
+        other_view_part_bboxes, wm_text_bboxes, cx, cy, _score_part_bbox,
+        _down_bbox, _view_line_grid, cross_view_text_bboxes)
+
+    # 冲突解决按较大字号估框（更保守）；绘制时再按组恢复真实字号
+    _set_active_label_height(max(group_heights) if group_heights else LABEL_HEIGHT)
+    for _ri, pd in enumerate(_placements):
+        gk, _, _, pk, ltk, dsk, agk = pd[:7]
+        _set_active_label_height(group_heights[_ri] if _ri < len(group_heights) else _lh())
+        placed_text_bboxes[_ri] = _text_bbox(
+            pk, dsk, agk, ltk, is_pair=(gk == 'pair'))
+    # 用最大字号做后续避让，避免小号字导致 W1/W5 漏检
+    _set_active_label_height(max(group_heights) if group_heights else LABEL_HEIGHT)
+    for _ri, pd in enumerate(_placements):
+        gk, _, _, pk, ltk, dsk, agk = pd[:7]
+        placed_text_bboxes[_ri] = _text_bbox(
+            pk, dsk, agk, ltk, is_pair=(gk == 'pair'))
 
     _assign_y_slots(_placements, placed_text_bboxes, placed_bboxes,
                     lines, text_bboxes, wm_text_bboxes, circles,
                     vx0, vy0, vx1, vy1, draw_bbox, hatch_bboxes,
                     other_view_bboxes, cx, cy, other_view_part_bboxes,
-                    cross_view_text_bboxes, part_view_bbox, _down_bbox)
+                    cross_view_text_bboxes, _score_part_bbox, _down_bbox)
 
-    # ---- 全局后处理：冲突解决（最多8次迭代） ----
-    _resolve_label_conflicts(msp, lines, text_bboxes, circles,
-                             vx0, vy0, vx1, vy1, draw_bbox, _placements, placed_text_bboxes, 8,
+    # y 分槽后再拉开一次近距文字
+    _separate_close_text_labels(
+        _placements, placed_bboxes, placed_text_bboxes, lines, text_bboxes, circles,
+        vx0, vy0, vx1, vy1, draw_bbox, hatch_bboxes, other_view_bboxes,
+        other_view_part_bboxes, wm_text_bboxes, cx, cy, _score_part_bbox,
+        _down_bbox, _view_line_grid, cross_view_text_bboxes)
+
+    # ---- 全局后处理：冲突解决 ----
+    _n_fix1 = _resolve_label_conflicts(msp, lines, text_bboxes, circles,
+                             vx0, vy0, vx1, vy1, draw_bbox, _placements, placed_text_bboxes, 5,
                              hatch_bboxes=hatch_bboxes, other_view_bboxes=other_view_bboxes,
                              quad_cx=cx, quad_cy=cy,
                              other_view_part_bboxes=other_view_part_bboxes,
                              cross_view_text_bboxes=cross_view_text_bboxes,
-                             wm_text_bboxes=wm_text_bboxes, part_bbox=part_view_bbox)
+                             wm_text_bboxes=wm_text_bboxes, part_bbox=_score_part_bbox)
 
-    # ---- 最终清理：检测并微调残留重叠 ----
-    for _cln_iter in range(10):
+    # ---- 最终清理：检测并微调残留重叠（含中心过近）----
+    _cln_did = False
+    for _cln_iter in range(6):
         _any_cln = False
         for ki in range(len(_placements)):
             for kj in range(ki + 1, len(_placements)):
                 tba, tbb = placed_text_bboxes[ki], placed_text_bboxes[kj]
                 ox = max(0, min(tba[1], tbb[1]) - max(tba[0], tbb[0]))
                 oy = max(0, min(tba[3], tbb[3]) - max(tba[2], tbb[2]))
-                if ox <= 0 or oy <= 0: continue
+                cxi = (tba[0] + tba[1]) / 2
+                cyi = (tba[2] + tba[3]) / 2
+                cxj = (tbb[0] + tbb[1]) / 2
+                cyj = (tbb[2] + tbb[3]) / 2
+                _near = (abs(cxi - cxj) < _lh() * 3.5 and
+                         abs(cyi - cyj) < _lh() * 1.35)
+                _li = str(_placements[ki][4])
+                _lj = str(_placements[kj][4])
+                _w_near = (_li.startswith('W') and _lj.startswith('W') and
+                           abs(cxi - cxj) < _lh() * 4 and abs(cyi - cyj) < _lh() * 2.2)
+                if ox <= 0 or oy <= 0:
+                    if not (_near or _w_near):
+                        continue
                 for target in [kj, ki]:
                     gk, itk, lbk, pk, ltk, dsk, agk = _placements[target][:7]
                     hqk = _weld_home_quadrant(pk[0], pk[1], cx, cy)
                     _pd_k = _prefer_downward_weld(pk[0], pk[1], _down_bbox)
-                    _allowed_k = _allowed_quadrants(hqk, allow_adjacent=_pd_k)
+                    _allowed_k = _allowed_quadrants(hqk, allow_adjacent=True)
                     _max_k = MAX_DIAG_LEN_PAIR if gk == 'pair' else MAX_DIAG_LEN
-                    for d_dist in [4, 8, 12, 16, 20, 24, 28, 32, -4, -8, -12, -16]:
+                    for d_dist in [4, 8, 12, 16, 20, 24, 28, 32, 36, -4, -8, -12, -16]:
                         nd = dsk + d_dist
                         if nd < 6 or nd > _max_k: continue
-                        for d_a in [-15, -10, -5, 0, 5, 10, 15, 20]:
+                        for d_a in [-25, -20, -15, -10, -5, 0, 5, 10, 15, 20, 25, 35, -35]:
                             na = agk + d_a
                             # 角度有效性检查：拒绝过水平/过垂直及越界象限
                             r5 = math.radians(na % 360)
@@ -1018,6 +1964,14 @@ def _annotate_view(msp, welds, view_id, bbox, part_centroids, f_counter, w_count
                                 if not (ttbb[1] < otb[0] - OVERLAP_MARGIN or ttbb[0] > otb[1] + OVERLAP_MARGIN or
                                         ttbb[3] < otb[2] - OVERLAP_MARGIN or ttbb[2] > otb[3] + OVERLAP_MARGIN):
                                     _ck = False; break
+                                # 中心距也要拉开
+                                _ocx = (otb[0] + otb[1]) / 2
+                                _ocy = (otb[2] + otb[3]) / 2
+                                _ncx = (ttbb[0] + ttbb[1]) / 2
+                                _ncy = (ttbb[2] + ttbb[3]) / 2
+                                if (abs(_ncx - _ocx) < _lh() * 3.0 and
+                                        abs(_ncy - _ocy) < _lh() * 1.2):
+                                    _ck = False; break
                             if not _ck: continue
                             for otb in cross_view_text_bboxes:
                                 if not (ttbb[1] < otb[0] - OVERLAP_MARGIN or ttbb[0] > otb[1] + OVERLAP_MARGIN or
@@ -1029,6 +1983,15 @@ def _annotate_view(msp, welds, view_id, bbox, part_centroids, f_counter, w_count
                                         ttbb[3] < ty0 - OVERLAP_MARGIN or ttbb[2] > ty1 + OVERLAP_MARGIN):
                                     _ck = False; break
                             if not _ck: continue
+                            for (tx0, tx1, ty0, ty1) in (wm_text_bboxes or []):
+                                if _text_overlaps(ttbb, (tx0, tx1, ty0, ty1), WM_TEXT_MARGIN):
+                                    _ck = False; break
+                            if not _ck: continue
+                            if hatch_bboxes:
+                                for (hx0, hx1, hy0, hy1) in hatch_bboxes:
+                                    if _text_overlaps(ttbb, (hx0, hx1, hy0, hy1), OVERLAP_MARGIN):
+                                        _ck = False; break
+                            if not _ck: continue
                             if _text_near_lines(ttbb, lines):
                                 _ck = False; continue
                             if draw_bbox is not None and not _text_in_inner_frame(ttbb, draw_bbox):
@@ -1037,20 +2000,108 @@ def _annotate_view(msp, welds, view_id, bbox, part_centroids, f_counter, w_count
                             placed_text_bboxes[target] = ttbb
                             _any_cln = True; break
                         if _any_cln: break
-        if not _any_cln: break
+                    if _any_cln: break
+                if _any_cln: break
+            if _any_cln: break
+        if _any_cln:
+            _cln_did = True
+        else:
+            break
 
-    # ---- 二次冲突解决：清理后修复新产生的重叠 ----
-    _resolve_label_conflicts(msp, lines, text_bboxes, circles,
-                             vx0, vy0, vx1, vy1, draw_bbox, _placements, placed_text_bboxes, 4,
-                             hatch_bboxes=hatch_bboxes, other_view_bboxes=other_view_bboxes,
-                             quad_cx=cx, quad_cy=cy,
-                             other_view_part_bboxes=other_view_part_bboxes,
-                             cross_view_text_bboxes=cross_view_text_bboxes,
-                             wm_text_bboxes=wm_text_bboxes, part_bbox=part_view_bbox)
+    # ---- 二次冲突解决：首次零修复且清理无改动则跳过 ----
+    if _n_fix1 > 0 or _cln_did:
+        _resolve_label_conflicts(msp, lines, text_bboxes, circles,
+                                 vx0, vy0, vx1, vy1, draw_bbox, _placements, placed_text_bboxes, 4,
+                                 hatch_bboxes=hatch_bboxes, other_view_bboxes=other_view_bboxes,
+                                 quad_cx=cx, quad_cy=cy,
+                                 other_view_part_bboxes=other_view_part_bboxes,
+                                 cross_view_text_bboxes=cross_view_text_bboxes,
+                                 wm_text_bboxes=wm_text_bboxes, part_bbox=_score_part_bbox)
 
-    # ---- 绘制所有标注 ----
-    for pd in _placements:
+    # ---- 绘制前：压构件文字优先加长引线重放 ----
+    _relocate_text_on_geometry(
+        _placements, placed_bboxes, placed_text_bboxes, lines, text_bboxes, circles,
+        vx0, vy0, vx1, vy1, draw_bbox, hatch_bboxes, other_view_bboxes,
+        other_view_part_bboxes, wm_text_bboxes, cx, cy, _score_part_bbox,
+        _down_bbox, _view_line_grid, cross_view_text_bboxes)
+
+    # 绘制前最后一次拉开近距/W 重叠
+    _set_active_label_height(max(group_heights) if group_heights else LABEL_HEIGHT)
+    for _ri, pd in enumerate(_placements):
+        gk, _, _, pk, ltk, dsk, agk = pd[:7]
+        placed_text_bboxes[_ri] = _text_bbox(
+            pk, dsk, agk, ltk, is_pair=(gk == 'pair'))
+        placed_bboxes[_ri] = (_paired_bbox(pk, dsk, agk, ltk) if gk == 'pair'
+                              else _single_bbox(pk, dsk, agk, ltk))
+    _separate_close_text_labels(
+        _placements, placed_bboxes, placed_text_bboxes, lines, text_bboxes, circles,
+        vx0, vy0, vx1, vy1, draw_bbox, hatch_bboxes, other_view_bboxes,
+        other_view_part_bboxes, wm_text_bboxes, cx, cy, _score_part_bbox,
+        _down_bbox, _view_line_grid, cross_view_text_bboxes)
+
+    # ---- 绘制所有标注（绘制前内框闸门；禁止仅保框而压线）----
+    for _pi, pd in enumerate(_placements):
         gtype, items, labels, pos, dname, diag_len, angle = pd[:7]
+        _set_active_label_height(group_heights[_pi] if _pi < len(group_heights) else _lh())
+        _is_pair = (gtype == 'pair')
+        _tbb_pre = _text_bbox(pos, diag_len, angle, dname, is_pair=_is_pair)
+        _need_fix = ((draw_bbox is not None and not _text_in_inner_frame(_tbb_pre, draw_bbox))
+                      or _text_near_lines(_tbb_pre, lines))
+        if _need_fix:
+            _hq = _weld_home_quadrant(pos[0], pos[1], cx, cy)
+            _old_ang, _old_diag = angle, diag_len
+            _nbr = [(_placements[k][3], _placements[k][6])
+                    for k in range(len(_placements)) if k != _pi]
+            _, diag_len, angle = _search_placement(
+                pos, lines, text_bboxes, circles,
+                [p[7] for k, p in enumerate(_placements) if k != _pi],
+                [otb for k, otb in enumerate(placed_text_bboxes) if k != _pi],
+                vx0, vy0, vx1, vy1, draw_bbox, is_pair=_is_pair,
+                hatch_bboxes=hatch_bboxes, other_view_bboxes=other_view_bboxes,
+                home_q=_hq, quad_cx=cx, quad_cy=cy,
+                other_view_part_bboxes=other_view_part_bboxes,
+                label_text=dname, wm_text_bboxes=wm_text_bboxes,
+                part_bbox=_score_part_bbox, prefer_down=False,
+                max_dist=(MAX_DIAG_LEN_PAIR if _is_pair else MAX_DIAG_LEN),
+                allow_adjacent=True, prefer_ang=_old_ang, neighbor_angles=_nbr,
+                cross_ok=False)
+            # 勿把近邻分向结果合并成同向
+            _collapsed = any(
+                math.hypot(npos[0] - pos[0], npos[1] - pos[1]) <= CLUSTER_RADIUS
+                and _angle_delta_deg(angle, nang) < DIVERGE_ANGLE_MIN
+                for npos, nang in _nbr)
+            if _collapsed:
+                diag_len, angle = _old_diag, _old_ang
+                # try lengthen in place to clear geometry without changing direction
+                _max_k = MAX_DIAG_LEN_PAIR if _is_pair else MAX_DIAG_LEN
+                for _nd in range(int(_old_diag) + 4, _max_k + 1, 4):
+                    _tb = _text_bbox(pos, _nd, _old_ang, dname, is_pair=_is_pair)
+                    if _text_near_lines(_tb, lines):
+                        continue
+                    if draw_bbox is not None and not _text_in_inner_frame(_tb, draw_bbox):
+                        continue
+                    diag_len = _nd
+                    break
+            _tbb_pre = _text_bbox(pos, diag_len, angle, dname, is_pair=_is_pair)
+            # 仅内框回退：候选也不压线、且不破坏分向时才采用
+            if draw_bbox is not None and not _text_in_inner_frame(_tbb_pre, draw_bbox):
+                _fp = _shortest_in_frame_pose(
+                    pos, dname, draw_bbox, is_pair=_is_pair, home_q=_hq, prefer_ang=angle)
+                if _fp is not None:
+                    _fd, _fa = _fp
+                    _tbb_fp = _text_bbox(pos, _fd, _fa, dname, is_pair=_is_pair)
+                    _fp_collapse = any(
+                        math.hypot(npos[0] - pos[0], npos[1] - pos[1]) <= CLUSTER_RADIUS
+                        and _angle_delta_deg(_fa, nang) < DIVERGE_ANGLE_MIN
+                        for npos, nang in _nbr)
+                    if not _text_near_lines(_tbb_fp, lines) and not _fp_collapse:
+                        diag_len, angle = _fd, _fa
+            if _is_pair:
+                nbb = _paired_bbox(pos, diag_len, angle, dname)
+            else:
+                nbb = _single_bbox(pos, diag_len, angle, dname)
+            _placements[_pi] = (gtype, items, labels, pos, dname, diag_len, angle, nbb)
+            placed_text_bboxes[_pi] = _text_bbox(pos, diag_len, angle, dname, is_pair=_is_pair)
         _smp = items[0][0].get('_sampled', False)
         if gtype == 'pair':
             _pd = _prefer_downward_weld(pos[0], pos[1], _down_bbox)
@@ -1142,7 +2193,7 @@ def _maybe_retry_downward_placement(weld_pos, diag_len, angle, label_text, is_pa
                                     placed_text_obstacles, vx0, vy0, vx1, vy1, draw_bbox,
                                     hatch_bboxes, other_view_bboxes, home_q, cx, cy,
                                     other_view_part_bboxes, wm_text_bboxes, part_bbox,
-                                    prefer_down):
+                                    prefer_down, line_grid=None):
     """Part 下半区围焊：若文字仍在焊点上方，在同半区向下象限重搜一次。"""
     if not prefer_down or _label_below_weld(weld_pos, diag_len, angle, label_text, is_pair):
         return diag_len, angle
@@ -1154,7 +2205,7 @@ def _maybe_retry_downward_placement(weld_pos, diag_len, angle, label_text, is_pa
         home_q=_dq, quad_cx=cx, quad_cy=cy,
         other_view_part_bboxes=other_view_part_bboxes,
         label_text=label_text, wm_text_bboxes=wm_text_bboxes,
-        part_bbox=part_bbox, prefer_down=True)
+        part_bbox=part_bbox, prefer_down=True, line_grid=line_grid)
     if _label_below_weld(weld_pos, nd, na, label_text, is_pair):
         return nd, na
     return diag_len, angle
@@ -1174,6 +2225,98 @@ def _allowed_quadrants(home_q, allow_adjacent=False, cross_ok=False):
     return {home_q}
 
 
+def _corridor_info(wx, wy, part_bbox, other_view_bboxes, home_q=None):
+    """Inter-view empty corridor: prefer angle into gap within home quadrant.
+
+    Does NOT expand allowed quadrants — only returns a soft prefer angle + gap
+    box so labels may land in the blank strip while staying in home/same-half.
+    Returns (side_hint_quads, prefer_ang, gap_box).
+    """
+    extras = set()
+    best_ang, best_gap, best_box = None, 0.0, None
+    if not part_bbox or not other_view_bboxes:
+        return extras, None, None
+    px0, py0, px1, py1 = part_bbox
+
+    def _cands_for(right_side):
+        # 上半偏上缝、下半偏下缝，避免上下焊点对角抢同一斜向
+        if home_q == 1:
+            return [55, 65, 45, 70] if right_side else [115, 135, 150]
+        if home_q == 2:
+            return [115, 135, 150, 120] if not right_side else [55, 65, 45]
+        if home_q == 3:
+            return [225, 210, 240, 230] if not right_side else [315, 305, 295]
+        if home_q == 4:
+            return [315, 305, 295, 325] if right_side else [225, 210, 240]
+        if right_side:
+            return [55, 65, 315, 305, 45, 295]
+        return [135, 150, 120, 225, 210, 240]
+
+    def _pick_ang(gx_lo, gx_hi, y_lo, y_hi, right_side):
+        cands = _cands_for(right_side)
+        dists = [18.0, 22.0, 28.0, 34.0, 40.0, 46.0]
+        # 上半目标偏上、下半偏下
+        if home_q in (1, 2):
+            gy_prefs = (min(y_hi - 4, wy + 18), wy + 10, 0.65 * y_hi + 0.35 * y_lo)
+        elif home_q in (3, 4):
+            gy_prefs = (max(y_lo + 4, wy - 18), wy - 10, 0.35 * y_hi + 0.65 * y_lo)
+        else:
+            gy_prefs = (wy, 0.5 * (y_lo + y_hi))
+        for pang in cands:
+            rad = math.radians(pang)
+            if abs(math.sin(rad)) < math.sin(math.radians(ANGLE_MIN)):
+                continue
+            if abs(math.cos(rad)) < math.cos(math.radians(ANGLE_MAX)):
+                continue
+            if home_q is not None and not _angle_in_quadrant(pang, home_q):
+                continue
+            for dist in dists:
+                tx = wx + dist * math.cos(rad)
+                ty = wy + dist * math.sin(rad)
+                if gx_lo <= tx <= gx_hi and (y_lo - 28) <= ty <= (y_hi + 28):
+                    return pang
+        gx = 0.5 * (gx_lo + gx_hi)
+        for gy in gy_prefs:
+            gy = max(y_lo + 2, min(y_hi - 2, gy))
+            ang = math.degrees(math.atan2(gy - wy, gx - wx)) % 360
+            if home_q is None or _angle_in_quadrant(ang, home_q, tol=12):
+                return ang
+        # 强制落在 home 象限中心角
+        _pref = {1: 45, 2: 135, 3: 225, 4: 315}
+        return _pref.get(home_q, 45)
+
+    for ovb in other_view_bboxes:
+        if not ovb or len(ovb) < 4:
+            continue
+        ox0, oy0, ox1, oy1 = ovb[0], ovb[1], ovb[2], ovb[3]
+        if ox0 - 2 <= wx <= ox1 + 2 and oy0 - 2 <= wy <= oy1 + 2:
+            continue
+        y_lo, y_hi = max(py0, oy0), min(py1, oy1)
+        if y_hi - y_lo < 8:
+            y_lo, y_hi = min(py0, oy0), max(py1, oy1)
+        gap_r = ox0 - px1
+        if 12 < gap_r < 220:
+            extras |= {1, 4}
+            gbox = (px1 + 3, y_lo - 10, ox0 - 3, y_hi + 10)
+            ang = _pick_ang(gbox[0], gbox[2], y_lo, y_hi, True)
+            if gap_r > best_gap:
+                best_gap, best_ang, best_box = gap_r, ang, gbox
+        gap_l = px0 - ox1
+        if 12 < gap_l < 220:
+            extras |= {2, 3}
+            gbox = (ox1 + 3, y_lo - 10, px0 - 3, y_hi + 10)
+            ang = _pick_ang(gbox[0], gbox[2], y_lo, y_hi, False)
+            if gap_l > best_gap:
+                best_gap, best_ang, best_box = gap_l, ang, gbox
+    return extras, best_ang, best_box
+
+
+def _point_in_bbox_xyxy(px, py, bb, mrg=0.0):
+    if not bb or len(bb) < 4:
+        return False
+    return (bb[0] - mrg <= px <= bb[2] + mrg and bb[1] - mrg <= py <= bb[3] + mrg)
+
+
 def _angle_in_quadrant(angle_deg, quad, tol=QUADRANT_ANGLE_TOL):
     a0, a1 = QUAD_ANGLE_RANGES[quad]
     a = angle_deg % 360
@@ -1187,6 +2330,7 @@ def _quadrant_angle_offsets(home_q, ideal_ang, step=3):
 
 
 def _label_text_width(labels, is_pair=False):
+    h = _lh()
     if is_pair:
         if isinstance(labels, (list, tuple)):
             text = f"{labels[0]},{labels[1]}"
@@ -1194,7 +2338,7 @@ def _label_text_width(labels, is_pair=False):
             text = str(labels)
     else:
         text = labels if isinstance(labels, str) else str(labels)
-    return max(LABEL_HEIGHT, len(text) * LABEL_HEIGHT * 0.6)
+    return max(h, len(text) * h * 0.6)
 
 
 def _placement_label_text(gtype, labels):
@@ -1204,8 +2348,10 @@ def _placement_label_text(gtype, labels):
 
 
 def _horiz_land(label_text, is_pair=False):
-    base = PAIR_HORIZ_LAND if is_pair else HORIZ_LAND
-    return max(base, _label_text_width(label_text, is_pair), MIN_HORIZ_LAND)
+    h = _lh()
+    base = h * 5.0 if is_pair else h * 2.2
+    min_land = h * 3.0
+    return max(base, _label_text_width(label_text, is_pair), min_land)
 
 
 def _text_in_inner_frame(tbb, inner_bbox, margin=None):
@@ -1217,6 +2363,50 @@ def _text_in_inner_frame(tbb, inner_bbox, margin=None):
     ix0, iy0, ix1, iy1 = inner_bbox
     return (bx0 >= ix0 + m and bx1 <= ix1 - m and
             by0 >= iy0 + m and by1 <= iy1 - m)
+
+
+def _shortest_in_frame_pose(weld_pos, label_text, draw_bbox, is_pair=False,
+                            home_q=None, prefer_ang=None, max_dist=None):
+    """Return (dist, angle) with shortest leader whose text stays in inner frame.
+    Angle-first at each distance; never returns an out-of-frame pose when one exists."""
+    if draw_bbox is None:
+        return None
+    _max = max_dist if max_dist is not None else (
+        MAX_DIAG_LEN_PAIR if is_pair else MAX_DIAG_LEN)
+    wx, wy = weld_pos
+    _cx = (draw_bbox[0] + draw_bbox[2]) / 2
+    _cy = (draw_bbox[1] + draw_bbox[3]) / 2
+    if home_q is None:
+        home_q = _weld_home_quadrant(wx, wy, _cx, _cy)
+    _pref = prefer_ang if prefer_ang is not None else {1: 45, 2: 135, 3: 225, 4: 315}.get(home_q, 45)
+    _angles = [_pref]
+    for q in (home_q, ((home_q - 2) % 4) + 1, (home_q % 4) + 1):
+        if q in QUAD_ANGLE_RANGES:
+            a0, a1 = QUAD_ANGLE_RANGES[q]
+            _angles.extend(range(int(a0), int(a1) + 1, 5))
+    _angles = list(dict.fromkeys(a % 360 for a in _angles))
+    for nd in range(MIN_DIAG_LEN, int(_max) + 1, 2):
+        for na in _angles:
+            r = math.radians(na)
+            if abs(math.sin(r)) < math.sin(math.radians(ANGLE_MIN)):
+                continue
+            if abs(math.cos(r)) < math.cos(math.radians(ANGLE_MAX)):
+                continue
+            tbb = _text_bbox(weld_pos, nd, na, label_text, is_pair=is_pair)
+            if _text_in_inner_frame(tbb, draw_bbox):
+                return nd, na
+    # last resort: full 360° / short steps（不超 _max）
+    for nd in range(MIN_DIAG_LEN, int(_max) + 1, 2):
+        for na in range(0, 360, 5):
+            r = math.radians(na)
+            if abs(math.sin(r)) < math.sin(math.radians(ANGLE_MIN)):
+                continue
+            if abs(math.cos(r)) < math.cos(math.radians(ANGLE_MAX)):
+                continue
+            tbb = _text_bbox(weld_pos, nd, float(na), label_text, is_pair=is_pair)
+            if _text_in_inner_frame(tbb, draw_bbox):
+                return nd, float(na)
+    return None
 
 
 def _text_overlaps(tbb, otb, margin):
@@ -1240,7 +2430,7 @@ def _single_bbox(weld_pos, diag_len, angle_deg, label_text=''):
         bx0, bx1 = lx - lw, lx
     # Include leader path
     all_xs = [wx, ex, bx0, bx1]
-    all_ys = [wy, ey, ly, ly + LABEL_HEIGHT]
+    all_ys = [wy, ey, ly, ly + _lh()]
     return min(all_xs), max(all_xs), min(all_ys), max(all_ys)
 
 
@@ -1258,7 +2448,7 @@ def _paired_bbox(weld_pos, diag_len, angle_deg, label_text=''):
     else:
         bx0, bx1 = lx - pair_w, lx
     all_xs = [wx, ex, bx0, bx1]
-    all_ys = [wy, ey, ly, ly + LABEL_HEIGHT]
+    all_ys = [wy, ey, ly, ly + _lh()]
     return min(all_xs), max(all_xs), min(all_ys), max(all_ys)
 
 
@@ -1297,15 +2487,13 @@ def _text_bbox(weld_pos, diag_len, angle_deg, label_text='', is_pair=False):
     else:                            # BL: text extends RIGHT from hx
         _tbx0 = _tbx
         _tbx1 = _tbx + _width
-    return (_tbx0, _tbx1, _tby, _tby + LABEL_HEIGHT)
+    return (_tbx0, _tbx1, _tby, _tby + _lh())
 
 
 def _text_near_lines(tbb, lines, margin=LINE_CLEARANCE):
     """True if label text bbox is too close to or crosses geometry lines."""
     bx0, bx1, by0, by1 = tbb
-    _txt_pts = [(bx0, by0), (bx1, by0), (bx0, by1), (bx1, by1),
-                ((bx0 + bx1) / 2, by0), ((bx0 + bx1) / 2, by1),
-                (bx0, (by0 + by1) / 2), (bx1, (by0 + by1) / 2)]
+    _txt_pts = _txt_sample_points(bx0, bx1, by0, by1)
     _cx_txt = (bx0 + bx1) / 2
     _cy_txt = (by0 + by1) / 2
     _mrg = margin + 2
@@ -1317,7 +2505,10 @@ def _text_near_lines(tbb, lines, margin=LINE_CLEARANCE):
         for (cx, cy) in _txt_pts:
             if _dist_pt_to_seg((cx, cy), (sx, sy), (ex2, ey2))[0] < margin:
                 return True
-        if _dist_pt_to_seg((_cx_txt, _cy_txt), (sx, sy), (ex2, ey2))[0] < margin * 0.6:
+        if _dist_pt_to_seg((_cx_txt, _cy_txt), (sx, sy), (ex2, ey2))[0] < margin * 0.75:
+            return True
+        # vertical / horizontal line through interior of bbox
+        if _seg_cross_rect((sx, sy), (ex2, ey2), bx0, bx1, by0, by1):
             return True
         _txt_edges = [((bx0, by0), (bx1, by0)), ((bx1, by0), (bx1, by1)),
                       ((bx1, by1), (bx0, by1)), ((bx0, by1), (bx0, by0))]
@@ -1333,8 +2524,8 @@ def _mtext_label_bbox(mtext_entity):
     w = _label_text_width(txt, ',' in txt)
     att = getattr(mtext_entity.dxf, 'attachment_point', MT_BOTTOM_RIGHT)
     if att in (MT_BOTTOM_RIGHT, MT_TOP_RIGHT, MT_MIDDLE_RIGHT):
-        return (ins.x - w, ins.x, ins.y, ins.y + LABEL_HEIGHT)
-    return (ins.x, ins.x + w, ins.y, ins.y + LABEL_HEIGHT)
+        return (ins.x - w, ins.x, ins.y, ins.y + _lh())
+    return (ins.x, ins.x + w, ins.y, ins.y + _lh())
 
 
 def _collect_part_lines(doc):
@@ -1360,50 +2551,81 @@ def _erase_label_entities(msp, entities):
 def _redraw_label_meta(msp, meta):
     """Erase and redraw a label from stored placement metadata."""
     _erase_label_entities(msp, meta['entities'])
-    if meta.get('is_pair'):
-        new = _draw_paired_weld_label(
-            msp, meta['labels'], meta['weld_pos'], meta['label_text'],
-            meta['diag_len'], meta['angle'], sampled=meta.get('sampled', False))
-    else:
-        new = _draw_weld_label(
-            msp, meta['label_text'], meta['weld_pos'], meta['label_text'],
-            meta['diag_len'], meta['angle'], sampled=meta.get('sampled', False))
-    meta.update(new)
+    _prev_h = _lh()
+    _set_active_label_height(meta.get('label_height', LABEL_HEIGHT))
+    try:
+        if meta.get('is_pair'):
+            new = _draw_paired_weld_label(
+                msp, meta['labels'], meta['weld_pos'], meta['label_text'],
+                meta['diag_len'], meta['angle'], sampled=meta.get('sampled', False))
+        else:
+            new = _draw_weld_label(
+                msp, meta['label_text'], meta['weld_pos'], meta['label_text'],
+                meta['diag_len'], meta['angle'], sampled=meta.get('sampled', False))
+        meta.update(new)
+    finally:
+        _set_active_label_height(_prev_h)
     return meta
 
 
-def _label_placement_ok(meta, part_lines, draw_bbox, wm_text_bboxes, other_metas):
-    tbb = _text_bbox(meta['weld_pos'], meta['diag_len'], meta['angle'],
-                     meta['label_text'], is_pair=meta.get('is_pair', False))
-    if draw_bbox is not None and not _text_in_inner_frame(tbb, draw_bbox):
-        return False
-    if _text_near_lines(tbb, part_lines):
-        return False
-    for om in other_metas:
-        if om is meta:
-            continue
-        otb = _text_bbox(om['weld_pos'], om['diag_len'], om['angle'],
-                         om['label_text'], is_pair=om.get('is_pair', False))
-        if _text_overlaps(tbb, otb, OVERLAP_MARGIN):
+def _with_meta_height(meta, fn):
+    """Run fn() under meta's label_height."""
+    _prev = _lh()
+    _set_active_label_height(meta.get('label_height', LABEL_HEIGHT))
+    try:
+        return fn()
+    finally:
+        _set_active_label_height(_prev)
+
+
+def _label_placement_ok(meta, part_lines, draw_bbox, wm_text_bboxes, other_metas,
+                        hatch_bboxes=None):
+    def _check():
+        tbb = _text_bbox(meta['weld_pos'], meta['diag_len'], meta['angle'],
+                         meta['label_text'], is_pair=meta.get('is_pair', False))
+        if draw_bbox is not None and not _text_in_inner_frame(tbb, draw_bbox):
             return False
-    for wtb in wm_text_bboxes or []:
-        if _text_overlaps(tbb, wtb, WM_TEXT_MARGIN):
+        if _text_near_lines(tbb, part_lines):
             return False
-    rad = math.radians(meta['angle'])
-    if meta['diag_len'] < MIN_DIAG_LEN:
-        return False
-    h_len = abs(_horiz_land(meta['label_text'], meta.get('is_pair', False)))
-    if h_len < MIN_HORIZ_LAND:
-        return False
-    return True
+        for om in other_metas:
+            if om is meta:
+                continue
+            def _otb():
+                return _text_bbox(om['weld_pos'], om['diag_len'], om['angle'],
+                                  om['label_text'], is_pair=om.get('is_pair', False))
+            otb = _with_meta_height(om, _otb)
+            if _text_overlaps(tbb, otb, OVERLAP_MARGIN):
+                return False
+        for wtb in wm_text_bboxes or []:
+            if _text_overlaps(tbb, wtb, WM_TEXT_MARGIN):
+                return False
+        if hatch_bboxes:
+            for htb in hatch_bboxes:
+                if _text_overlaps(tbb, htb, OVERLAP_MARGIN):
+                    return False
+        wx, wy = meta['weld_pos']
+        rad = math.radians(meta['angle'])
+        ex = wx + meta['diag_len'] * math.cos(rad)
+        ey = wy + meta['diag_len'] * math.sin(rad)
+        for wtb in wm_text_bboxes or []:
+            if _seg_cross_rect((wx, wy), (ex, ey), wtb[0], wtb[1], wtb[2], wtb[3]):
+                return False
+        if meta['diag_len'] < MIN_DIAG_LEN:
+            return False
+        h_len = abs(_horiz_land(meta['label_text'], meta.get('is_pair', False)))
+        if h_len < _lh() * 3.0:
+            return False
+        return True
+    return _with_meta_height(meta, _check)
 
 
 def _reposition_drawn_label(msp, meta, diag_len, angle_deg, part_lines, draw_bbox,
-                            wm_text_bboxes, other_metas):
+                            wm_text_bboxes, other_metas, hatch_bboxes=None):
     old = (meta['diag_len'], meta['angle'])
     meta['diag_len'] = diag_len
     meta['angle'] = angle_deg
-    if not _label_placement_ok(meta, part_lines, draw_bbox, wm_text_bboxes, other_metas):
+    if not _label_placement_ok(meta, part_lines, draw_bbox, wm_text_bboxes, other_metas,
+                               hatch_bboxes=hatch_bboxes):
         meta['diag_len'], meta['angle'] = old
         return False
     _redraw_label_meta(msp, meta)
@@ -1411,15 +2633,18 @@ def _reposition_drawn_label(msp, meta, diag_len, angle_deg, part_lines, draw_bbo
 
 
 def _nudge_drawn_label(msp, meta, dx, dy, part_lines, draw_bbox=None,
-                       wm_text_bboxes=None, other_metas=None):
+                       wm_text_bboxes=None, other_metas=None, hatch_bboxes=None):
     """Reposition label by adjusting leader geometry and redrawing."""
     if other_metas is None:
         other_metas = []
     ds, ag = meta['diag_len'], meta['angle']
+    # Prefer small angle / moderate length nudges before large extensions
     shifts = [
-        (ds + 4, ag + 8), (ds + 4, ag - 8), (ds + 8, ag + 12), (ds + 8, ag - 12),
-        (ds + 12, ag + 15), (ds + 12, ag - 15), (ds + 16, ag), (ds + 20, ag + 10),
-        (ds + 20, ag - 10), (ds - 4, ag + 10), (ds - 4, ag - 10),
+        (ds + 4, ag + 5), (ds + 4, ag - 5), (ds + 4, ag + 8), (ds + 4, ag - 8),
+        (ds + 8, ag + 8), (ds + 8, ag - 8), (ds + 8, ag + 12), (ds + 8, ag - 12),
+        (ds + 12, ag + 12), (ds + 12, ag - 12), (ds + 12, ag + 15), (ds + 12, ag - 15),
+        (ds + 16, ag), (ds + 20, ag + 10), (ds + 20, ag - 10),
+        (ds - 4, ag + 10), (ds - 4, ag - 10),
         (ds + 6, ag + 20), (ds + 6, ag - 20), (ds + 10, ag + 25), (ds + 10, ag - 25),
     ]
     if abs(dx) > abs(dy):
@@ -1428,27 +2653,111 @@ def _nudge_drawn_label(msp, meta, dx, dy, part_lines, draw_bbox=None,
         shifts = [(ds + int(abs(dy) / 2) + 4, ag + (12 if dy > 0 else -12))] + shifts
     _max_len = MAX_DIAG_LEN_PAIR if meta.get('is_pair') else MAX_DIAG_LEN
     for nd, na in shifts:
-        if nd < MIN_DIAG_LEN or nd > _max_len + 20:
+        if nd < MIN_DIAG_LEN or nd > _max_len:
             continue
         if _reposition_drawn_label(msp, meta, nd, na % 360, part_lines, draw_bbox,
-                                   wm_text_bboxes or [], other_metas):
+                                   wm_text_bboxes or [], other_metas,
+                                   hatch_bboxes=hatch_bboxes):
             return True
     return False
 
 
 def _fix_global_label_overlaps(msp, part_lines, draw_bbox=None, wm_text_bboxes=None,
-                               drawn_registry=None):
-    """Final pass: nudge any remaining cross-view label overlaps apart."""
+                               drawn_registry=None, hatch_bboxes=None):
+    """Final pass: nudge remaining label/WM/hatch overlaps; leave clean labels alone."""
     if not drawn_registry:
         drawn_registry = []
         for e in msp:
             if e.dxftype() == 'MTEXT' and e.dxf.layer == LAYER_NAME:
                 drawn_registry.append({'mtext': e, 'entities': [e]})
     wm_text_bboxes = wm_text_bboxes or []
+    hatch_bboxes = hatch_bboxes or []
 
     def _meta_tbb(meta):
-        return _text_bbox(meta['weld_pos'], meta['diag_len'], meta['angle'],
-                          meta['label_text'], is_pair=meta.get('is_pair', False))
+        def _calc():
+            return _text_bbox(meta['weld_pos'], meta['diag_len'], meta['angle'],
+                              meta['label_text'], is_pair=meta.get('is_pair', False))
+        return _with_meta_height(meta, _calc)
+
+    def _shrink_overlapping():
+        """Shrink font on residual text-text overlaps and their local weld neighbors."""
+        if not drawn_registry:
+            return False
+        entries = [(m, _meta_tbb(m)) for m in drawn_registry if m.get('weld_pos')]
+        targets = set()
+        for i in range(len(entries)):
+            mi, bi = entries[i]
+            for j in range(i + 1, len(entries)):
+                mj, bj = entries[j]
+                if _text_overlaps(bi, bj, OVERLAP_MARGIN):
+                    targets.add(id(mi))
+                    targets.add(id(mj))
+        if not targets:
+            return False
+        # expand to nearby welds in the same dense pocket
+        seed_pos = [m['weld_pos'] for m in drawn_registry if id(m) in targets]
+        for meta in drawn_registry:
+            if not meta.get('weld_pos'):
+                continue
+            wx, wy = meta['weld_pos']
+            if any(math.hypot(wx - sx, wy - sy) <= CLUSTER_RADIUS for sx, sy in seed_pos):
+                targets.add(id(meta))
+        shrunk = False
+        for meta in drawn_registry:
+            if id(meta) not in targets:
+                continue
+            cur = meta.get('label_height', LABEL_HEIGHT)
+            if cur <= LABEL_HEIGHT_VERY_DENSE + 0.05:
+                continue
+            meta['label_height'] = LABEL_HEIGHT_VERY_DENSE
+            _redraw_label_meta(msp, meta)
+            shrunk = True
+        return shrunk
+
+    def _shrink_dense_clusters():
+        """Proactively shrink labels in dense weld pockets or crowded text areas."""
+        metas = [m for m in drawn_registry if m.get('weld_pos')]
+        if len(metas) < DENSE_CLUSTER_N:
+            return False
+        positions = [(m['weld_pos'][0], m['weld_pos'][1]) for m in metas]
+        tbbs = [_meta_tbb(m) for m in metas]
+        centers = [((b[0] + b[1]) / 2.0, (b[2] + b[3]) / 2.0) for b in tbbs]
+        text_r = max(18.0, CLUSTER_RADIUS * 0.65)
+        shrunk = False
+        for i, meta in enumerate(metas):
+            n_weld = _local_cluster_size_at(meta['weld_pos'], positions)
+            n_text = _local_cluster_size_at(centers[i], centers, radius=text_r)
+            tgt = _height_from_cluster_n(max(n_weld, n_text))
+            # also shrink if this text box nearly touches another
+            bi = tbbs[i]
+            near_hit = False
+            for j, bj in enumerate(tbbs):
+                if j == i:
+                    continue
+                if _text_overlaps(bi, bj, OVERLAP_MARGIN * 2.5):
+                    near_hit = True
+                    break
+            if near_hit:
+                tgt = min(tgt, LABEL_HEIGHT_VERY_DENSE)
+            cur = meta.get('label_height', LABEL_HEIGHT)
+            if cur > tgt + 0.05:
+                meta['label_height'] = tgt
+                _redraw_label_meta(msp, meta)
+                shrunk = True
+        return shrunk
+
+    def _hits_obstacle(tbb):
+        if draw_bbox is not None and not _text_in_inner_frame(tbb, draw_bbox):
+            return True
+        for wtb in wm_text_bboxes:
+            if _text_overlaps(tbb, wtb, WM_TEXT_MARGIN):
+                return True
+        for htb in hatch_bboxes:
+            if _text_overlaps(tbb, htb, OVERLAP_MARGIN):
+                return True
+        if _text_near_lines(tbb, part_lines):
+            return True
+        return False
 
     def _search_reposition(meta):
         others = [m for m in drawn_registry if m is not meta]
@@ -1471,82 +2780,84 @@ def _fix_global_label_overlaps(msp, part_lines, draw_bbox=None, wm_text_bboxes=N
             is_pair=meta.get('is_pair', False), home_q=hq,
             quad_cx=_cx, quad_cy=_cy,
             label_text=meta['label_text'], wm_text_bboxes=wm_text_bboxes,
-            max_dist=_max_len + 48)
-        if _reposition_drawn_label(msp, meta, nd, na, part_lines, draw_bbox,
-                                   wm_text_bboxes, others):
-            return True
-        _, nd2, na2 = _search_placement(
-            meta['weld_pos'], part_lines, wm_text_bboxes, [], [],
-            other_text, vx0, vy0, vx1, vy1, draw_bbox,
-            is_pair=meta.get('is_pair', False), home_q=hq,
-            quad_cx=_cx, quad_cy=_cy,
-            label_text=meta['label_text'], wm_text_bboxes=wm_text_bboxes,
-            max_dist=_max_len + 64)
-        return _reposition_drawn_label(msp, meta, nd2, na2, part_lines, draw_bbox,
-                                       wm_text_bboxes, others)
+            hatch_bboxes=hatch_bboxes or None,
+            max_dist=_max_len, allow_adjacent=True)
+        return _reposition_drawn_label(msp, meta, nd, na, part_lines, draw_bbox,
+                                       wm_text_bboxes, others, hatch_bboxes=hatch_bboxes)
 
     def _brute_reposition(meta):
         others = [m for m in drawn_registry if m is not meta]
         _max_len = MAX_DIAG_LEN_PAIR if meta.get('is_pair') else MAX_DIAG_LEN
-        for dist in range(20, _max_len + 49, 4):
-            for ang in range(0, 360, 12):
+        # 短距优先：固定 dist 扫角度
+        for dist in range(MIN_DIAG_LEN, _max_len + 1, 2):
+            for ang in range(0, 360, 8):
                 r = math.radians(ang)
                 if abs(math.sin(r)) < math.sin(math.radians(ANGLE_MIN)):
                     continue
                 if abs(math.cos(r)) < math.cos(math.radians(ANGLE_MAX)):
                     continue
                 if _reposition_drawn_label(msp, meta, dist, float(ang), part_lines,
-                                           draw_bbox, wm_text_bboxes, others):
+                                           draw_bbox, wm_text_bboxes, others,
+                                           hatch_bboxes=hatch_bboxes):
                     return True
         return False
 
-    for _ in range(24):
-        if len(drawn_registry) < 2:
+    _shrink_dense_clusters()
+
+    for _ in range(4):
+        if not drawn_registry:
             return
         entries = [(meta, _meta_tbb(meta)) for meta in drawn_registry]
         fixed = False
         for i in range(len(entries)):
-            _, bi = entries[i]
-            for j in range(i + 1, len(entries)):
+            mi, bi = entries[i]
+            needs_fix = _hits_obstacle(bi)
+            conflict_partners = []
+            for j in range(len(entries)):
+                if j == i:
+                    continue
                 ej, bj = entries[j]
-                if not _text_overlaps(bi, bj, OVERLAP_MARGIN):
-                    wm_hit = False
-                    for wtb in wm_text_bboxes:
-                        if _text_overlaps(bi, wtb, WM_TEXT_MARGIN) or _text_overlaps(bj, wtb, WM_TEXT_MARGIN):
-                            wm_hit = True
-                            break
-                    if not wm_hit:
-                        continue
-                for target_meta in (ej, entries[i][0]):
-                    shifts = [
-                        (-LABEL_HEIGHT * 4, 0), (LABEL_HEIGHT * 4, 0),
-                        (0, LABEL_HEIGHT * 2.5), (0, -LABEL_HEIGHT * 2.5),
-                        (-LABEL_HEIGHT * 6, LABEL_HEIGHT * 2.5),
-                        (LABEL_HEIGHT * 6, LABEL_HEIGHT * 2.5),
-                        (0, LABEL_HEIGHT * 5.0), (0, -LABEL_HEIGHT * 5.0),
-                        (LABEL_HEIGHT * 8, 0), (-LABEL_HEIGHT * 8, 0),
-                    ]
-                    others = [m for m in drawn_registry if m is not target_meta]
-                    for dx, dy in shifts:
-                        if _nudge_drawn_label(msp, target_meta, dx, dy, part_lines,
-                                              draw_bbox, wm_text_bboxes, others):
-                            fixed = True
-                            break
-                    if not fixed and _search_reposition(target_meta):
+                if _text_overlaps(bi, bj, OVERLAP_MARGIN):
+                    needs_fix = True
+                    conflict_partners.append(ej)
+            if not needs_fix:
+                continue
+            _out_frame = (draw_bbox is not None and
+                          not _text_in_inner_frame(bi, draw_bbox))
+            targets = conflict_partners + [mi] if conflict_partners else [mi]
+            for target_meta in targets:
+                shifts = [
+                    (-_lh() * 4, 0), (_lh() * 4, 0),
+                    (0, _lh() * 2.5), (0, -_lh() * 2.5),
+                    (-_lh() * 6, _lh() * 2.5),
+                    (_lh() * 6, _lh() * 2.5),
+                    (0, _lh() * 5.0), (0, -_lh() * 5.0),
+                    (_lh() * 8, 0), (-_lh() * 8, 0),
+                ]
+                others = [m for m in drawn_registry if m is not target_meta]
+                for dx, dy in shifts:
+                    if _nudge_drawn_label(msp, target_meta, dx, dy, part_lines,
+                                          draw_bbox, wm_text_bboxes, others,
+                                          hatch_bboxes=hatch_bboxes):
                         fixed = True
-                    if not fixed and _brute_reposition(target_meta):
-                        fixed = True
-                    if fixed:
                         break
+                if not fixed and _search_reposition(target_meta):
+                    fixed = True
+                if not fixed and _out_frame and _brute_reposition(target_meta):
+                    fixed = True
                 if fixed:
                     break
             if fixed:
                 break
         if not fixed:
+            # 残留字重叠：整簇缩到最小字号后再试挪位
+            if _shrink_overlapping():
+                continue
             break
 
 
-def _enforce_inner_frame_labels(msp, draw_bbox, part_lines, wm_text_bboxes, drawn_registry):
+def _enforce_inner_frame_labels(msp, draw_bbox, part_lines, wm_text_bboxes, drawn_registry,
+                                hatch_bboxes=None):
     """最终强制：所有已绘制标注文字不得超出内框。"""
     if not draw_bbox or not drawn_registry:
         return
@@ -1554,31 +2865,64 @@ def _enforce_inner_frame_labels(msp, draw_bbox, part_lines, wm_text_bboxes, draw
     _cy = (draw_bbox[1] + draw_bbox[3]) / 2
     vx0, vy0, vx1, vy1 = draw_bbox
     for meta in drawn_registry:
-        tbb = _text_bbox(meta['weld_pos'], meta['diag_len'], meta['angle'],
-                         meta['label_text'], is_pair=meta.get('is_pair', False))
+        def _tbb_cur():
+            return _text_bbox(meta['weld_pos'], meta['diag_len'], meta['angle'],
+                              meta['label_text'], is_pair=meta.get('is_pair', False))
+        tbb = _with_meta_height(meta, _tbb_cur)
         if _text_in_inner_frame(tbb, draw_bbox):
             continue
         wx, wy = meta['weld_pos']
         _prefer_down = meta.get('prefer_down', False)
         hq = _weld_home_quadrant(wx, wy, _cx, _cy)
         others = [m for m in drawn_registry if m is not meta]
-        other_text = [_text_bbox(m['weld_pos'], m['diag_len'], m['angle'],
-                                 m['label_text'], is_pair=m.get('is_pair', False))
-                      for m in others]
+        other_text = []
+        for m in others:
+            def _otb(mm=m):
+                return _text_bbox(mm['weld_pos'], mm['diag_len'], mm['angle'],
+                                  mm['label_text'], is_pair=mm.get('is_pair', False))
+            other_text.append(_with_meta_height(m, _otb))
         _max_len = MAX_DIAG_LEN_PAIR if meta.get('is_pair') else MAX_DIAG_LEN
         fixed = False
-        for _ext in (_max_len + 16, _max_len + 32):
-            _, nd, na = _search_placement(
+        # 1) 框内短距搜索
+        def _do_search():
+            return _search_placement(
                 meta['weld_pos'], part_lines, wm_text_bboxes or [], [], [],
                 other_text, vx0, vy0, vx1, vy1, draw_bbox,
                 is_pair=meta.get('is_pair', False), home_q=hq,
                 quad_cx=_cx, quad_cy=_cy, label_text=meta['label_text'],
                 wm_text_bboxes=wm_text_bboxes, prefer_down=_prefer_down,
-                max_dist=_ext)
-            if _reposition_drawn_label(msp, meta, nd, na, part_lines, draw_bbox,
-                                       wm_text_bboxes, others):
+                hatch_bboxes=hatch_bboxes or None,
+                max_dist=_max_len, allow_adjacent=True)
+        _, nd, na = _with_meta_height(meta, _do_search)
+        if _reposition_drawn_label(msp, meta, nd, na, part_lines, draw_bbox,
+                                   wm_text_bboxes, others, hatch_bboxes=hatch_bboxes):
+            fixed = True
+        # 2) 短距×角度穷举（完整 _label_placement_ok）
+        if not fixed:
+            for dist in range(MIN_DIAG_LEN, _max_len + 1, 2):
+                for ang in range(0, 360, 8):
+                    r = math.radians(ang)
+                    if abs(math.sin(r)) < math.sin(math.radians(ANGLE_MIN)):
+                        continue
+                    if abs(math.cos(r)) < math.cos(math.radians(ANGLE_MAX)):
+                        continue
+                    if _reposition_drawn_label(msp, meta, dist, float(ang), part_lines,
+                                               draw_bbox, wm_text_bboxes, others,
+                                               hatch_bboxes=hatch_bboxes):
+                        fixed = True
+                        break
+                if fixed:
+                    break
+        # 3) 放宽软冲突，仅保证内框：强制改写绘制
+        if not fixed:
+            _fp = _shortest_in_frame_pose(
+                meta['weld_pos'], meta['label_text'], draw_bbox,
+                is_pair=meta.get('is_pair', False), home_q=hq,
+                prefer_ang=meta['angle'], max_dist=_max_len)
+            if _fp is not None:
+                meta['diag_len'], meta['angle'] = _fp
+                _redraw_label_meta(msp, meta)
                 fixed = True
-                break
         if not fixed:
             print(f"    [warn] inner-frame violation unresolved at ({wx:.1f},{wy:.1f}) "
                   f"label={meta['label_text']!r}")
@@ -1629,7 +2973,7 @@ def _draw_weld_label(msp, label, weld_pos, dname, diag_len, angle_deg, sampled=F
         lx = hx
     mt = msp.add_mtext(label, dxfattribs={
         'layer': LAYER_NAME, 'color': LABEL_COLOR,
-        'char_height': LABEL_HEIGHT,
+        'char_height': _lh(),
         'insert': (lx, hy),
         'attachment_point': ap,
         'style': 'Arial Narrow',
@@ -1638,14 +2982,15 @@ def _draw_weld_label(msp, label, weld_pos, dname, diag_len, angle_deg, sampled=F
     entities.append(mt)
 
     if sampled:
-        _tw = len(label) * LABEL_HEIGHT * 0.6
+        _h = _lh()
+        _tw = len(label) * _h * 0.6
         if h_land >= 0:
             _cx = lx - _tw / 2
         else:
             _cx = lx + _tw / 2
-        _cy = hy + LABEL_HEIGHT / 2
+        _cy = hy + _h / 2
         _rx = _tw / 2 + 1.3
-        _ry = LABEL_HEIGHT / 2 + 1.3
+        _ry = _h / 2 + 1.3
         entities.append(msp.add_ellipse(center=(_cx, _cy), major_axis=(_rx, 0),
                                         ratio=_ry / max(_rx, 0.01),
                                         dxfattribs={'layer': LAYER_NAME, 'color': 1}))
@@ -1653,7 +2998,7 @@ def _draw_weld_label(msp, label, weld_pos, dname, diag_len, angle_deg, sampled=F
     return {
         'entities': entities, 'mtext': mt, 'weld_pos': weld_pos,
         'diag_len': diag_len, 'angle': angle_deg, 'label_text': label,
-        'is_pair': False, 'sampled': sampled,
+        'is_pair': False, 'sampled': sampled, 'label_height': _lh(),
     }
 
 
@@ -1687,7 +3032,7 @@ def _draw_paired_weld_label(msp, labels, weld_pos, dname, diag_len, angle_deg, s
         lx = hx
     mt = msp.add_mtext(paired_text, dxfattribs={
         'layer': LAYER_NAME, 'color': LABEL_COLOR,
-        'char_height': LABEL_HEIGHT,
+        'char_height': _lh(),
         'insert': (lx, hy),
         'attachment_point': ap,
         'style': 'Arial Narrow',
@@ -1696,14 +3041,15 @@ def _draw_paired_weld_label(msp, labels, weld_pos, dname, diag_len, angle_deg, s
     entities.append(mt)
 
     if sampled:
-        _tw = len(paired_text) * LABEL_HEIGHT * 0.6
+        _h = _lh()
+        _tw = len(paired_text) * _h * 0.6
         if h_land >= 0:
             _cx = lx - _tw / 2
         else:
             _cx = lx + _tw / 2
-        _cy = hy + LABEL_HEIGHT / 2
+        _cy = hy + _h / 2
         _rx = _tw / 2 + 1.3
-        _ry = LABEL_HEIGHT / 2 + 1.3
+        _ry = _h / 2 + 1.3
         entities.append(msp.add_ellipse(center=(_cx, _cy), major_axis=(_rx, 0),
                                         ratio=_ry / max(_rx, 0.01),
                                         dxfattribs={'layer': LAYER_NAME, 'color': 1}))
@@ -1712,6 +3058,7 @@ def _draw_paired_weld_label(msp, labels, weld_pos, dname, diag_len, angle_deg, s
         'entities': entities, 'mtext': mt, 'weld_pos': weld_pos,
         'diag_len': diag_len, 'angle': angle_deg, 'label_text': paired_text,
         'is_pair': True, 'sampled': sampled, 'labels': list(labels),
+        'label_height': _lh(),
     }
 
 
@@ -1721,33 +3068,64 @@ def _search_placement(weld_pos, lines, text_bboxes, circles, placed_bboxes,
                       hatch_bboxes=None, other_view_bboxes=None,
                       home_q=None, quad_cx=None, quad_cy=None,
                       other_view_part_bboxes=None, max_dist=None, label_text='',
-                      wm_text_bboxes=None, part_bbox=None, prefer_down=False):
+                      wm_text_bboxes=None, part_bbox=None, prefer_down=False,
+                      line_grid=None, allow_adjacent=False, prefer_ang=None,
+                      neighbor_angles=None, cross_ok=False):
     """在360°连续角度中搜索最佳标注位置。"""
     wx, wy = weld_pos
 
-    # 空间索引：将几何线分到 50×50 网格，加速近邻查询
     _GRID = 50
-    _line_grid = {}
-    for _s, _e in lines:
-        _gx0 = int(min(_s[0], _e[0]) / _GRID)
-        _gx1 = int(max(_s[0], _e[0]) / _GRID)
-        _gy0 = int(min(_s[1], _e[1]) / _GRID)
-        _gy1 = int(max(_s[1], _e[1]) / _GRID)
-        for _gx in range(_gx0, _gx1 + 1):
-            for _gy in range(_gy0, _gy1 + 1):
-                _line_grid.setdefault((_gx, _gy), []).append((_s, _e))
+    if line_grid is None:
+        _line_grid = _build_line_grid(lines, _GRID)
+    else:
+        _line_grid = line_grid
 
-    # 预计算理想引线方向（象限用）
+    # 预计算理想引线方向（象限用）；prefer_ang 优先用于近距分向
     _vcx = quad_cx if quad_cx is not None else (vx0 + vx1) / 2
     _vcy = quad_cy if quad_cy is not None else (vy0 + vy1) / 2
-    _ideal_ang = math.degrees(math.atan2(wy - _vcy, wx - _vcx)) % 360
+    _radial_ang = math.degrees(math.atan2(wy - _vcy, wx - _vcx)) % 360
     if home_q is None:
         home_q = _weld_home_quadrant(wx, wy, _vcx, _vcy)
-    _allowed_quads = _allowed_quadrants(home_q, allow_adjacent=prefer_down)
     if wm_text_bboxes is None:
         wm_text_bboxes = []
+    if neighbor_angles is None:
+        neighbor_angles = []
     _part_bbox = part_bbox if part_bbox else (vx0, vy0, vx1, vy1)
     _max_len = MAX_DIAG_LEN_PAIR if is_pair else MAX_DIAG_LEN
+    _ov_corr = other_view_part_bboxes if other_view_part_bboxes else other_view_bboxes
+    _corr_quads, _gap_ang, _gap_box = _corridor_info(
+        wx, wy, _part_bbox, _ov_corr, home_q=home_q)
+    # 仅朝缝半侧启用走廊偏好；绝不并入额外象限（防上下抢缝交叉）
+    _px0, _py0, _px1, _py1 = _part_bbox
+    _mid_x = 0.5 * (_px0 + _px1)
+    _pw = max(_px1 - _px0, 1.0)
+    _use_corr = False
+    if _gap_ang is not None and _corr_quads:
+        if (1 in _corr_quads or 4 in _corr_quads) and wx >= _mid_x - 0.18 * _pw:
+            _use_corr = True
+        if (2 in _corr_quads or 3 in _corr_quads) and wx <= _mid_x + 0.18 * _pw:
+            _use_corr = True
+    if not _use_corr:
+        _corr_quads, _gap_ang, _gap_box = set(), None, None
+    _allowed_quads = _allowed_quadrants(
+        home_q, allow_adjacent=prefer_down or allow_adjacent, cross_ok=cross_ok)
+    # 走廊角仅当落在允许象限内才作 ideal；否则 prefer / 径向
+    if (_gap_ang is not None and
+            any(_angle_in_quadrant(_gap_ang, q) for q in _allowed_quads)):
+        _ideal_ang = _gap_ang
+    elif prefer_ang is not None:
+        _ideal_ang = prefer_ang % 360
+    else:
+        _ideal_ang = _radial_ang
+
+    def _near_lines_for(wx0, wy0, wx1, wy1, mrg=15):
+        _gx0 = int((min(wx0, wx1) - mrg) / _GRID); _gx1 = int((max(wx0, wx1) + mrg) / _GRID)
+        _gy0 = int((min(wy0, wy1) - mrg) / _GRID); _gy1 = int((max(wy0, wy1) + mrg) / _GRID)
+        _near = []
+        for _gx in range(_gx0, _gx1 + 1):
+            for _gy in range(_gy0, _gy1 + 1):
+                _near.extend(_line_grid.get((_gx, _gy), []))
+        return _near
 
     def _has_conflict(angle_deg, dist, _db):
         if dist < MIN_DIAG_LEN:
@@ -1765,26 +3143,27 @@ def _search_placement(weld_pos, lines, text_bboxes, circles, placed_bboxes,
         ex = wx + dist * cos_a
         ey = wy + dist * sin_a
         h_len = _horiz_land(label_text, is_pair)
-        if h_len < MIN_HORIZ_LAND:
+        if h_len < _lh() * 3.0:
             return True
         h_land = h_len if cos_a >= -0.05 else -h_len
         hx = ex + h_land; hy = ey
-        lw = _label_text_width(label_text, is_pair)
-        bx0 = hx - lw if h_land >= 0 else hx
-        bx1 = hx if h_land >= 0 else hx + lw
-        by0, by1 = hy, hy + LABEL_HEIGHT
-        nbb = (min(wx, ex, bx0), max(wx, ex, bx1),
-               min(wy, ey, by0), max(wy, ey, by1))
+        # 文字盒与绘制一致
+        bx0, bx1, by0, by1 = _text_bbox(
+            (wx, wy), dist, angle_deg, label_text, is_pair=is_pair)
+        nbb = (min(wx, ex, bx0, hx), max(wx, ex, bx1, hx),
+               min(wy, ey, by0, hy), max(wy, ey, by1, hy))
         if not _bbox_in_boundary(nbb, vx0, vy0, vx1, vy1, _db):
             return True
-        # 跨视图边界检查：只用 Part 块做硬阻挡，margin=20
+        # 跨视图：跳过本视图；硬拦文字压入邻视图（允许引线穿过中间空白）
         _ov_check = other_view_part_bboxes if other_view_part_bboxes is not None else other_view_bboxes
         if _ov_check:
             for _ovb in _ov_check:
-                if _ovb == (vx0, vy0, vx1, vy1):
+                ox0, oy0, ox1, oy1 = _ovb[0], _ovb[1], _ovb[2], _ovb[3]
+                if ox0 - 2 <= wx <= ox1 + 2 and oy0 - 2 <= wy <= oy1 + 2:
                     continue
-                _M = 20
-                if nbb[1] > _ovb[0] - _M and nbb[0] < _ovb[2] + _M and nbb[3] > _ovb[1] - _M and nbb[2] < _ovb[3] + _M:
+                _M = 6 if _use_corr else 10
+                if (bx1 > ox0 - _M and bx0 < ox1 + _M
+                        and by1 > oy0 - _M and by0 < oy1 + _M):
                     return True
         for otb in placed_text_bboxes:
             if not (bx1 < otb[0] - OVERLAP_MARGIN or bx0 > otb[1] + OVERLAP_MARGIN or
@@ -1797,6 +3176,8 @@ def _search_placement(weld_pos, lines, text_bboxes, circles, placed_bboxes,
         for (tx0, tx1, ty0, ty1) in wm_text_bboxes:
             if not (bx1 < tx0 - WM_TEXT_MARGIN or bx0 > tx1 + WM_TEXT_MARGIN or
                     by1 < ty0 - WM_TEXT_MARGIN or by0 > ty1 + WM_TEXT_MARGIN):
+                return True
+            if _seg_cross_rect((wx, wy), (ex, ey), tx0, tx1, ty0, ty1):
                 return True
         for (tx0, tx1, ty0, ty1) in text_bboxes:
             if _seg_cross_rect((wx, wy), (ex, ey), tx0, tx1, ty0, ty1):
@@ -1818,42 +3199,40 @@ def _search_placement(weld_pos, lines, text_bboxes, circles, placed_bboxes,
         _min_x = min(wx, ex, hx, bx0); _max_x = max(wx, ex, hx, bx1)
         _min_y = min(wy, ey, hy, by0); _max_y = max(wy, ey, hy, by1)
         _mrg = 15
-        _gx0 = int((_min_x - _mrg) / 50); _gx1 = int((_max_x + _mrg) / 50)
-        _gy0 = int((_min_y - _mrg) / 50); _gy1 = int((_max_y + _mrg) / 50)
-        _near = []
-        for _gx in range(_gx0, _gx1 + 1):
-            for _gy in range(_gy0, _gy1 + 1):
-                _near.extend(_line_grid.get((_gx, _gy), []))
+        _near = _near_lines_for(_min_x, _min_y, _max_x, _max_y, _mrg)
         for (sx, sy), (ex2, ey2) in _near:
-            if not (max(sx, ex2) < _min_x - _mrg or min(sx, ex2) > _max_x + _mrg or
-                    max(sy, ey2) < _min_y - _mrg or min(sy, ey2) > _max_y + _mrg):
-                if _segments_cross_((ex, ey), (hx, hy), (sx, sy), (ex2, ey2)):
-                    return True
-        # 文字与几何线过近
+            if max(sx, ex2) < _min_x - _mrg or min(sx, ex2) > _max_x + _mrg or \
+                    max(sy, ey2) < _min_y - _mrg or min(sy, ey2) > _max_y + _mrg:
+                continue
+            if _segments_cross_((ex, ey), (hx, hy), (sx, sy), (ex2, ey2)):
+                return True
+            # 对角引线 vs 构件线
+            if _segments_cross_((wx, wy), (ex, ey), (sx, sy), (ex2, ey2)):
+                return True
+        # 文字与几何线过近（加密采样）
         _line_mrg = LINE_CLEARANCE
-        _txt_pts = [(bx0, by0), (bx1, by0), (bx0, by1), (bx1, by1),
-                    ((bx0+bx1)/2, by0), ((bx0+bx1)/2, by1),
-                    (bx0, (by0+by1)/2), (bx1, (by0+by1)/2)]
+        _txt_pts = _txt_sample_points(bx0, bx1, by0, by1)
         for (sx, sy), (ex2, ey2) in _near:
-            for (cx, cy) in _txt_pts:
-                if _dist_pt_to_seg((cx, cy), (sx, sy), (ex2, ey2))[0] < _line_mrg:
+            for (tcx, tcy) in _txt_pts:
+                if _dist_pt_to_seg((tcx, tcy), (sx, sy), (ex2, ey2))[0] < _line_mrg:
                     return True
+            if _seg_cross_rect((sx, sy), (ex2, ey2), bx0, bx1, by0, by1):
+                return True
         _cx_txt = (bx0 + bx1) / 2
         _cy_txt = (by0 + by1) / 2
         for (sx, sy), (ex2, ey2) in _near:
-            if _dist_pt_to_seg((_cx_txt, _cy_txt), (sx, sy), (ex2, ey2))[0] < _line_mrg * 0.6:
+            if _dist_pt_to_seg((_cx_txt, _cy_txt), (sx, sy), (ex2, ey2))[0] < _line_mrg * 0.75:
                 return True
-        # 射线法：检查文字中心是否在几何线围成的封闭形状内
-        # 使用全部 lines（非 _near），配合 y/x 范围过滤保证性能
+        # 射线法：仅用网格近邻线（速度）；空白环由评分引导
         _odd = 0
         for _rx, _ry in [(_cx_txt + 99999, _cy_txt), (_cx_txt - 99999, _cy_txt)]:
-            _cnt = sum(1 for (sx, sy), (ex2, ey2) in lines
+            _cnt = sum(1 for (sx, sy), (ex2, ey2) in _near
                        if (sy <= _cy_txt <= ey2 or ey2 <= _cy_txt <= sy)
                        and _segments_cross_((_cx_txt, _cy_txt), (_rx, _ry), (sx, sy), (ex2, ey2)))
             if _cnt % 2 == 1:
                 _odd += 1
         for _rx, _ry in [(_cx_txt, _cy_txt + 99999), (_cx_txt, _cy_txt - 99999)]:
-            _cnt = sum(1 for (sx, sy), (ex2, ey2) in lines
+            _cnt = sum(1 for (sx, sy), (ex2, ey2) in _near
                        if (sx <= _cx_txt <= ex2 or ex2 <= _cx_txt <= sx)
                        and _segments_cross_((_cx_txt, _cy_txt), (_rx, _ry), (sx, sy), (ex2, ey2)))
             if _cnt % 2 == 1:
@@ -1869,10 +3248,15 @@ def _search_placement(weld_pos, lines, text_bboxes, circles, placed_bboxes,
         for (ccx, ccy, cr) in circles:
             if not (bx1 < ccx - cr or bx0 > ccx + cr or by1 < ccy - cr or by0 > ccy + cr):
                 return True
+            # 对角引线穿过 WM 圆
+            if _dist_pt_to_seg((ccx, ccy), (wx, wy), (ex, ey))[0] < cr:
+                return True
         if hatch_bboxes:
             for (hx0, hx1, hy0, hy1) in hatch_bboxes:
                 if not (bx1 < hx0 - OVERLAP_MARGIN or bx0 > hx1 + OVERLAP_MARGIN or
                         by1 < hy0 - OVERLAP_MARGIN or by0 > hy1 + OVERLAP_MARGIN):
+                    return True
+                if _seg_cross_rect((wx, wy), (ex, ey), hx0, hx1, hy0, hy1):
                     return True
         # 纯文字内框硬约束
         _tbb_chk = (bx0, bx1, by0, by1)
@@ -1881,222 +3265,270 @@ def _search_placement(weld_pos, lines, text_bboxes, circles, placed_bboxes,
         return False
 
     def _fine_tune(dist, angle, _db):
-        """Local angle fix, then sweep distances to find shortest valid leader.
-        Guarantees returned angle satisfies ANGLE_MIN/MAX."""
-        # 首先尝试在同距离下找有效角度
-        _ang = None
-        for da in range(-60, 61, 3):
+        """Local tune only — never return a conflicting pose."""
+        for da in range(-15, 16, 5):
             na2 = angle + da
             r2 = math.radians(na2 % 360)
             if abs(math.sin(r2)) < math.sin(math.radians(ANGLE_MIN)): continue
             if abs(math.cos(r2)) < math.cos(math.radians(ANGLE_MAX)): continue
             if not _has_conflict(na2, dist, _db):
-                _ang = na2
-                break
-        # 若同距离无有效角度，尝试更长距离（优先）和更短距离
-        _full_ao = [0, 10, -10, 20, -20, 30, -30, 40, -40, 50, -50,
-                    60, -60, 70, -70, 80, -80, 90, -90,
-                    100, -100, 110, -110, 120, -120, 130, -130,
-                    140, -140, 150, -150, 160, -160, 170, -170, 180]
-        # 先试更长距离（更有空间）
-        for nd in range(dist + 2, min(dist + 40, _max_len + 1), 2):
-            for offset in _full_ao:
-                na = (angle + offset) % 360
-                r3 = math.radians(na)
-                if abs(math.sin(r3)) < math.sin(math.radians(ANGLE_MIN)): continue
-                if abs(math.cos(r3)) < math.cos(math.radians(ANGLE_MAX)): continue
-                if not _has_conflict(na, nd, _db):
-                    for da in range(-30, 31, 3):
-                        na3 = na + da
-                        r3b = math.radians(na3 % 360)
-                        if abs(math.sin(r3b)) < math.sin(math.radians(ANGLE_MIN)): continue
-                        if abs(math.cos(r3b)) < math.cos(math.radians(ANGLE_MAX)): continue
-                        if not _has_conflict(na3, nd, _db):
-                            return na3, nd, 0
-                    return na, nd, 0
-        # 再试更短距离
-        for nd in range(max(6, dist - 20), dist, 2):
-            for offset in _full_ao:
-                na = (angle + offset) % 360
-                r3 = math.radians(na)
-                if abs(math.sin(r3)) < math.sin(math.radians(ANGLE_MIN)): continue
-                if abs(math.cos(r3)) < math.cos(math.radians(ANGLE_MAX)): continue
-                if not _has_conflict(na, nd, _db):
-                    for da in range(-30, 31, 3):
-                        na3 = na + da
-                        r3b = math.radians(na3 % 360)
-                        if abs(math.sin(r3b)) < math.sin(math.radians(ANGLE_MIN)): continue
-                        if abs(math.cos(r3b)) < math.cos(math.radians(ANGLE_MAX)): continue
-                        if not _has_conflict(na3, nd, _db):
-                            return na3, nd, 0
-                    return na, nd, 0
-        # 全距离/角度穷举后再兜底
-        for nd in range(8, _max_len + 1, 2):
-            for offset in _full_ao:
-                na = (angle + offset) % 360
-                r3 = math.radians(na)
+                return na2, dist, 0
+        for nd in (dist + 4, dist + 8, dist + 12, dist - 4):
+            if nd < MIN_DIAG_LEN or nd > _max_len:
+                continue
+            for da in (0, 8, -8, 15, -15):
+                na = angle + da
+                r3 = math.radians(na % 360)
                 if abs(math.sin(r3)) < math.sin(math.radians(ANGLE_MIN)): continue
                 if abs(math.cos(r3)) < math.cos(math.radians(ANGLE_MAX)): continue
                 if not _has_conflict(na, nd, _db):
                     return na, nd, 0
-        if not _has_conflict(angle, dist, _db):
-            return angle, dist, 0
-        _pref_angles = {1: 45, 2: 135, 3: 225, 4: 315}
-        _hq = _weld_home_quadrant(wx, wy, quad_cx if quad_cx is not None else (vx0+vx1)/2, quad_cy if quad_cy is not None else (vy0+vy1)/2)
-        _fa = _pref_angles.get(_hq, 45)
-        if not _has_conflict(_fa, dist, _db):
-            return _fa, dist, 0
-        return angle, dist, 0
+        return None
 
-    def _search_pass(_db, allow_adjacent=False, max_dist=None, cross_ok=False):
-        """三阶段搜索，归属象限内搜索最佳位置。"""
+    def _search_pass(_db, allow_adj=False, max_dist_local=None):
+        """分阶段搜索，只返回无冲突位姿。"""
         nonlocal _allowed_quads
-        _allowed_quads = _allowed_quadrants(home_q, allow_adjacent=allow_adjacent, cross_ok=cross_ok)
-        _eff_max = max_dist if max_dist is not None else _max_len
-        distances = list(range(8, _eff_max + 1, 2))
+        _allowed_quads = _allowed_quadrants(
+            home_q, allow_adjacent=allow_adj or prefer_down, cross_ok=cross_ok)
+        # 走廊不再并入象限：只作 prefer / 短距快路径提示
+        _eff_max = max_dist_local if max_dist_local is not None else (
+            max_dist if max_dist is not None else _max_len)
+        distances = list(range(PREFERRED_DIAG_MIN, _eff_max + 1, 2))
         if is_pair:
             distances = [d + 4 for d in distances]
         _full_ao = [0, 5, -5, 10, -10, 15, -15, 20, -20, 25, -25, 30, -30,
                      35, -35, 40, -40, 45, -45, 50, -50, 55, -55, 60, -60,
-                     65, -65, 70, -70, 75, -75, 80, -80, 85, -85, 90, -90,
-                     95, -95, 100, -100, 105, -105, 110, -110, 115, -115,
-                     120, -120, 125, -125, 130, -130, 135, -135, 140, -140,
-                     145, -145, 150, -150, 155, -155, 160, -160, 165, -165,
-                     170, -170, 175, -175, 180]
+                     70, -70, 80, -80, 90, -90, 100, -100, 120, -120, 150, -150, 180]
 
-        def _try_place(dist, ao_list):
+        def _try_place(dist, ao_list, base_ang=None):
+            _base = _ideal_ang if base_ang is None else base_ang
             for offset in ao_list:
-                angle = (_ideal_ang + offset) % 360
+                angle = (_base + offset) % 360
                 rad = math.radians(angle)
                 if abs(math.sin(rad)) < math.sin(math.radians(ANGLE_MIN)): continue
                 if abs(math.cos(rad)) < math.cos(math.radians(ANGLE_MAX)): continue
                 if not _has_conflict(angle, dist, _db):
-                    _fa, _fd, _fs = _fine_tune(dist, angle, _db)
+                    ft = _fine_tune(dist, angle, _db)
+                    if ft is None:
+                        return 0, (angle, dist, 0)
+                    _fa, _fd, _fs = ft
                     if not _has_conflict(_fa, _fd, _db):
                         return _fs, (_fa, _fd, 0)
             return None
 
-        # Phase A: 短距离 8→24（半区内优先短引线）
+        def _try_place_bases(dist, ao_list):
+            # corridor first, then prefer / radial
+            bases = [_ideal_ang]
+            if prefer_ang is not None and _angle_delta_deg(_ideal_ang, prefer_ang) > 1:
+                bases.append(prefer_ang % 360)
+            if _gap_ang is not None and _angle_delta_deg(_ideal_ang, _gap_ang) > 1:
+                bases.append(_gap_ang)
+            if _angle_delta_deg(_ideal_ang, _radial_ang) > 1:
+                bases.append(_radial_ang)
+            for _b in bases:
+                result = _try_place(dist, ao_list, base_ang=_b)
+                if result:
+                    return result
+            return None
+
+        # 走廊短引线快路径：尽量把 tip / 文字中心落入空白条带
+        if _gap_ang is not None:
+            _gap_cap = min(int(_eff_max), 48)
+            _targets = []
+            if _gap_box is not None:
+                gx0, gy0, gx1, gy1 = _gap_box
+                gxm = 0.5 * (gx0 + gx1)
+                for gy in (wy, 0.5 * (gy0 + gy1), wy + 14, wy - 14,
+                           gy0 + 8, gy1 - 8):
+                    gy = max(gy0 + 2, min(gy1 - 2, gy))
+                    _targets.append((gxm, gy))
+                    _targets.append((0.35 * gx0 + 0.65 * gx1, gy))
+                    _targets.append((0.65 * gx0 + 0.35 * gx1, gy))
+            for (tx, ty) in _targets:
+                dx, dy = tx - wx, ty - wy
+                nd = math.hypot(dx, dy)
+                if nd < PREFERRED_DIAG_MIN or nd > _gap_cap:
+                    continue
+                na = math.degrees(math.atan2(dy, dx)) % 360
+                if not _has_conflict(na, nd, _db):
+                    return 0, (na, nd, 0)
+            for dist in range(PREFERRED_DIAG_MIN, _gap_cap + 1, 2):
+                for da in (0, 8, -8, 16, -16, 25, -25, 35, -35, 45, -45):
+                    _ga = (_gap_ang + da) % 360
+                    if not _has_conflict(_ga, dist, _db):
+                        # 若能进走廊盒，优先接受
+                        if _gap_box is not None:
+                            rad = math.radians(_ga)
+                            tipx = wx + dist * math.cos(rad)
+                            tipy = wy + dist * math.sin(rad)
+                            gx0, gy0, gx1, gy1 = _gap_box
+                            if gx0 <= tipx <= gx1 and gy0 <= tipy <= gy1:
+                                return 0, (_ga, dist, 0)
+                        else:
+                            return 0, (_ga, dist, 0)
+            # 兜底：任意朝走廊角且无冲突的短位姿
+            for dist in range(PREFERRED_DIAG_MIN, _gap_cap + 1, 2):
+                for da in (0, 10, -10, 20, -20, 30, -30):
+                    _ga = (_gap_ang + da) % 360
+                    if not _has_conflict(_ga, dist, _db):
+                        return 0, (_ga, dist, 0)
+
         _wide_ao = [0, 5, -5, 10, -10, 15, -15, 20, -20, 25, -25, 30, -30,
                     35, -35, 40, -40, 45, -45, 50, -50, 55, -55, 60, -60]
         _mid_ao = [0, 8, -8, 15, -15, 22, -22, 30, -30, 38, -38, 45, -45]
+        # 1) 短甜区 20–28 优先
         for dist in distances:
-            if dist > 24:
-                break
-            result = _try_place(dist, _wide_ao)
-            if result:
-                return result
-
-        # Phase B: 中距离 26→38
-        for dist in distances:
-            if dist < 26 or dist > 38:
+            if dist < 20 or dist > 28:
                 continue
-            result = _try_place(dist, _mid_ao)
+            result = _try_place_bases(dist, _mid_ao)
             if result:
                 return result
-
-        # Phase C: 空白环 40→50（短/中无解时再向外展开）
+        # 2) 更短带 18–20
         for dist in distances:
-            if dist < 40 or dist > 50:
+            if dist < PREFERRED_DIAG_MIN or dist > 20:
                 continue
-            result = _try_place(dist, _wide_ao)
+            result = _try_place_bases(dist, _wide_ao)
             if result:
                 return result
-
-        # Phase D: 长距离 52→max 全角度兜底
+        # 3) 略长但仍在适中带 30–38
         for dist in distances:
-            if dist < 52:
+            if dist < 30 or dist > 38:
                 continue
-            result = _try_place(dist, _full_ao)
+            result = _try_place_bases(dist, _wide_ao)
             if result:
                 return result
-
-        # Phase E: 剩余距离
+        # 4) ≥40 仅兜底
         for dist in distances:
-            if 24 < dist < 26 or 38 < dist < 40 or 50 < dist < 52:
+            if dist < 40:
                 continue
-            result = _try_place(dist, _full_ao)
+            result = _try_place_bases(dist, _full_ao)
             if result:
                 return result
 
-        # 评分兜底：初始化为象限首选角度，确保有效
-        _pref_angles = {1: 45, 2: 135, 3: 225, 4: 315}
-        _init_ang = _pref_angles.get(home_q, 45)
+        # 评分兜底：无走廊时稀疏；有走廊时围绕 gap 角加分扫，保证空白利用
         _best_score = -999999999
-        _best_result = (_init_ang, min(distances), 0)
-        for dist in distances:
-            for _off in range(0, 360, 30):
-                angle = (_ideal_ang + _off) % 360
-                rad = math.radians(angle)
-                if abs(math.sin(rad)) < math.sin(math.radians(ANGLE_MIN)): continue
-                if abs(math.cos(rad)) < math.cos(math.radians(ANGLE_MAX)): continue
-                if _has_conflict(angle, dist, _db): continue
-                score = _score_placement(wx, wy, angle, dist, lines, text_bboxes,
-                                         circles, placed_bboxes, placed_text_bboxes,
-                                         vx0, vy0, vx1, vy1,
-                                         _db, is_pair=is_pair, min_score=_best_score,
-                                         line_grid=_line_grid,
-                                         hatch_bboxes=hatch_bboxes,
-                                         other_view_bboxes=other_view_bboxes,
-                                         label_text=label_text,
-                                         wm_text_bboxes=wm_text_bboxes,
-                                         part_bbox=_part_bbox, prefer_down=prefer_down)
-                if score > _best_score:
-                    _best_score = score
-                    _best_result = (angle, dist, 0)
-        _bd, _bdst, _ = _best_result
-        _fa, _fd, _fs = _fine_tune(_bdst, _bd, _db)
-        if not _has_conflict(_fa, _fd, _db):
-            return _fs, (_fa, _fd, 0)
-        return 0, (_bd, _bdst, 0)
-
-    score, result = _search_pass(draw_bbox, allow_adjacent=False, max_dist=max_dist)
-    _fa, _fd, _ = result
-    if _score_placement(wx, wy, _fa, _fd, lines, text_bboxes,
-                        circles, placed_bboxes, placed_text_bboxes,
-                        vx0, vy0, vx1, vy1, draw_bbox, is_pair=is_pair,
-                        line_grid=_line_grid, hatch_bboxes=hatch_bboxes,
-                        other_view_bboxes=other_view_bboxes,
-                        home_q=home_q, label_text=label_text,
-                        wm_text_bboxes=wm_text_bboxes, part_bbox=_part_bbox,
-                        prefer_down=prefer_down) < -10000:
-        _ext_max = max_dist if max_dist is not None else _max_len + 16
-        _ext_score, _ext_result = _search_pass(draw_bbox, allow_adjacent=False,
-                                                max_dist=_ext_max)
-        _ext_fa, _ext_fd, _ = _ext_result
-        if _score_placement(wx, wy, _ext_fa, _ext_fd, lines, text_bboxes,
-                            circles, placed_bboxes, placed_text_bboxes,
-                            vx0, vy0, vx1, vy1, draw_bbox, is_pair=is_pair,
-                            line_grid=_line_grid, hatch_bboxes=hatch_bboxes,
-                            other_view_bboxes=other_view_bboxes,
-                            home_q=home_q, label_text=label_text,
-                            wm_text_bboxes=wm_text_bboxes, part_bbox=_part_bbox,
-                            prefer_down=prefer_down) >= -10000:
-            score, result = _ext_score, _ext_result
+        _best_result = None
+        if _gap_ang is not None:
+            _score_dists = [d for d in distances if d <= 44][::2] or distances[::3]
+            _score_offs = list(range(0, 90, 15)) + list(range(0, -90, -15))
+            _bases_sc = [_gap_ang, _ideal_ang]
+            if prefer_ang is not None:
+                _bases_sc.append(prefer_ang % 360)
         else:
-            print(f"    [warn] quadrant-fallback at ({wx:.1f},{wy:.1f}) home_q={home_q}")
-            score, result = _search_pass(draw_bbox, allow_adjacent=True, max_dist=max_dist)
-            _af, _ad, _ = result
-            if _score_placement(wx, wy, _af, _ad, lines, text_bboxes,
-                                circles, placed_bboxes, placed_text_bboxes,
-                                vx0, vy0, vx1, vy1, draw_bbox, is_pair=is_pair,
-                                line_grid=_line_grid, hatch_bboxes=hatch_bboxes,
-                                other_view_bboxes=other_view_bboxes,
-                                home_q=home_q, label_text=label_text,
-                                wm_text_bboxes=wm_text_bboxes, part_bbox=_part_bbox,
-                                prefer_down=prefer_down) < -10000:
-                score, result = _search_pass(draw_bbox, allow_adjacent=True,
-                                              max_dist=_ext_max)
-    # 硬约束：钳制过水平/过垂直；尽量回归 home 象限
-    _fa, _fd = result[0], result[1]
+            _score_dists = [d for d in distances if d in (
+                PREFERRED_DIAG_MIN, 24, 30, 38, 46) or (distances and d == distances[-1])]
+            if not _score_dists:
+                _score_dists = distances[::4]
+            _score_offs = list(range(0, 360, 60))
+            _bases_sc = [_ideal_ang]
+        for _base in _bases_sc:
+            for dist in _score_dists:
+                for _off in _score_offs:
+                    angle = (_base + _off) % 360
+                    rad = math.radians(angle)
+                    if abs(math.sin(rad)) < math.sin(math.radians(ANGLE_MIN)): continue
+                    if abs(math.cos(rad)) < math.cos(math.radians(ANGLE_MAX)): continue
+                    if _has_conflict(angle, dist, _db): continue
+                    score = _score_placement(wx, wy, angle, dist, lines, text_bboxes,
+                                             circles, placed_bboxes, placed_text_bboxes,
+                                             vx0, vy0, vx1, vy1,
+                                             _db, is_pair=is_pair, min_score=_best_score,
+                                             line_grid=_line_grid,
+                                             hatch_bboxes=hatch_bboxes,
+                                             other_view_bboxes=other_view_bboxes,
+                                             home_q=home_q, quad_cx=_vcx, quad_cy=_vcy,
+                                             label_text=label_text,
+                                             wm_text_bboxes=wm_text_bboxes,
+                                             part_bbox=_part_bbox, prefer_down=prefer_down,
+                                             neighbor_angles=neighbor_angles,
+                                             weld_pos=(wx, wy),
+                                             allow_adjacent=allow_adj or prefer_down or allow_adjacent,
+                                             corridor_quads=_corr_quads,
+                                             gap_prefer_ang=_gap_ang)
+                    if score > _best_score:
+                        _best_score = score
+                        _best_result = (angle, dist, 0)
+        if _best_result is not None:
+            _bd, _bdst, _ = _best_result
+            ft = _fine_tune(_bdst, _bd, _db)
+            if ft is not None:
+                _fa, _fd, _fs = ft
+                if not _has_conflict(_fa, _fd, _db):
+                    return _fs, (_fa, _fd, 0)
+            if not _has_conflict(_bd, _bdst, _db):
+                return 0, (_bd, _bdst, 0)
+        return None
+
+    _eff_cap = max_dist if max_dist is not None else _max_len
+    _eff_cap = min(max(int(_eff_cap), MIN_DIAG_LEN), _max_len)
+
+    result = _search_pass(draw_bbox, allow_adj=allow_adjacent or prefer_down,
+                          max_dist_local=_eff_cap)
+    if result is None or _has_conflict(result[1][0], result[1][1], draw_bbox):
+        # 中距优先：从 PREFERRED_DIAG_MIN 起扫角度，再逐步加长
+        _seed_ang = result[1][0] if result else _ideal_ang
+        _found = None
+        _ang_offs = (0, 8, -8, 15, -15, 25, -25, 35, -35, 45, -45, 60, -60)
+        for nd in range(PREFERRED_DIAG_MIN, _eff_cap + 1, 2):
+            for da in _ang_offs:
+                if not _has_conflict(_seed_ang + da, nd, draw_bbox):
+                    _found = (0, (_seed_ang + da, nd, 0))
+                    break
+            if _found:
+                break
+            if home_q in QUAD_ANGLE_RANGES:
+                a0, a1 = QUAD_ANGLE_RANGES[home_q]
+                for na in range(int(a0), int(a1) + 1, 5):
+                    if not _has_conflict(na, nd, draw_bbox):
+                        _found = (0, (na, nd, 0))
+                        break
+            if _found:
+                break
+        if _found:
+            result = _found
+        else:
+            if not hasattr(_search_placement, '_fb_seen'):
+                _search_placement._fb_seen = set()
+            _fk = (round(wx, 0), round(wy, 0), home_q)
+            if _fk not in _search_placement._fb_seen and len(_search_placement._fb_seen) < 8:
+                _search_placement._fb_seen.add(_fk)
+                print(f"    [warn] quadrant-fallback at ({wx:.1f},{wy:.1f}) home_q={home_q}")
+            result = _search_pass(draw_bbox, allow_adj=True, max_dist_local=_eff_cap)
+            if result is None or _has_conflict(result[1][0], result[1][1], draw_bbox):
+                # 仅接受框内最短无冲突位姿；绝不返回出框默认点
+                _frame_pose = _shortest_in_frame_pose(
+                    (wx, wy), label_text, draw_bbox, is_pair=is_pair,
+                    home_q=home_q, prefer_ang=_seed_ang, max_dist=_eff_cap)
+                if _frame_pose is not None:
+                    _fd0, _fa0 = _frame_pose
+                    # 在框内位姿上优先找无冲突的近邻
+                    _picked = None
+                    for nd in range(PREFERRED_DIAG_MIN, _eff_cap + 1, 2):
+                        for da in (0, 5, -5, 10, -10, 15, -15, 20, -20, 30, -30):
+                            na = _fa0 + da
+                            if not _has_conflict(na, nd, draw_bbox):
+                                _picked = (0, (na, nd, 0))
+                                break
+                        if _picked:
+                            break
+                    result = _picked if _picked else (0, (_fa0, max(_fd0, PREFERRED_DIAG_MIN), 0))
+                else:
+                    _pref = {1: 45, 2: 135, 3: 225, 4: 315}
+                    result = (0, (_pref.get(home_q, 45), min(PREFERRED_DIAG_SOFT, _eff_cap), 0))
+                    print(f"    [warn] unresolved placement at ({wx:.1f},{wy:.1f}) "
+                          f"label={label_text!r}")
+
+    # 硬约束：钳制过水平/过垂直；尽量回归 home 象限；最终硬门闩
+    _fa, _fd = result[1][0], result[1][1]
     _ang = _fa % 360
     _sin_a, _cos_a = math.sin(math.radians(_ang)), math.cos(math.radians(_ang))
     if abs(_sin_a) < math.sin(math.radians(ANGLE_MIN)):
         _fa = ANGLE_MIN if _ang < 90 or _ang > 270 else 180 - ANGLE_MIN
     elif abs(_cos_a) < math.cos(math.radians(ANGLE_MAX)):
         _fa = ANGLE_MAX if _ang < 180 else 180 + ANGLE_MAX
-    if home_q is not None and not _angle_in_quadrant(_fa, home_q):
-        _allowed_quads = {home_q}
+    # 仅当结果跑出允许象限（含走廊扩展）时才钳回；勿抹掉走廊位姿
+    if home_q is not None and not any(
+            _angle_in_quadrant(_fa, q) for q in _allowed_quads):
         _pref_angles = {1: 45, 2: 135, 3: 225, 4: 315}
         _candidates = [_pref_angles.get(home_q, 45)]
         a0, a1 = QUAD_ANGLE_RANGES[home_q]
@@ -2105,6 +3537,31 @@ def _search_placement(weld_pos, lines, text_bboxes, circles, placed_bboxes,
             if not _has_conflict(_ca, _fd, draw_bbox):
                 _fa = _ca
                 break
+    # 最终硬门闩：先同距换角，再从甜区起加长
+    if _has_conflict(_fa, _fd, draw_bbox):
+        _cleared = False
+        for nd in range(PREFERRED_DIAG_MIN, _eff_cap + 1, 2):
+            for da in (0, 8, -8, 15, -15, 25, -25, 35, -35):
+                if not _has_conflict(_fa + da, nd, draw_bbox):
+                    _fa, _fd = _fa + da, nd
+                    _cleared = True
+                    break
+            if _cleared:
+                break
+    # 内框硬不变量：文字必须在框内
+    _tbb_final = _text_bbox((wx, wy), _fd, _fa, label_text, is_pair=is_pair)
+    if draw_bbox is not None and not _text_in_inner_frame(_tbb_final, draw_bbox):
+        _fp = _shortest_in_frame_pose(
+            (wx, wy), label_text, draw_bbox, is_pair=is_pair,
+            home_q=home_q, prefer_ang=_fa, max_dist=_eff_cap)
+        if _fp is not None:
+            _fd, _fa = _fp
+            for nd in range(PREFERRED_DIAG_MIN, max(int(_fd), PREFERRED_DIAG_MIN) + 1, 2):
+                if not _has_conflict(_fa, nd, draw_bbox):
+                    t2 = _text_bbox((wx, wy), nd, _fa, label_text, is_pair=is_pair)
+                    if _text_in_inner_frame(t2, draw_bbox):
+                        _fd = nd
+                        break
     return 0, _fd, _fa
 
 
@@ -2143,10 +3600,14 @@ def _score_placement(wx, wy, angle_deg, dist, lines, text_bboxes, circles,
                      draw_bbox=None, is_pair=False, min_score=None, line_grid=None,
                      hatch_bboxes=None, other_view_bboxes=None,
                      home_q=None, quad_cx=None, quad_cy=None, label_text='',
-                     wm_text_bboxes=None, part_bbox=None, prefer_down=False):
+                     wm_text_bboxes=None, part_bbox=None, prefer_down=False,
+                     neighbor_angles=None, weld_pos=None, allow_adjacent=False,
+                     corridor_quads=None, gap_prefer_ang=None):
     """对 (角度, 距离) 位置评分。分值越高越推荐，正分表示无冲突，负分表示冲突严重。"""
     if wm_text_bboxes is None:
         wm_text_bboxes = []
+    if neighbor_angles is None:
+        neighbor_angles = []
     _part_bbox = part_bbox if part_bbox else (vx0, vy0, vx1, vy1)
     score = 0
     rad = math.radians(angle_deg)
@@ -2162,7 +3623,7 @@ def _score_placement(wx, wy, angle_deg, dist, lines, text_bboxes, circles,
     hy = ey
 
     lw = _label_text_width(label_text, is_pair)
-    lh = LABEL_HEIGHT
+    lh = _lh()
     if h_land >= 0:
         bx0, bx1 = hx - lw, hx
     else:
@@ -2174,8 +3635,14 @@ def _score_placement(wx, wy, angle_deg, dist, lines, text_bboxes, circles,
     _vcy_s = quad_cy if quad_cy is not None else (vy0 + vy1) / 2.0
     _cx_cand = (bx0 + bx1) / 2.0
     _cy_cand = (by0 + by1) / 2.0
+    _corr = set()  # 不再用走廊扩展允许象限
+    if other_view_bboxes and gap_prefer_ang is None:
+        _, _auto_gap, _ = _corridor_info(
+            wx, wy, _part_bbox, other_view_bboxes, home_q=home_q)
+        gap_prefer_ang = _auto_gap
     if home_q is not None:
-        _allowed = _allowed_quadrants(home_q, allow_adjacent=prefer_down)
+        _allowed = set(_allowed_quadrants(
+            home_q, allow_adjacent=prefer_down or allow_adjacent))
         if not any(_angle_in_quadrant(angle_deg, q) for q in _allowed):
             score -= 50000
         _label_q = _pos_home_quadrant(_cx_cand, _cy_cand, _vcx_s, _vcy_s)
@@ -2190,7 +3657,7 @@ def _score_placement(wx, wy, angle_deg, dist, lines, text_bboxes, circles,
     if prefer_down:
         if _cy_cand < wy - 1.0:
             score += 90
-        elif _cy_cand > wy + LABEL_HEIGHT * 0.5:
+        elif _cy_cand > wy + _lh() * 0.5:
             score -= 120
         if home_q in (3, 4):
             if sin_a < -0.15:
@@ -2253,45 +3720,46 @@ def _score_placement(wx, wy, angle_deg, dist, lines, text_bboxes, circles,
         if 0 < _prox < BOUNDARY_MARGIN * 2:
             score -= (BOUNDARY_MARGIN * 2 - _prox) * 800
 
-    # Part 视图与内框之间的空白环偏好
+    # Part-only 空白环偏好（part_bbox 必须是 part_only，不是整视图框）
     _inside_part = (px0 <= _cx_cand <= px1 and py0 <= _cy_cand <= py1)
+    _inside_inner = True
     if draw_bbox is not None:
         dbx0, dby0, dbx1, dby1 = draw_bbox
         _inside_inner = (dbx0 <= _cx_cand <= dbx1 and dby0 <= _cy_cand <= dby1)
         if _inside_inner and not _inside_part:
-            score += 50
+            score += 300
     if _inside_part:
-        score -= 200
+        score -= 1800
 
-    # 跨视图重叠惩罚：渐进式距离惩罚，越接近其他视图边界扣分越多
+    # 跨视图：硬罚真正压入邻视图；走廊空白（两视图之间）反而加分，勿用近距大罚把标签赶走
     if other_view_bboxes:
         nbb = (min(wx, ex, bx0), max(wx, ex, bx1),
                min(wy, ey, by0), max(wy, ey, by1))
-        _OV_MARGIN = 25
-        _OV_PROX = 60
+        _in_other_txt = False
         for _ovb in other_view_bboxes:
             if _ovb == (vx0, vy0, vx1, vy1):
                 continue
-            _ov_x_in = max(0, min(nbb[1], _ovb[2] + _OV_MARGIN) - max(nbb[0], _ovb[0] - _OV_MARGIN))
-            _ov_y_in = max(0, min(nbb[3], _ovb[3] + _OV_MARGIN) - max(nbb[2], _ovb[1] - _OV_MARGIN))
-            if _ov_x_in > 0 and _ov_y_in > 0:
-                score -= max(100000, _ov_x_in * _ov_y_in * 8)
-            else:
-                _dx = max(0, _ovb[0] - _OV_MARGIN - nbb[1], nbb[0] - _ovb[2] - _OV_MARGIN)
-                _dy = max(0, _ovb[1] - _OV_MARGIN - nbb[3], nbb[2] - _ovb[3] - _OV_MARGIN)
-                _prox = math.hypot(_dx, _dy)
-                if _prox < _OV_PROX:
-                    score -= (_OV_PROX - _prox) * 100
-
-    # 跨视图重叠惩罚（完整标注包围盒 vs 其他视图边界）
-    if other_view_bboxes:
-        nbb = (min(wx, ex, bx0), max(wx, ex, bx1),
-               min(wy, ey, by0), max(wy, ey, by1))
-        for _ovb in other_view_bboxes:
-            if _ovb == (vx0, vy0, vx1, vy1):
-                continue
-            if nbb[1] > _ovb[0] - 10 and nbb[0] < _ovb[2] + 10 and nbb[3] > _ovb[1] - 10 and nbb[2] < _ovb[3] + 10:
-                score -= 50000
+            if _point_in_bbox_xyxy(_cx_cand, _cy_cand, _ovb, mrg=4):
+                _in_other_txt = True
+                score -= 100000
+            # leader/text 包围盒真正切入邻视图
+            if (nbb[1] > _ovb[0] and nbb[0] < _ovb[2]
+                    and nbb[3] > _ovb[1] and nbb[2] < _ovb[3]):
+                score -= 80000
+        if _inside_inner and not _inside_part and not _in_other_txt:
+            # 视图间走廊：空白区优先，但角度须在归属/同半区（已由上方硬罚保证）
+            score += 900
+            if gap_prefer_ang is not None:
+                _gdev = _angle_delta_deg(angle_deg, gap_prefer_ang)
+                if _gdev < 40:
+                    score += (40 - _gdev) * 14
+            if dist <= 36:
+                score += (36 - dist) * 6
+            # 标签 Y 相对焊点方向应与 home 上/下一致
+            if home_q in (1, 2) and _cy_cand >= wy - 2:
+                score += 80
+            if home_q in (3, 4) and _cy_cand <= wy + 2:
+                score += 80
 
     # 水平接地线与几何线交叉：扣30
     for (sx, sy), (ex2, ey2) in _near_lines:
@@ -2399,13 +3867,15 @@ def _score_placement(wx, wy, angle_deg, dist, lines, text_bboxes, circles,
     # 奖励远离构件几何边
     score += min(_min_center_dist, 20) * 8
 
-    # 适度短引线偏好 + 极长引线轻惩罚
+    # 适中引线：过短与过长都扣分（偏短胜出）
+    if dist < PREFERRED_DIAG_MIN:
+        score -= (PREFERRED_DIAG_MIN - dist) * 20
     if dist > PREFERRED_DIAG_SOFT:
-        score -= (dist - PREFERRED_DIAG_SOFT) * 3
+        score -= (dist - PREFERRED_DIAG_SOFT) * 12
     if dist > PREFERRED_DIAG_HARD:
-        score -= (dist - PREFERRED_DIAG_HARD) * 5
-    if dist > 90:
-        score -= (dist - 90) * 1.5
+        score -= (dist - PREFERRED_DIAG_HARD) * 25
+    if dist > 42:
+        score -= (dist - 42) * 30
 
     # 文字与圆/弧重叠：扣30
     for (ccx, ccy, cr) in circles:
@@ -2428,8 +3898,8 @@ def _score_placement(wx, wy, angle_deg, dist, lines, text_bboxes, circles,
     # 同高度横向拥挤惩罚
     for otb in placed_text_bboxes:
         ocy = (otb[2] + otb[3]) / 2
-        if abs(_cy_cand - ocy) < LABEL_HEIGHT * 2:
-            if not (bx1 < otb[0] - LABEL_HEIGHT * 4 or bx0 > otb[1] + LABEL_HEIGHT * 4):
+        if abs(_cy_cand - ocy) < _lh() * 2:
+            if not (bx1 < otb[0] - _lh() * 4 or bx0 > otb[1] + _lh() * 4):
                 score -= 800
 
     # WM / 3 SIDES TYP 重叠惩罚
@@ -2444,6 +3914,19 @@ def _score_placement(wx, wy, angle_deg, dist, lines, text_bboxes, circles,
     _ang_dev = abs(_ang - 45)
     if _ang_dev > 20:
         score -= (_ang_dev - 20) * 5
+
+    # 近邻分向：同簇夹角过小惩罚，约 60–120° 加分
+    _wp = weld_pos if weld_pos is not None else (wx, wy)
+    for npos, nang in neighbor_angles:
+        if math.hypot(npos[0] - _wp[0], npos[1] - _wp[1]) > CLUSTER_RADIUS:
+            continue
+        gap = _angle_delta_deg(angle_deg, nang)
+        if gap < DIVERGE_SCORE_CLOSE:
+            score -= (DIVERGE_SCORE_CLOSE - gap) * 40
+        elif 55 <= gap <= 125:
+            score += 120
+        elif gap > 150:
+            score += 40
 
     return score
 
@@ -2484,20 +3967,24 @@ def _assign_y_slots(placements, placed_text_bboxes, placed_bboxes,
                     cross_view_text_bboxes, part_bbox, part_down_bbox=None):
     """Stagger labels at similar Y that crowd horizontally."""
     _down_ref = part_down_bbox if part_down_bbox is not None else part_bbox
-    y_tol = LABEL_HEIGHT * 0.8
-    x_gap = LABEL_HEIGHT * 4
-    slot_h = Y_SLOT_HEIGHT
+    y_tol = _lh() * 0.8
+    x_gap = _lh() * 4
+    slot_h = _y_slot_height()
 
     def _crowded(i, j):
         tbb_i, tbb_j = placed_text_bboxes[i], placed_text_bboxes[j]
         cy_i = (tbb_i[2] + tbb_i[3]) / 2
         cy_j = (tbb_j[2] + tbb_j[3]) / 2
-        if abs(cy_i - cy_j) > y_tol:
+        li = str(placements[i][4])
+        lj = str(placements[j][4])
+        _y_lim = y_tol * (2.2 if (li.startswith('W') and lj.startswith('W')) else 1.0)
+        if abs(cy_i - cy_j) > _y_lim:
             return False
         if tbb_i[1] < tbb_j[0] - x_gap or tbb_i[0] > tbb_j[1] + x_gap:
             return False
         return (_text_overlaps(tbb_i, tbb_j, OVERLAP_MARGIN) or
-                min(abs(tbb_i[0] - tbb_j[1]), abs(tbb_j[0] - tbb_i[1])) < x_gap)
+                min(abs(tbb_i[0] - tbb_j[1]), abs(tbb_j[0] - tbb_i[1])) < x_gap or
+                (li.startswith('W') and lj.startswith('W') and abs(cy_i - cy_j) < slot_h))
 
     for i in range(len(placements)):
         if not any(_crowded(i, j) for j in range(i)):
@@ -2542,10 +4029,14 @@ def _assign_y_slots(placements, placed_text_bboxes, placed_bboxes,
                 best_score = score
                 best = (nd, na, nbb, tbb)
 
+        # 先同距换角，再少量加长
+        for slot_mult in (1, -1, 2, -2):
+            for deg_step in (5, 8, 10, 15, 20):
+                _try(ds_i, ag_i + slot_mult * deg_step)
         for slot_mult in (1, -1, 2, -2):
             for deg_step in (5, 8, 10, 20):
-                for extra in (4, 8, 12):
-                    nd = min(ds_i + extra, _max_len + 8)
+                for extra in (2, 4, 8):
+                    nd = min(ds_i + extra, _max_len)
                     na = ag_i + slot_mult * deg_step
                     _try(nd, na)
         _, nd_s, na_s = _search_placement(
@@ -2556,7 +4047,7 @@ def _assign_y_slots(placements, placed_text_bboxes, placed_bboxes,
             home_q=hq, quad_cx=quad_cx, quad_cy=quad_cy,
             other_view_part_bboxes=other_view_part_bboxes,
             label_text=ltk_i, wm_text_bboxes=wm_text_bboxes,
-            part_bbox=part_bbox, max_dist=_max_len + 12)
+            part_bbox=part_bbox, max_dist=_max_len, allow_adjacent=True)
         _try(nd_s, na_s)
 
         if best:
@@ -2581,7 +4072,7 @@ def _redistribute_groups(groups, centroids, view_bbox=None):
         if len(entries) <= 1:
             continue
         wx, wy = pos_key
-        _y_step = LABEL_HEIGHT * 5.0
+        _y_step = _lh() * 5.0
         for i_idx, (gi, gtype) in enumerate(entries):
             if i_idx == 0:
                 continue
@@ -2621,6 +4112,7 @@ def _resolve_label_conflicts(msp, lines, text_bboxes, circles,
     if wm_text_bboxes is None:
         wm_text_bboxes = []
     _part_bbox = part_bbox if part_bbox else (vx0, vy0, vx1, vy1)
+    _total_fixes = 0
 
     def _foreign_text_bboxes(skip_idx):
         return _cross_text + [otb for k, otb in enumerate(placed_text_bboxes) if k != skip_idx]
@@ -2700,17 +4192,22 @@ def _resolve_label_conflicts(msp, lines, text_bboxes, circles,
         hx = ex + h_land
         hy = ey
 
-        # 水平接地线与几何线交叉
-        _cx0, _cx1 = min(nbb[0], hx, ex), max(nbb[1], hx, ex)
-        _cy0, _cy1 = min(nbb[2], hy, ey), max(nbb[3], hy, ey)
+        # 水平接地线 / 对角引线 与几何线交叉
+        _cx0, _cx1 = min(nbb[0], hx, ex, wx), max(nbb[1], hx, ex, wx)
+        _cy0, _cy1 = min(nbb[2], hy, ey, wy), max(nbb[3], hy, ey, wy)
         for (sx, sy), (ex2, ey2) in lines:
             if max(sx, ex2) < _cx0 - 5 or min(sx, ex2) > _cx1 + 5: continue
             if max(sy, ey2) < _cy0 - 5 or min(sy, ey2) > _cy1 + 5: continue
             if _segments_cross_((ex, ey), (hx, hy), (sx, sy), (ex2, ey2)):
                 return None
+            if _segments_cross_((wx, wy), (ex, ey), (sx, sy), (ex2, ey2)):
+                return None
 
-        # 斜引线与图纸文字框交叉
+        # 斜引线与图纸文字框 / WM 文字交叉
         for (tx0, tx1, ty0, ty1) in text_bboxes:
+            if _seg_cross_rect((wx, wy), (ex, ey), tx0, tx1, ty0, ty1):
+                return None
+        for (tx0, tx1, ty0, ty1) in wm_text_bboxes:
             if _seg_cross_rect((wx, wy), (ex, ey), tx0, tx1, ty0, ty1):
                 return None
 
@@ -2729,17 +4226,21 @@ def _resolve_label_conflicts(msp, lines, text_bboxes, circles,
             if _seg_cross_rect((ex, ey), (hx, hy), tx0, tx1, ty0, ty1):
                 return None
 
-        # 文字与圆/弧重叠
+        # 文字与圆/弧重叠；对角引线不得穿 WM 圆
         for (ccx, ccy, cr) in circles:
             if not (_tbb[1] < ccx - cr or _tbb[0] > ccx + cr or
                     _tbb[3] < ccy - cr or _tbb[2] > ccy + cr):
                 return None
+            if _dist_pt_to_seg((ccx, ccy), (wx, wy), (ex, ey))[0] < cr:
+                return None
 
-        # 文字与 HATCH 填充区重叠
+        # 文字与 HATCH 填充区重叠；对角引线不得穿 hatch
         if hatch_bboxes:
             for (hx0, hx1, hy0, hy1) in hatch_bboxes:
                 if not (_tbb[1] < hx0 - _OVERLAP_MARGIN or _tbb[0] > hx1 + _OVERLAP_MARGIN or
                         _tbb[3] < hy0 - _OVERLAP_MARGIN or _tbb[2] > hy1 + _OVERLAP_MARGIN):
+                    return None
+                if _seg_cross_rect((wx, wy), (ex, ey), hx0, hx1, hy0, hy1):
                     return None
 
         if _text_near_lines(_tbb, lines):
@@ -2763,24 +4264,32 @@ def _resolve_label_conflicts(msp, lines, text_bboxes, circles,
                     # 文字不重叠，检查引线是否穿过对方文字
                     if not (_leader_crosses_text(pos_i, ds_i, ag_i, gi, tbb_j, ltk_i) or
                             _leader_crosses_text(pos_j, ds_j, ag_j, gj, tbb_i, ltk_j)):
-                        # Also check leader-leader crossing (<45° must fix)
+                        # 引线交叉：近邻焊点一律尝试修复；远距仅修锐角(<50°)
                         _h_i = _horiz_land(ltk_i, gi == 'pair')
                         _h_j = _horiz_land(ltk_j, gj == 'pair')
                         _crosses, _cross_ang = _leader_crosses_leader(
                             pos_i, ds_i, ag_i, _h_i, pos_j, ds_j, ag_j, _h_j)
-                        if not _crosses or (_cross_ang and _cross_ang >= 45):
+                        _near_w = math.hypot(
+                            pos_i[0] - pos_j[0], pos_i[1] - pos_j[1]) <= CLUSTER_RADIUS * 1.5
+                        if not _crosses:
                             continue
-                        # Cross angle < 45° → try to fix
+                        if (not _near_w) and _cross_ang is not None and _cross_ang >= 50:
+                            continue
                         _cross_fixed = False
                         for target, g, it, lb, pos, ltk, ds, ag in [
                             (j, gj, it_j, lb_j, pos_j, ltk_j, ds_j, ag_j),
                             (i, gi, it_i, lb_i, pos_i, ltk_i, ds_i, ag_i),
                         ]:
-                            for d_a in [15, -15, 30, -30, 45, -45]:
-                                na = ag + d_a
+                            _hq_t = _weld_home_quadrant(pos[0], pos[1], _vcx, _vcy)
+                            _pref_t = {1: 55, 2: 135, 3: 225, 4: 315}.get(_hq_t, ag)
+                            for na in (_pref_t, ag + 20, ag - 20, ag + 35, ag - 35,
+                                       ag + 45, ag - 45, ag + 15, ag - 15):
                                 ra = math.radians(na % 360)
                                 if abs(math.sin(ra)) < math.sin(math.radians(ANGLE_MIN)): continue
                                 if abs(math.cos(ra)) < math.cos(math.radians(ANGLE_MAX)): continue
+                                if not any(_angle_in_quadrant(na, q) for q in
+                                           _allowed_quadrants(_hq_t, allow_adjacent=True)):
+                                    continue
                                 result = _adjust_safe(target, pos, ltk, ds, na, g, target)
                                 if result:
                                     nbb, tbb = result
@@ -2788,7 +4297,22 @@ def _resolve_label_conflicts(msp, lines, text_bboxes, circles,
                                     placed_text_bboxes[target] = tbb
                                     _cross_fixed = True
                                     break
-                            if _cross_fixed: break
+                            if _cross_fixed:
+                                break
+                            for nd in range(PREFERRED_DIAG_MIN, min(int(ds) + 16, MAX_DIAG_LEN) + 1, 4):
+                                for d_a in (20, -20, 35, -35, 45, -45):
+                                    na = ag + d_a
+                                    result = _adjust_safe(target, pos, ltk, nd, na, g, target)
+                                    if result:
+                                        nbb, tbb = result
+                                        placements[target] = (g, it, lb, pos, ltk, nd, na, nbb)
+                                        placed_text_bboxes[target] = tbb
+                                        _cross_fixed = True
+                                        break
+                                if _cross_fixed:
+                                    break
+                            if _cross_fixed:
+                                break
                         if _cross_fixed:
                             _fixed = True
                             break
@@ -2802,12 +4326,46 @@ def _resolve_label_conflicts(msp, lines, text_bboxes, circles,
                     (i, gi, it_i, lb_i, pos_i, ltk_i, ds_i, ag_i),
                 ]:
                     _max_len = MAX_DIAG_LEN_PAIR if g == 'pair' else MAX_DIAG_LEN
-                    # --- 距离微调（含 Y 槽位错开）---
-                    _dist_tries = [1, -1, 2, -2, 4, -4, 8, -8, 12, -12, 16, -16, 20, -20, 24, -24, 32, -32, 40, -40]
+                    # --- 先同距换角 ---
+                    for d_a in [1, -1, 2, -2, 3, -3, 5, -5, 8, -8, 12, -12, 15, -15, 20, -20, 25, -25, 30, -30]:
+                        na = ag + d_a
+                        r5 = math.radians(na % 360)
+                        if abs(math.sin(r5)) < math.sin(math.radians(ANGLE_MIN)): continue
+                        if abs(math.cos(r5)) < math.cos(math.radians(ANGLE_MAX)): continue
+                        result = _adjust_safe(target, pos, ltk, ds, na, g, target)
+                        if result:
+                            nbb, tbb = result
+                            placements[target] = (g, it, lb, pos, ltk, ds, na, nbb)
+                            placed_text_bboxes[target] = tbb
+                            _fixed = True
+                            break
+                    if _fixed: break
+
+                    # --- 方向翻转（同距优先）---
+                    _opp_ang = (ag + 180) % 360
+                    for _oa in [_opp_ang, (_opp_ang-12)%360, (_opp_ang+12)%360,
+                                (_opp_ang-24)%360, (_opp_ang+24)%360]:
+                        r6 = math.radians(_oa)
+                        if abs(math.sin(r6)) < math.sin(math.radians(ANGLE_MIN)): continue
+                        if abs(math.cos(r6)) < math.cos(math.radians(ANGLE_MAX)): continue
+                        for od in [ds, ds - 4, ds + 4, ds - 8, ds + 8]:
+                            if od < MIN_DIAG_LEN or od > _max_len: continue
+                            result = _adjust_safe(target, pos, ltk, od, _oa, g, target)
+                            if result:
+                                nbb, tbb = result
+                                placements[target] = (g, it, lb, pos, ltk, od, _oa, nbb)
+                                placed_text_bboxes[target] = tbb
+                                _fixed = True
+                                break
+                        if _fixed: break
+                    if _fixed: break
+
+                    # --- 再小步调距（含 Y 槽位）---
+                    _dist_tries = [1, -1, 2, -2, 4, -4, 8, -8, 12, -12, 16, -16, 20, -20]
                     _ang_tries = [0, 8, -8, 12, -12, 15, -15, 20, -20]
                     for d_dist in _dist_tries:
                         for y_slot in (0, 1, -1, 2, -2):
-                            nd = ds + d_dist + abs(y_slot) * 4
+                            nd = ds + d_dist + abs(y_slot) * 2
                             if nd < MIN_DIAG_LEN or nd > _max_len:
                                 continue
                             for d_a in _ang_tries:
@@ -2826,25 +4384,10 @@ def _resolve_label_conflicts(msp, lines, text_bboxes, circles,
                     if _fixed:
                         break
 
-                    # --- 角度微调 ---
-                    for d_a in [1, -1, 2, -2, 3, -3, 5, -5, 8, -8, 12, -12, 15, -15, 20, -20, 25, -25, 30, -30]:
-                        na = ag + d_a
-                        r5 = math.radians(na % 360)
-                        if abs(math.sin(r5)) < math.sin(math.radians(ANGLE_MIN)): continue
-                        if abs(math.cos(r5)) < math.cos(math.radians(ANGLE_MAX)): continue
-                        result = _adjust_safe(target, pos, ltk, ds, na, g, target)
-                        if result:
-                            nbb, tbb = result
-                            placements[target] = (g, it, lb, pos, ltk, ds, na, nbb)
-                            placed_text_bboxes[target] = tbb
-                            _fixed = True
-                            break
-                    if _fixed: break
-
-                    # 距离增大 + 角度偏移 组合尝试
+                    # 距离增大 + 角度偏移（上限 MAX_DIAG_LEN）
                     for d_dist in [4, 8, 12, 16, 20, 24]:
                         nd = ds + d_dist
-                        if nd < 6 or nd > _max_len: continue
+                        if nd < MIN_DIAG_LEN or nd > _max_len: continue
                         for d_a in [-15, -10, -5, 5, 10, 15, 20, 25, 30]:
                             na = ag + d_a
                             r6 = math.radians(na % 360)
@@ -2860,33 +4403,15 @@ def _resolve_label_conflicts(msp, lines, text_bboxes, circles,
                         if _fixed: break
                     if _fixed: break
 
-                    # --- 方向翻转（角度+180°）---
-                    _opp_ang = (ag + 180) % 360
-                    for _oa in [_opp_ang, (_opp_ang-12)%360, (_opp_ang+12)%360,
-                                (_opp_ang-24)%360, (_opp_ang+24)%360]:
-                        r6 = math.radians(_oa)
-                        if abs(math.sin(r6)) < math.sin(math.radians(ANGLE_MIN)): continue
-                        if abs(math.cos(r6)) < math.cos(math.radians(ANGLE_MAX)): continue
-                        for od in [ds, ds+4, ds-4, ds+8, ds-8]:
-                            if od < 8 or od > 60: continue
-                            result = _adjust_safe(target, pos, ltk, od, _oa, g, target)
-                            if result:
-                                nbb, tbb = result
-                                placements[target] = (g, it, lb, pos, ltk, od, _oa, nbb)
-                                placed_text_bboxes[target] = tbb
-                                _fixed = True
-                                break
-                        if _fixed: break
-                    if _fixed: break
-
-                    # --- 全局重新搜索（兜底）---
+                    # --- 全局重新搜索（兜底，不超 MAX_DIAG_LEN）---
                     _, _ds, _ag = _search_placement(
                         pos, lines, text_bboxes, circles,
                         [p[7] for p in placements], _cross_text + placed_text_bboxes,
                         vx0, vy0, vx1, vy1, draw_bbox,
                         is_pair=(g == 'pair'), hatch_bboxes=hatch_bboxes, other_view_bboxes=other_view_bboxes,
                         other_view_part_bboxes=other_view_part_bboxes,
-                        label_text=ltk, wm_text_bboxes=wm_text_bboxes, part_bbox=_part_bbox)
+                        label_text=ltk, wm_text_bboxes=wm_text_bboxes, part_bbox=_part_bbox,
+                        max_dist=_max_len, allow_adjacent=True)
                     _re_result = _adjust_safe(target, pos, ltk, _ds, _ag, g, target)
                     if _re_result:
                         _nbb, _tbb = _re_result
@@ -2896,13 +4421,14 @@ def _resolve_label_conflicts(msp, lines, text_bboxes, circles,
 
                 if _fixed:
                     _any_fix = True
+                    _total_fixes += 1
 
         if not _any_fix:
             break
 
     # ---- 标注-WM文字重叠专项修复 ----
     if wm_text_bboxes or text_bboxes or hatch_bboxes:
-        for _wm_iter in range(10):
+        for _wm_iter in range(2):
             _wm_fixed = False
             n = len(placements)
             for ki in range(n):
@@ -2932,21 +4458,9 @@ def _resolve_label_conflicts(msp, lines, text_bboxes, circles,
                 if not _wm_over:
                     continue
                 _max_len = MAX_DIAG_LEN_PAIR if gi == 'pair' else MAX_DIAG_LEN
-                _ext_max = _max_len + 40
-                # --- 优先向外增大距离 ---
-                for d_dist in [8, 12, 16, 20, 24, 28, 32, 36, 40, 44, 48, 52, 56, 60,
-                               4, -4, -8, 1, -1, 2, -2]:
-                    nd = dsi + d_dist
-                    if nd < 6 or nd > _ext_max: continue
-                    result = _adjust_safe(ki, pi, ltki, nd, agi, gi, ki)
-                    if result:
-                        nbb, tbb = result
-                        placements[ki] = (gi, iti, lbi, pi, ltki, nd, agi, nbb)
-                        placed_text_bboxes[ki] = tbb
-                        _wm_fixed = True; break
-                if _wm_fixed: continue
-                # --- 角度微调 ---
-                for d_a in [1, -1, 2, -2, 3, -3, 5, -5, 8, -8, 12, -12, 15, -15, 20, -20, 30, -30]:
+                _ext_max = _max_len
+                # --- 优先小角度微调（保留原长度）---
+                for d_a in [5, -5, 8, -8, 12, -12, 15, -15, 20, -20, 3, -3, 1, -1, 25, -25, 30, -30]:
                     na = agi + d_a
                     r5 = math.radians(na % 360)
                     if abs(math.sin(r5)) < math.sin(math.radians(ANGLE_MIN)): continue
@@ -2958,11 +4472,22 @@ def _resolve_label_conflicts(msp, lines, text_bboxes, circles,
                         placed_text_bboxes[ki] = tbb
                         _wm_fixed = True; break
                 if _wm_fixed: continue
-                # --- 距离+角度组合（限 ±40° 防止跨半区引线交叉）---
+                # --- 适度拉长 / 缩短（同角度）---
+                for d_dist in [4, -4, 8, -8, 12, -12, 16, 20, 24, 28, 32, 36, 40, 44, 48]:
+                    nd = dsi + d_dist
+                    if nd < 6 or nd > _ext_max: continue
+                    result = _adjust_safe(ki, pi, ltki, nd, agi, gi, ki)
+                    if result:
+                        nbb, tbb = result
+                        placements[ki] = (gi, iti, lbi, pi, ltki, nd, agi, nbb)
+                        placed_text_bboxes[ki] = tbb
+                        _wm_fixed = True; break
+                if _wm_fixed: continue
+                # --- 距离+角度组合（限 ±40°）---
                 for c_dist in [4, 6, 8, 10, 12, 16, 20, 24, 28, 32, 36, 40, 44, 48]:
                     nd = dsi + c_dist
                     if nd < 6 or nd > _ext_max: continue
-                    for c_ang in [-40, -30, -25, -20, -15, -10, -5, 5, 10, 15, 20, 25, 30, 40]:
+                    for c_ang in [-15, 15, -10, 10, -20, 20, -25, 25, -30, 30, -40, 40, -5, 5]:
                         na = agi + c_ang
                         r_c = math.radians(na % 360)
                         if abs(math.sin(r_c)) < math.sin(math.radians(ANGLE_MIN)): continue
@@ -2995,7 +4520,7 @@ def _resolve_label_conflicts(msp, lines, text_bboxes, circles,
                 break
 
     # ---- 文字与构件边重合专项修复 ----
-    for _line_iter in range(8):
+    for _line_iter in range(2):
         _line_fixed = False
         n = len(placements)
         for ki in range(n):
@@ -3004,20 +4529,8 @@ def _resolve_label_conflicts(msp, lines, text_bboxes, circles,
             if not _text_near_lines(tbbi, lines):
                 continue
             _max_len = MAX_DIAG_LEN_PAIR if gi == 'pair' else MAX_DIAG_LEN
-            _ext_max = _max_len + 40
-            for d_dist in [2, -2, 4, -4, 8, -8, 12, -12, 16, -16, 20, -20, 24, -24, 28, -28, 32, -32, 36, -36, 40]:
-                nd = dsi + d_dist
-                if nd < 6 or nd > _ext_max:
-                    continue
-                result = _adjust_safe(ki, pi, ltki, nd, agi, gi, ki)
-                if result:
-                    nbb, tbb = result
-                    placements[ki] = (gi, iti, lbi, pi, ltki, nd, agi, nbb)
-                    placed_text_bboxes[ki] = tbb
-                    _line_fixed = True
-                    break
-            if _line_fixed:
-                continue
+            _ext_max = _max_len
+            # 先小角度，再适度距离
             for d_a in [5, -5, 10, -10, 15, -15, 20, -20, 25, -25, 30, -30]:
                 na = agi + d_a
                 r5 = math.radians(na % 360)
@@ -3034,11 +4547,24 @@ def _resolve_label_conflicts(msp, lines, text_bboxes, circles,
                     break
             if _line_fixed:
                 continue
+            for d_dist in [2, -2, 4, -4, 8, -8, 12, -12, 16, -16, 20, -20, 24, -24, 28, -28, 32, -32, 36, -36, 40]:
+                nd = dsi + d_dist
+                if nd < 6 or nd > _ext_max:
+                    continue
+                result = _adjust_safe(ki, pi, ltki, nd, agi, gi, ki)
+                if result:
+                    nbb, tbb = result
+                    placements[ki] = (gi, iti, lbi, pi, ltki, nd, agi, nbb)
+                    placed_text_bboxes[ki] = tbb
+                    _line_fixed = True
+                    break
+            if _line_fixed:
+                continue
             for c_dist in [6, 10, 14, 18, 22, 26, 30, 34, 38, 42, 46]:
                 nd = dsi + c_dist
                 if nd < 6 or nd > _ext_max:
                     continue
-                for c_ang in [-35, -25, -15, -10, 10, 15, 25, 35]:
+                for c_ang in [-15, 15, -10, 10, -25, 25, -35, 35]:
                     na = agi + c_ang
                     r_c = math.radians(na % 360)
                     if abs(math.sin(r_c)) < math.sin(math.radians(ANGLE_MIN)):
@@ -3056,27 +4582,131 @@ def _resolve_label_conflicts(msp, lines, text_bboxes, circles,
                     break
             if _line_fixed:
                 continue
-            _, _ds, _ag = _search_placement(
-                pi, lines, text_bboxes, circles,
-                [p[7] for p in placements], _cross_text + placed_text_bboxes,
-                vx0, vy0, vx1, vy1, draw_bbox,
-                is_pair=(gi == 'pair'), hatch_bboxes=hatch_bboxes,
-                other_view_bboxes=other_view_bboxes,
-                home_q=_weld_home_quadrant(pi[0], pi[1], _vcx, _vcy),
-                quad_cx=_vcx, quad_cy=_vcy,
-                other_view_part_bboxes=other_view_part_bboxes,
-                max_dist=_ext_max, label_text=ltki,
-                wm_text_bboxes=wm_text_bboxes, part_bbox=_part_bbox)
-            _re_result = _adjust_safe(ki, pi, ltki, _ds, _ag, gi, ki)
-            if _re_result:
-                _nbb, _tbb = _re_result
-                placements[ki] = (gi, iti, lbi, pi, ltki, _ds, _ag, _nbb)
-                placed_text_bboxes[ki] = _tbb
-                _line_fixed = True
+            # 受限二次搜索：定点失败时再搜一次
+            _wx, _wy = pi
+            _hq = _weld_home_quadrant(_wx, _wy, _vcx, _vcy)
+            _others = [placed_text_bboxes[j] for j in range(n) if j != ki]
+            _pb = []
+            for j in range(n):
+                if j == ki:
+                    continue
+                _pb.append(placements[j][7])
+            try:
+                _, nd, na = _search_placement(
+                    pi, lines, text_bboxes, circles, _pb, _others,
+                    vx0, vy0, vx1, vy1, draw_bbox,
+                    is_pair=(gi == 'pair'), home_q=_hq,
+                    quad_cx=_vcx, quad_cy=_vcy, label_text=ltki,
+                    wm_text_bboxes=wm_text_bboxes, hatch_bboxes=hatch_bboxes,
+                    other_view_bboxes=other_view_bboxes,
+                    other_view_part_bboxes=other_view_part_bboxes,
+                    max_dist=_max_len, allow_adjacent=True)
+                result = _adjust_safe(ki, pi, ltki, nd, na, gi, ki)
+                if result:
+                    nbb, tbb = result
+                    placements[ki] = (gi, iti, lbi, pi, ltki, nd, na, nbb)
+                    placed_text_bboxes[ki] = tbb
+                    _line_fixed = True
+            except Exception:
+                pass
         if not _line_fixed:
             break
 
-    # 最终安全兜底：文字不得超出内框
+    # ---- 残留冲突：同距换角 → 再短步加长；二次搜索不超 MAX_DIAG_LEN ----
+    for _ext_iter in range(4):
+        _ext_fixed = False
+        n = len(placements)
+        for ki in range(n):
+            gi, iti, lbi, pi, ltki, dsi, agi = placements[ki][:7]
+            tbbi = placed_text_bboxes[ki]
+            _need = False
+            for kj in range(n):
+                if kj == ki:
+                    continue
+                if _text_overlaps(tbbi, placed_text_bboxes[kj], OVERLAP_MARGIN):
+                    _need = True
+                    break
+            if not _need:
+                for wtb in wm_text_bboxes:
+                    if _text_overlaps(tbbi, wtb, WM_TEXT_MARGIN):
+                        _need = True
+                        break
+            if not _need and hatch_bboxes:
+                for htb in hatch_bboxes:
+                    if _text_overlaps(tbbi, htb, OVERLAP_MARGIN):
+                        _need = True
+                        break
+            if not _need and _text_near_lines(tbbi, lines):
+                _need = True
+            if not _need:
+                continue
+            _max_len = MAX_DIAG_LEN_PAIR if gi == 'pair' else MAX_DIAG_LEN
+            # 同距换角
+            for d_a in [5, -5, 10, -10, 15, -15, 20, -20, 25, -25, 30, -30]:
+                na = agi + d_a
+                r5 = math.radians(na % 360)
+                if abs(math.sin(r5)) < math.sin(math.radians(ANGLE_MIN)):
+                    continue
+                if abs(math.cos(r5)) < math.cos(math.radians(ANGLE_MAX)):
+                    continue
+                result = _adjust_safe(ki, pi, ltki, dsi, na, gi, ki)
+                if result:
+                    nbb, tbb = result
+                    placements[ki] = (gi, iti, lbi, pi, ltki, dsi, na, nbb)
+                    placed_text_bboxes[ki] = tbb
+                    _ext_fixed = True
+                    break
+            if _ext_fixed:
+                continue
+            # 短步加长 + 换角
+            for d_dist in [2, 4, 8, 12, 16, 20, 24]:
+                nd = dsi + d_dist
+                if nd < MIN_DIAG_LEN or nd > _max_len:
+                    continue
+                for d_a in [0, 5, -5, 10, -10, 15, -15, 20, -20]:
+                    na = agi + d_a
+                    r5 = math.radians(na % 360)
+                    if abs(math.sin(r5)) < math.sin(math.radians(ANGLE_MIN)):
+                        continue
+                    if abs(math.cos(r5)) < math.cos(math.radians(ANGLE_MAX)):
+                        continue
+                    result = _adjust_safe(ki, pi, ltki, nd, na, gi, ki)
+                    if result:
+                        nbb, tbb = result
+                        placements[ki] = (gi, iti, lbi, pi, ltki, nd, na, nbb)
+                        placed_text_bboxes[ki] = tbb
+                        _ext_fixed = True
+                        break
+                if _ext_fixed:
+                    break
+            if _ext_fixed:
+                continue
+            _wx, _wy = pi
+            _hq = _weld_home_quadrant(_wx, _wy, _vcx, _vcy)
+            _others = [placed_text_bboxes[j] for j in range(n) if j != ki]
+            _pb = [placements[j][7] for j in range(n) if j != ki]
+            try:
+                _, nd, na = _search_placement(
+                    pi, lines, text_bboxes, circles, _pb, _others,
+                    vx0, vy0, vx1, vy1, draw_bbox,
+                    is_pair=(gi == 'pair'), home_q=_hq,
+                    quad_cx=_vcx, quad_cy=_vcy, label_text=ltki,
+                    wm_text_bboxes=wm_text_bboxes, hatch_bboxes=hatch_bboxes,
+                    other_view_bboxes=other_view_bboxes,
+                    other_view_part_bboxes=other_view_part_bboxes,
+                    max_dist=_max_len, allow_adjacent=True)
+                result = _adjust_safe(ki, pi, ltki, nd, na, gi, ki)
+                if result:
+                    nbb, tbb = result
+                    placements[ki] = (gi, iti, lbi, pi, ltki, nd, na, nbb)
+                    placed_text_bboxes[ki] = tbb
+                    _ext_fixed = True
+            except Exception:
+                pass
+        if not _ext_fixed:
+            break
+
+    # 最终安全兜底：文字不得超出内框（最短框内位姿）
     for k, pd in enumerate(placements):
         gk, it_k, lb_k, pk, ltk, dsk, agk, bbk = pd
         _tb = _text_bbox(pk, dsk, agk, ltk, is_pair=(gk == 'pair'))
@@ -3084,7 +4714,27 @@ def _resolve_label_conflicts(msp, lines, text_bboxes, circles,
             continue
         if draw_bbox is None and _bbox_in_boundary(bbk, vx0, vy0, vx1, vy1, draw_bbox):
             continue
-        for nd in range(MIN_DIAG_LEN, dsk + 1, 2):
+        _max_len = MAX_DIAG_LEN_PAIR if gk == 'pair' else MAX_DIAG_LEN
+        _hq = _weld_home_quadrant(pk[0], pk[1], _vcx, _vcy)
+        _fp = _shortest_in_frame_pose(
+            pk, ltk, draw_bbox, is_pair=(gk == 'pair'),
+            home_q=_hq, prefer_ang=agk, max_dist=_max_len) if draw_bbox else None
+        if _fp is not None:
+            nd, na = _fp
+            result = _adjust_safe(k, pk, ltk, nd, na, gk, k)
+            if result:
+                nbb, tbb = result
+                placements[k] = (gk, it_k, lb_k, pk, ltk, nd, na, nbb)
+                placed_text_bboxes[k] = tbb
+            else:
+                if gk == 'pair':
+                    nbb = _paired_bbox(pk, nd, na, ltk)
+                else:
+                    nbb = _single_bbox(pk, nd, na, ltk)
+                placements[k] = (gk, it_k, lb_k, pk, ltk, nd, na, nbb)
+                placed_text_bboxes[k] = _text_bbox(pk, nd, na, ltk, is_pair=(gk == 'pair'))
+            continue
+        for nd in range(MIN_DIAG_LEN, min(dsk, _max_len) + 1, 2):
             if gk == 'pair':
                 nbb = _paired_bbox(pk, nd, agk, ltk)
             else:
@@ -3094,17 +4744,11 @@ def _resolve_label_conflicts(msp, lines, text_bboxes, circles,
                 continue
             if not _bbox_in_boundary(nbb, vx0, vy0, vx1, vy1, draw_bbox):
                 continue
-            _hatch_ok = True
-            if hatch_bboxes:
-                for (hx0, hx1, hy0, hy1) in hatch_bboxes:
-                    if not (_tb2[1] < hx0 - OVERLAP_MARGIN or _tb2[0] > hx1 + OVERLAP_MARGIN or
-                            _tb2[3] < hy0 - OVERLAP_MARGIN or _tb2[2] > hy1 + OVERLAP_MARGIN):
-                        _hatch_ok = False
-                        break
-            if _hatch_ok:
-                placements[k] = (gk, it_k, lb_k, pk, ltk, nd, agk, nbb)
-                placed_text_bboxes[k] = _tb2
-                break
+            placements[k] = (gk, it_k, lb_k, pk, ltk, nd, agk, nbb)
+            placed_text_bboxes[k] = _tb2
+            break
+
+    return _total_fixes
 
 
 def _draw_fallback_label(msp, w, label, bbox):
