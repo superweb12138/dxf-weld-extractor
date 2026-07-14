@@ -7,13 +7,31 @@ _bak_*
 _tmp_*
 __pycache__/
 *.pyc
-# Debug scripts (deleted)
+*.bak
+
+# Debug / run logs
+_debug_out*.txt
+_run_*.txt
+_qual_out.txt
+full_output.txt
+
+# Debug scripts (deleted / one-off)
 investigate_*.py
 simulate_*.py
 trace_*.py
 run_all.py
+_temp_*.py
+_t.py
+debug_*.py
+_plot_*.py
+_insert_*.py
+
+# Plot dumps
+_plot_*.png
+
 # Annotated PDFs are generated outputs
 annotated/*.PDF
 annotated/*.pdf
+
 # External tools
 AcmeCAD_*.exe
