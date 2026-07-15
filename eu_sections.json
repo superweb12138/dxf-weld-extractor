@@ -1,0 +1,1276 @@
+{
+  "_meta": {
+    "note": "Generated from European steel PDF Dimensions tables (h/b/tw/tf)",
+    "source_pdf": "欧标型钢规格(全).pdf",
+    "section_count": 167
+  },
+  "by_catalog": {
+    "HE1000A": {
+      "depth": 990.0,
+      "flange_w": 300.0,
+      "web_t": 16.5,
+      "flange_t": 31.0
+    },
+    "HE1000AA": {
+      "depth": 970.0,
+      "flange_w": 300.0,
+      "web_t": 16.0,
+      "flange_t": 21.0
+    },
+    "HE1000B": {
+      "depth": 1000.0,
+      "flange_w": 300.0,
+      "web_t": 19.0,
+      "flange_t": 36.0
+    },
+    "HE1000M": {
+      "depth": 1008.0,
+      "flange_w": 302.0,
+      "web_t": 21.0,
+      "flange_t": 40.0
+    },
+    "HE100A": {
+      "depth": 96.0,
+      "flange_w": 100.0,
+      "web_t": 5.0,
+      "flange_t": 8.0
+    },
+    "HE100AA": {
+      "depth": 91.0,
+      "flange_w": 100.0,
+      "web_t": 4.2,
+      "flange_t": 5.5
+    },
+    "HE100B": {
+      "depth": 100.0,
+      "flange_w": 100.0,
+      "web_t": 6.0,
+      "flange_t": 10.0
+    },
+    "HE100M": {
+      "depth": 120.0,
+      "flange_w": 106.0,
+      "web_t": 12.0,
+      "flange_t": 20.0
+    },
+    "HE120A": {
+      "depth": 114.0,
+      "flange_w": 120.0,
+      "web_t": 5.0,
+      "flange_t": 8.0
+    },
+    "HE120AA": {
+      "depth": 109.0,
+      "flange_w": 120.0,
+      "web_t": 4.2,
+      "flange_t": 5.5
+    },
+    "HE120B": {
+      "depth": 120.0,
+      "flange_w": 120.0,
+      "web_t": 6.5,
+      "flange_t": 11.0
+    },
+    "HE120M": {
+      "depth": 140.0,
+      "flange_w": 126.0,
+      "web_t": 12.5,
+      "flange_t": 21.0
+    },
+    "HE140A": {
+      "depth": 133.0,
+      "flange_w": 140.0,
+      "web_t": 5.5,
+      "flange_t": 8.5
+    },
+    "HE140AA": {
+      "depth": 128.0,
+      "flange_w": 140.0,
+      "web_t": 4.3,
+      "flange_t": 6.0
+    },
+    "HE140B": {
+      "depth": 140.0,
+      "flange_w": 140.0,
+      "web_t": 7.0,
+      "flange_t": 12.0
+    },
+    "HE140M": {
+      "depth": 160.0,
+      "flange_w": 146.0,
+      "web_t": 13.0,
+      "flange_t": 22.0
+    },
+    "HE160A": {
+      "depth": 152.0,
+      "flange_w": 160.0,
+      "web_t": 6.0,
+      "flange_t": 9.0
+    },
+    "HE160AA": {
+      "depth": 148.0,
+      "flange_w": 160.0,
+      "web_t": 4.5,
+      "flange_t": 7.0
+    },
+    "HE160B": {
+      "depth": 160.0,
+      "flange_w": 160.0,
+      "web_t": 8.0,
+      "flange_t": 13.0
+    },
+    "HE160M": {
+      "depth": 180.0,
+      "flange_w": 166.0,
+      "web_t": 14.0,
+      "flange_t": 23.0
+    },
+    "HE180A": {
+      "depth": 171.0,
+      "flange_w": 180.0,
+      "web_t": 6.0,
+      "flange_t": 9.5
+    },
+    "HE180AA": {
+      "depth": 167.0,
+      "flange_w": 180.0,
+      "web_t": 5.0,
+      "flange_t": 7.5
+    },
+    "HE180B": {
+      "depth": 180.0,
+      "flange_w": 180.0,
+      "web_t": 8.5,
+      "flange_t": 14.0
+    },
+    "HE180M": {
+      "depth": 200.0,
+      "flange_w": 186.0,
+      "web_t": 14.5,
+      "flange_t": 24.0
+    },
+    "HE200A": {
+      "depth": 190.0,
+      "flange_w": 200.0,
+      "web_t": 6.5,
+      "flange_t": 10.0
+    },
+    "HE200AA": {
+      "depth": 186.0,
+      "flange_w": 200.0,
+      "web_t": 5.5,
+      "flange_t": 8.0
+    },
+    "HE200B": {
+      "depth": 200.0,
+      "flange_w": 200.0,
+      "web_t": 9.0,
+      "flange_t": 15.0
+    },
+    "HE200M": {
+      "depth": 220.0,
+      "flange_w": 206.0,
+      "web_t": 15.0,
+      "flange_t": 25.0
+    },
+    "HE220A": {
+      "depth": 210.0,
+      "flange_w": 220.0,
+      "web_t": 7.0,
+      "flange_t": 11.0
+    },
+    "HE220AA": {
+      "depth": 205.0,
+      "flange_w": 220.0,
+      "web_t": 6.0,
+      "flange_t": 8.5
+    },
+    "HE220B": {
+      "depth": 220.0,
+      "flange_w": 220.0,
+      "web_t": 9.5,
+      "flange_t": 16.0
+    },
+    "HE220M": {
+      "depth": 240.0,
+      "flange_w": 226.0,
+      "web_t": 15.5,
+      "flange_t": 26.0
+    },
+    "HE240A": {
+      "depth": 230.0,
+      "flange_w": 240.0,
+      "web_t": 7.5,
+      "flange_t": 12.0
+    },
+    "HE240AA": {
+      "depth": 224.0,
+      "flange_w": 240.0,
+      "web_t": 6.5,
+      "flange_t": 9.0
+    },
+    "HE240B": {
+      "depth": 240.0,
+      "flange_w": 240.0,
+      "web_t": 10.0,
+      "flange_t": 17.0
+    },
+    "HE240M": {
+      "depth": 270.0,
+      "flange_w": 248.0,
+      "web_t": 18.0,
+      "flange_t": 32.0
+    },
+    "HE260A": {
+      "depth": 250.0,
+      "flange_w": 260.0,
+      "web_t": 7.5,
+      "flange_t": 12.5
+    },
+    "HE260AA": {
+      "depth": 244.0,
+      "flange_w": 260.0,
+      "web_t": 6.5,
+      "flange_t": 9.5
+    },
+    "HE260B": {
+      "depth": 260.0,
+      "flange_w": 260.0,
+      "web_t": 10.0,
+      "flange_t": 17.5
+    },
+    "HE260M": {
+      "depth": 290.0,
+      "flange_w": 268.0,
+      "web_t": 18.0,
+      "flange_t": 32.5
+    },
+    "HE280A": {
+      "depth": 270.0,
+      "flange_w": 280.0,
+      "web_t": 8.0,
+      "flange_t": 13.0
+    },
+    "HE280AA": {
+      "depth": 264.0,
+      "flange_w": 280.0,
+      "web_t": 7.0,
+      "flange_t": 10.0
+    },
+    "HE280B": {
+      "depth": 280.0,
+      "flange_w": 280.0,
+      "web_t": 10.5,
+      "flange_t": 18.0
+    },
+    "HE280M": {
+      "depth": 310.0,
+      "flange_w": 288.0,
+      "web_t": 18.5,
+      "flange_t": 33.0
+    },
+    "HE300A": {
+      "depth": 290.0,
+      "flange_w": 300.0,
+      "web_t": 8.5,
+      "flange_t": 14.0
+    },
+    "HE300AA": {
+      "depth": 283.0,
+      "flange_w": 300.0,
+      "web_t": 7.5,
+      "flange_t": 10.5
+    },
+    "HE300B": {
+      "depth": 300.0,
+      "flange_w": 300.0,
+      "web_t": 11.0,
+      "flange_t": 19.0
+    },
+    "HE300M": {
+      "depth": 340.0,
+      "flange_w": 310.0,
+      "web_t": 21.0,
+      "flange_t": 39.0
+    },
+    "HE320A": {
+      "depth": 310.0,
+      "flange_w": 300.0,
+      "web_t": 9.0,
+      "flange_t": 15.5
+    },
+    "HE320AA": {
+      "depth": 301.0,
+      "flange_w": 300.0,
+      "web_t": 8.0,
+      "flange_t": 11.0
+    },
+    "HE320B": {
+      "depth": 320.0,
+      "flange_w": 300.0,
+      "web_t": 11.5,
+      "flange_t": 20.5
+    },
+    "HE320M": {
+      "depth": 359.0,
+      "flange_w": 309.0,
+      "web_t": 21.0,
+      "flange_t": 40.0
+    },
+    "HE340A": {
+      "depth": 330.0,
+      "flange_w": 300.0,
+      "web_t": 9.5,
+      "flange_t": 16.5
+    },
+    "HE340AA": {
+      "depth": 320.0,
+      "flange_w": 300.0,
+      "web_t": 8.5,
+      "flange_t": 11.5
+    },
+    "HE340B": {
+      "depth": 340.0,
+      "flange_w": 300.0,
+      "web_t": 12.0,
+      "flange_t": 21.5
+    },
+    "HE340M": {
+      "depth": 377.0,
+      "flange_w": 309.0,
+      "web_t": 21.0,
+      "flange_t": 40.0
+    },
+    "HE360A": {
+      "depth": 350.0,
+      "flange_w": 300.0,
+      "web_t": 10.0,
+      "flange_t": 17.5
+    },
+    "HE360AA": {
+      "depth": 339.0,
+      "flange_w": 300.0,
+      "web_t": 9.0,
+      "flange_t": 12.0
+    },
+    "HE360B": {
+      "depth": 360.0,
+      "flange_w": 300.0,
+      "web_t": 12.5,
+      "flange_t": 22.5
+    },
+    "HE360M": {
+      "depth": 395.0,
+      "flange_w": 308.0,
+      "web_t": 21.0,
+      "flange_t": 40.0
+    },
+    "HE400A": {
+      "depth": 390.0,
+      "flange_w": 300.0,
+      "web_t": 11.0,
+      "flange_t": 19.0
+    },
+    "HE400AA": {
+      "depth": 378.0,
+      "flange_w": 300.0,
+      "web_t": 9.5,
+      "flange_t": 13.0
+    },
+    "HE400B": {
+      "depth": 400.0,
+      "flange_w": 300.0,
+      "web_t": 13.5,
+      "flange_t": 24.0
+    },
+    "HE400M": {
+      "depth": 432.0,
+      "flange_w": 307.0,
+      "web_t": 21.0,
+      "flange_t": 40.0
+    },
+    "HE450A": {
+      "depth": 440.0,
+      "flange_w": 300.0,
+      "web_t": 11.5,
+      "flange_t": 21.0
+    },
+    "HE450AA": {
+      "depth": 425.0,
+      "flange_w": 300.0,
+      "web_t": 10.0,
+      "flange_t": 13.5
+    },
+    "HE450B": {
+      "depth": 450.0,
+      "flange_w": 300.0,
+      "web_t": 14.0,
+      "flange_t": 26.0
+    },
+    "HE450M": {
+      "depth": 478.0,
+      "flange_w": 307.0,
+      "web_t": 21.0,
+      "flange_t": 40.0
+    },
+    "HE500A": {
+      "depth": 490.0,
+      "flange_w": 300.0,
+      "web_t": 12.0,
+      "flange_t": 23.0
+    },
+    "HE500AA": {
+      "depth": 472.0,
+      "flange_w": 300.0,
+      "web_t": 10.5,
+      "flange_t": 14.0
+    },
+    "HE500B": {
+      "depth": 500.0,
+      "flange_w": 300.0,
+      "web_t": 14.5,
+      "flange_t": 28.0
+    },
+    "HE500M": {
+      "depth": 524.0,
+      "flange_w": 306.0,
+      "web_t": 21.0,
+      "flange_t": 40.0
+    },
+    "HE550A": {
+      "depth": 540.0,
+      "flange_w": 300.0,
+      "web_t": 12.5,
+      "flange_t": 24.0
+    },
+    "HE550AA": {
+      "depth": 522.0,
+      "flange_w": 300.0,
+      "web_t": 11.5,
+      "flange_t": 15.0
+    },
+    "HE550B": {
+      "depth": 550.0,
+      "flange_w": 300.0,
+      "web_t": 15.0,
+      "flange_t": 29.0
+    },
+    "HE550M": {
+      "depth": 572.0,
+      "flange_w": 306.0,
+      "web_t": 21.0,
+      "flange_t": 40.0
+    },
+    "HE600A": {
+      "depth": 590.0,
+      "flange_w": 300.0,
+      "web_t": 13.0,
+      "flange_t": 25.0
+    },
+    "HE600AA": {
+      "depth": 571.0,
+      "flange_w": 300.0,
+      "web_t": 12.0,
+      "flange_t": 15.5
+    },
+    "HE600B": {
+      "depth": 600.0,
+      "flange_w": 300.0,
+      "web_t": 15.5,
+      "flange_t": 30.0
+    },
+    "HE600M": {
+      "depth": 620.0,
+      "flange_w": 305.0,
+      "web_t": 21.0,
+      "flange_t": 40.0
+    },
+    "HE650A": {
+      "depth": 640.0,
+      "flange_w": 300.0,
+      "web_t": 13.5,
+      "flange_t": 26.0
+    },
+    "HE650AA": {
+      "depth": 620.0,
+      "flange_w": 300.0,
+      "web_t": 12.5,
+      "flange_t": 16.0
+    },
+    "HE650B": {
+      "depth": 650.0,
+      "flange_w": 300.0,
+      "web_t": 16.0,
+      "flange_t": 31.0
+    },
+    "HE650M": {
+      "depth": 668.0,
+      "flange_w": 305.0,
+      "web_t": 21.0,
+      "flange_t": 40.0
+    },
+    "HE700A": {
+      "depth": 690.0,
+      "flange_w": 300.0,
+      "web_t": 14.5,
+      "flange_t": 27.0
+    },
+    "HE700AA": {
+      "depth": 670.0,
+      "flange_w": 300.0,
+      "web_t": 13.0,
+      "flange_t": 17.0
+    },
+    "HE700B": {
+      "depth": 700.0,
+      "flange_w": 300.0,
+      "web_t": 17.0,
+      "flange_t": 32.0
+    },
+    "HE700M": {
+      "depth": 716.0,
+      "flange_w": 304.0,
+      "web_t": 21.0,
+      "flange_t": 40.0
+    },
+    "HE800A": {
+      "depth": 790.0,
+      "flange_w": 300.0,
+      "web_t": 15.0,
+      "flange_t": 28.0
+    },
+    "HE800AA": {
+      "depth": 770.0,
+      "flange_w": 300.0,
+      "web_t": 14.0,
+      "flange_t": 18.0
+    },
+    "HE800B": {
+      "depth": 800.0,
+      "flange_w": 300.0,
+      "web_t": 17.5,
+      "flange_t": 33.0
+    },
+    "HE800M": {
+      "depth": 814.0,
+      "flange_w": 303.0,
+      "web_t": 21.0,
+      "flange_t": 40.0
+    },
+    "HE900A": {
+      "depth": 890.0,
+      "flange_w": 300.0,
+      "web_t": 16.0,
+      "flange_t": 30.0
+    },
+    "HE900AA": {
+      "depth": 870.0,
+      "flange_w": 300.0,
+      "web_t": 15.0,
+      "flange_t": 20.0
+    },
+    "HE900B": {
+      "depth": 900.0,
+      "flange_w": 300.0,
+      "web_t": 18.5,
+      "flange_t": 35.0
+    },
+    "HE900M": {
+      "depth": 910.0,
+      "flange_w": 302.0,
+      "web_t": 21.0,
+      "flange_t": 40.0
+    },
+    "IPE100": {
+      "depth": 100.0,
+      "flange_w": 55.0,
+      "web_t": 4.1,
+      "flange_t": 5.7
+    },
+    "IPE120": {
+      "depth": 120.0,
+      "flange_w": 64.0,
+      "web_t": 4.4,
+      "flange_t": 6.3
+    },
+    "IPE140": {
+      "depth": 140.0,
+      "flange_w": 73.0,
+      "web_t": 4.7,
+      "flange_t": 6.9
+    },
+    "IPE160": {
+      "depth": 160.0,
+      "flange_w": 82.0,
+      "web_t": 5.0,
+      "flange_t": 7.4
+    },
+    "IPE180": {
+      "depth": 180.0,
+      "flange_w": 91.0,
+      "web_t": 5.3,
+      "flange_t": 8.0
+    },
+    "IPE200": {
+      "depth": 200.0,
+      "flange_w": 100.0,
+      "web_t": 5.6,
+      "flange_t": 8.5
+    },
+    "IPE220": {
+      "depth": 220.0,
+      "flange_w": 110.0,
+      "web_t": 5.9,
+      "flange_t": 9.2
+    },
+    "IPE240": {
+      "depth": 240.0,
+      "flange_w": 120.0,
+      "web_t": 6.2,
+      "flange_t": 9.8
+    },
+    "IPE270": {
+      "depth": 270.0,
+      "flange_w": 135.0,
+      "web_t": 6.6,
+      "flange_t": 10.2
+    },
+    "IPE300": {
+      "depth": 300.0,
+      "flange_w": 150.0,
+      "web_t": 7.1,
+      "flange_t": 10.7
+    },
+    "IPE330": {
+      "depth": 330.0,
+      "flange_w": 160.0,
+      "web_t": 7.5,
+      "flange_t": 11.5
+    },
+    "IPE360": {
+      "depth": 360.0,
+      "flange_w": 170.0,
+      "web_t": 8.0,
+      "flange_t": 12.7
+    },
+    "IPE400": {
+      "depth": 400.0,
+      "flange_w": 180.0,
+      "web_t": 8.6,
+      "flange_t": 13.5
+    },
+    "IPE450": {
+      "depth": 450.0,
+      "flange_w": 190.0,
+      "web_t": 9.4,
+      "flange_t": 14.6
+    },
+    "IPE500": {
+      "depth": 500.0,
+      "flange_w": 200.0,
+      "web_t": 10.2,
+      "flange_t": 16.0
+    },
+    "IPE550": {
+      "depth": 550.0,
+      "flange_w": 210.0,
+      "web_t": 11.1,
+      "flange_t": 17.2
+    },
+    "IPE600": {
+      "depth": 600.0,
+      "flange_w": 220.0,
+      "web_t": 12.0,
+      "flange_t": 19.0
+    },
+    "IPE80": {
+      "depth": 80.0,
+      "flange_w": 46.0,
+      "web_t": 3.8,
+      "flange_t": 5.2
+    },
+    "IPN100": {
+      "depth": 100.0,
+      "flange_w": 50.0,
+      "web_t": 4.5,
+      "flange_t": 6.8
+    },
+    "IPN120": {
+      "depth": 120.0,
+      "flange_w": 58.0,
+      "web_t": 5.1,
+      "flange_t": 7.7
+    },
+    "IPN140": {
+      "depth": 140.0,
+      "flange_w": 66.0,
+      "web_t": 5.7,
+      "flange_t": 8.6
+    },
+    "IPN160": {
+      "depth": 160.0,
+      "flange_w": 74.0,
+      "web_t": 6.3,
+      "flange_t": 9.5
+    },
+    "IPN180": {
+      "depth": 180.0,
+      "flange_w": 82.0,
+      "web_t": 6.9,
+      "flange_t": 10.4
+    },
+    "IPN200": {
+      "depth": 200.0,
+      "flange_w": 90.0,
+      "web_t": 7.5,
+      "flange_t": 11.3
+    },
+    "IPN220": {
+      "depth": 220.0,
+      "flange_w": 98.0,
+      "web_t": 8.1,
+      "flange_t": 12.2
+    },
+    "IPN240": {
+      "depth": 240.0,
+      "flange_w": 106.0,
+      "web_t": 8.7,
+      "flange_t": 13.1
+    },
+    "IPN260": {
+      "depth": 260.0,
+      "flange_w": 113.0,
+      "web_t": 9.4,
+      "flange_t": 14.1
+    },
+    "IPN280": {
+      "depth": 280.0,
+      "flange_w": 119.0,
+      "web_t": 10.1,
+      "flange_t": 15.2
+    },
+    "IPN300": {
+      "depth": 300.0,
+      "flange_w": 125.0,
+      "web_t": 10.8,
+      "flange_t": 16.2
+    },
+    "IPN320": {
+      "depth": 320.0,
+      "flange_w": 131.0,
+      "web_t": 11.5,
+      "flange_t": 17.3
+    },
+    "IPN340": {
+      "depth": 340.0,
+      "flange_w": 137.0,
+      "web_t": 12.2,
+      "flange_t": 18.3
+    },
+    "IPN360": {
+      "depth": 360.0,
+      "flange_w": 143.0,
+      "web_t": 13.0,
+      "flange_t": 19.5
+    },
+    "IPN380": {
+      "depth": 380.0,
+      "flange_w": 149.0,
+      "web_t": 13.7,
+      "flange_t": 20.5
+    },
+    "IPN400": {
+      "depth": 400.0,
+      "flange_w": 155.0,
+      "web_t": 14.4,
+      "flange_t": 21.6
+    },
+    "IPN450": {
+      "depth": 450.0,
+      "flange_w": 170.0,
+      "web_t": 16.2,
+      "flange_t": 24.3
+    },
+    "IPN500": {
+      "depth": 500.0,
+      "flange_w": 185.0,
+      "web_t": 18.0,
+      "flange_t": 27.0
+    },
+    "IPN550": {
+      "depth": 550.0,
+      "flange_w": 200.0,
+      "web_t": 19.0,
+      "flange_t": 30.0
+    },
+    "IPN600": {
+      "depth": 600.0,
+      "flange_w": 215.0,
+      "web_t": 21.6,
+      "flange_t": 32.4
+    },
+    "IPN80": {
+      "depth": 80.0,
+      "flange_w": 42.0,
+      "web_t": 3.9,
+      "flange_t": 5.9
+    },
+    "UPE100": {
+      "depth": 100.0,
+      "flange_w": 55.0,
+      "web_t": 4.5,
+      "flange_t": 7.5
+    },
+    "UPE120": {
+      "depth": 120.0,
+      "flange_w": 60.0,
+      "web_t": 5.0,
+      "flange_t": 8.0
+    },
+    "UPE140": {
+      "depth": 140.0,
+      "flange_w": 65.0,
+      "web_t": 5.0,
+      "flange_t": 9.0
+    },
+    "UPE160": {
+      "depth": 160.0,
+      "flange_w": 70.0,
+      "web_t": 5.5,
+      "flange_t": 9.5
+    },
+    "UPE180": {
+      "depth": 180.0,
+      "flange_w": 75.0,
+      "web_t": 5.5,
+      "flange_t": 10.5
+    },
+    "UPE200": {
+      "depth": 200.0,
+      "flange_w": 80.0,
+      "web_t": 6.0,
+      "flange_t": 11.0
+    },
+    "UPE220": {
+      "depth": 220.0,
+      "flange_w": 85.0,
+      "web_t": 6.5,
+      "flange_t": 12.0
+    },
+    "UPE240": {
+      "depth": 240.0,
+      "flange_w": 90.0,
+      "web_t": 7.0,
+      "flange_t": 12.5
+    },
+    "UPE270": {
+      "depth": 270.0,
+      "flange_w": 95.0,
+      "web_t": 7.5,
+      "flange_t": 13.5
+    },
+    "UPE300": {
+      "depth": 300.0,
+      "flange_w": 100.0,
+      "web_t": 9.5,
+      "flange_t": 15.0
+    },
+    "UPE330": {
+      "depth": 330.0,
+      "flange_w": 105.0,
+      "web_t": 11.0,
+      "flange_t": 16.0
+    },
+    "UPE360": {
+      "depth": 360.0,
+      "flange_w": 110.0,
+      "web_t": 12.0,
+      "flange_t": 17.0
+    },
+    "UPE400": {
+      "depth": 400.0,
+      "flange_w": 115.0,
+      "web_t": 13.5,
+      "flange_t": 18.0
+    },
+    "UPE80": {
+      "depth": 80.0,
+      "flange_w": 50.0,
+      "web_t": 4.0,
+      "flange_t": 7.0
+    },
+    "UPN100": {
+      "depth": 100.0,
+      "flange_w": 50.0,
+      "web_t": 6.0,
+      "flange_t": 8.5
+    },
+    "UPN120": {
+      "depth": 120.0,
+      "flange_w": 55.0,
+      "web_t": 7.0,
+      "flange_t": 9.0
+    },
+    "UPN140": {
+      "depth": 140.0,
+      "flange_w": 60.0,
+      "web_t": 7.0,
+      "flange_t": 10.0
+    },
+    "UPN160": {
+      "depth": 160.0,
+      "flange_w": 65.0,
+      "web_t": 7.5,
+      "flange_t": 10.5
+    },
+    "UPN180": {
+      "depth": 180.0,
+      "flange_w": 70.0,
+      "web_t": 8.0,
+      "flange_t": 11.0
+    },
+    "UPN200": {
+      "depth": 200.0,
+      "flange_w": 75.0,
+      "web_t": 8.5,
+      "flange_t": 11.5
+    },
+    "UPN220": {
+      "depth": 220.0,
+      "flange_w": 80.0,
+      "web_t": 9.0,
+      "flange_t": 12.5
+    },
+    "UPN240": {
+      "depth": 240.0,
+      "flange_w": 85.0,
+      "web_t": 9.5,
+      "flange_t": 13.0
+    },
+    "UPN260": {
+      "depth": 260.0,
+      "flange_w": 90.0,
+      "web_t": 10.0,
+      "flange_t": 14.0
+    },
+    "UPN280": {
+      "depth": 280.0,
+      "flange_w": 95.0,
+      "web_t": 10.0,
+      "flange_t": 15.0
+    },
+    "UPN300": {
+      "depth": 300.0,
+      "flange_w": 100.0,
+      "web_t": 10.0,
+      "flange_t": 16.0
+    },
+    "UPN320": {
+      "depth": 320.0,
+      "flange_w": 100.0,
+      "web_t": 14.0,
+      "flange_t": 17.5
+    },
+    "UPN350": {
+      "depth": 350.0,
+      "flange_w": 100.0,
+      "web_t": 14.0,
+      "flange_t": 16.0
+    },
+    "UPN380": {
+      "depth": 380.0,
+      "flange_w": 102.0,
+      "web_t": 13.5,
+      "flange_t": 16.0
+    },
+    "UPN400": {
+      "depth": 400.0,
+      "flange_w": 110.0,
+      "web_t": 14.0,
+      "flange_t": 18.0
+    },
+    "UPN50": {
+      "depth": 50.0,
+      "flange_w": 38.0,
+      "web_t": 5.0,
+      "flange_t": 7.0
+    },
+    "UPN65": {
+      "depth": 65.0,
+      "flange_w": 42.0,
+      "web_t": 5.5,
+      "flange_t": 7.5
+    },
+    "UPN80": {
+      "depth": 80.0,
+      "flange_w": 45.0,
+      "web_t": 6.0,
+      "flange_t": 8.0
+    }
+  },
+  "aliases": {
+    "HE1000A": "HE1000A",
+    "HE1000AA": "HE1000AA",
+    "HE1000B": "HE1000B",
+    "HE1000M": "HE1000M",
+    "HE100A": "HE100A",
+    "HE100AA": "HE100AA",
+    "HE100B": "HE100B",
+    "HE100M": "HE100M",
+    "HE120A": "HE120A",
+    "HE120AA": "HE120AA",
+    "HE120B": "HE120B",
+    "HE120M": "HE120M",
+    "HE140A": "HE140A",
+    "HE140AA": "HE140AA",
+    "HE140B": "HE140B",
+    "HE140M": "HE140M",
+    "HE160A": "HE160A",
+    "HE160AA": "HE160AA",
+    "HE160B": "HE160B",
+    "HE160M": "HE160M",
+    "HE180A": "HE180A",
+    "HE180AA": "HE180AA",
+    "HE180B": "HE180B",
+    "HE180M": "HE180M",
+    "HE200A": "HE200A",
+    "HE200AA": "HE200AA",
+    "HE200B": "HE200B",
+    "HE200M": "HE200M",
+    "HE220A": "HE220A",
+    "HE220AA": "HE220AA",
+    "HE220B": "HE220B",
+    "HE220M": "HE220M",
+    "HE240A": "HE240A",
+    "HE240AA": "HE240AA",
+    "HE240B": "HE240B",
+    "HE240M": "HE240M",
+    "HE260A": "HE260A",
+    "HE260AA": "HE260AA",
+    "HE260B": "HE260B",
+    "HE260M": "HE260M",
+    "HE280A": "HE280A",
+    "HE280AA": "HE280AA",
+    "HE280B": "HE280B",
+    "HE280M": "HE280M",
+    "HE300A": "HE300A",
+    "HE300AA": "HE300AA",
+    "HE300B": "HE300B",
+    "HE300M": "HE300M",
+    "HE320A": "HE320A",
+    "HE320AA": "HE320AA",
+    "HE320B": "HE320B",
+    "HE320M": "HE320M",
+    "HE340A": "HE340A",
+    "HE340AA": "HE340AA",
+    "HE340B": "HE340B",
+    "HE340M": "HE340M",
+    "HE360A": "HE360A",
+    "HE360AA": "HE360AA",
+    "HE360B": "HE360B",
+    "HE360M": "HE360M",
+    "HE400A": "HE400A",
+    "HE400AA": "HE400AA",
+    "HE400B": "HE400B",
+    "HE400M": "HE400M",
+    "HE450A": "HE450A",
+    "HE450AA": "HE450AA",
+    "HE450B": "HE450B",
+    "HE450M": "HE450M",
+    "HE500A": "HE500A",
+    "HE500AA": "HE500AA",
+    "HE500B": "HE500B",
+    "HE500M": "HE500M",
+    "HE550A": "HE550A",
+    "HE550AA": "HE550AA",
+    "HE550B": "HE550B",
+    "HE550M": "HE550M",
+    "HE600A": "HE600A",
+    "HE600AA": "HE600AA",
+    "HE600B": "HE600B",
+    "HE600M": "HE600M",
+    "HE650A": "HE650A",
+    "HE650AA": "HE650AA",
+    "HE650B": "HE650B",
+    "HE650M": "HE650M",
+    "HE700A": "HE700A",
+    "HE700AA": "HE700AA",
+    "HE700B": "HE700B",
+    "HE700M": "HE700M",
+    "HE800A": "HE800A",
+    "HE800AA": "HE800AA",
+    "HE800B": "HE800B",
+    "HE800M": "HE800M",
+    "HE900A": "HE900A",
+    "HE900AA": "HE900AA",
+    "HE900B": "HE900B",
+    "HE900M": "HE900M",
+    "HEA100": "HE100A",
+    "HEA1000": "HE1000A",
+    "HEA120": "HE120A",
+    "HEA140": "HE140A",
+    "HEA160": "HE160A",
+    "HEA180": "HE180A",
+    "HEA200": "HE200A",
+    "HEA220": "HE220A",
+    "HEA240": "HE240A",
+    "HEA260": "HE260A",
+    "HEA280": "HE280A",
+    "HEA300": "HE300A",
+    "HEA320": "HE320A",
+    "HEA340": "HE340A",
+    "HEA360": "HE360A",
+    "HEA400": "HE400A",
+    "HEA450": "HE450A",
+    "HEA500": "HE500A",
+    "HEA550": "HE550A",
+    "HEA600": "HE600A",
+    "HEA650": "HE650A",
+    "HEA700": "HE700A",
+    "HEA800": "HE800A",
+    "HEA900": "HE900A",
+    "HEAA100": "HE100AA",
+    "HEAA1000": "HE1000AA",
+    "HEAA120": "HE120AA",
+    "HEAA140": "HE140AA",
+    "HEAA160": "HE160AA",
+    "HEAA180": "HE180AA",
+    "HEAA200": "HE200AA",
+    "HEAA220": "HE220AA",
+    "HEAA240": "HE240AA",
+    "HEAA260": "HE260AA",
+    "HEAA280": "HE280AA",
+    "HEAA300": "HE300AA",
+    "HEAA320": "HE320AA",
+    "HEAA340": "HE340AA",
+    "HEAA360": "HE360AA",
+    "HEAA400": "HE400AA",
+    "HEAA450": "HE450AA",
+    "HEAA500": "HE500AA",
+    "HEAA550": "HE550AA",
+    "HEAA600": "HE600AA",
+    "HEAA650": "HE650AA",
+    "HEAA700": "HE700AA",
+    "HEAA800": "HE800AA",
+    "HEAA900": "HE900AA",
+    "HEB100": "HE100B",
+    "HEB1000": "HE1000B",
+    "HEB120": "HE120B",
+    "HEB140": "HE140B",
+    "HEB160": "HE160B",
+    "HEB180": "HE180B",
+    "HEB200": "HE200B",
+    "HEB220": "HE220B",
+    "HEB240": "HE240B",
+    "HEB260": "HE260B",
+    "HEB280": "HE280B",
+    "HEB300": "HE300B",
+    "HEB320": "HE320B",
+    "HEB340": "HE340B",
+    "HEB360": "HE360B",
+    "HEB400": "HE400B",
+    "HEB450": "HE450B",
+    "HEB500": "HE500B",
+    "HEB550": "HE550B",
+    "HEB600": "HE600B",
+    "HEB650": "HE650B",
+    "HEB700": "HE700B",
+    "HEB800": "HE800B",
+    "HEB900": "HE900B",
+    "HEM100": "HE100M",
+    "HEM1000": "HE1000M",
+    "HEM120": "HE120M",
+    "HEM140": "HE140M",
+    "HEM160": "HE160M",
+    "HEM180": "HE180M",
+    "HEM200": "HE200M",
+    "HEM220": "HE220M",
+    "HEM240": "HE240M",
+    "HEM260": "HE260M",
+    "HEM280": "HE280M",
+    "HEM300": "HE300M",
+    "HEM320": "HE320M",
+    "HEM340": "HE340M",
+    "HEM360": "HE360M",
+    "HEM400": "HE400M",
+    "HEM450": "HE450M",
+    "HEM500": "HE500M",
+    "HEM550": "HE550M",
+    "HEM600": "HE600M",
+    "HEM650": "HE650M",
+    "HEM700": "HE700M",
+    "HEM800": "HE800M",
+    "HEM900": "HE900M",
+    "IPE100": "IPE100",
+    "IPE120": "IPE120",
+    "IPE140": "IPE140",
+    "IPE160": "IPE160",
+    "IPE180": "IPE180",
+    "IPE200": "IPE200",
+    "IPE220": "IPE220",
+    "IPE240": "IPE240",
+    "IPE270": "IPE270",
+    "IPE300": "IPE300",
+    "IPE330": "IPE330",
+    "IPE360": "IPE360",
+    "IPE400": "IPE400",
+    "IPE450": "IPE450",
+    "IPE500": "IPE500",
+    "IPE550": "IPE550",
+    "IPE600": "IPE600",
+    "IPE80": "IPE80",
+    "IPN100": "IPN100",
+    "IPN120": "IPN120",
+    "IPN140": "IPN140",
+    "IPN160": "IPN160",
+    "IPN180": "IPN180",
+    "IPN200": "IPN200",
+    "IPN220": "IPN220",
+    "IPN240": "IPN240",
+    "IPN260": "IPN260",
+    "IPN280": "IPN280",
+    "IPN300": "IPN300",
+    "IPN320": "IPN320",
+    "IPN340": "IPN340",
+    "IPN360": "IPN360",
+    "IPN380": "IPN380",
+    "IPN400": "IPN400",
+    "IPN450": "IPN450",
+    "IPN500": "IPN500",
+    "IPN550": "IPN550",
+    "IPN600": "IPN600",
+    "IPN80": "IPN80",
+    "UPE100": "UPE100",
+    "UPE120": "UPE120",
+    "UPE140": "UPE140",
+    "UPE160": "UPE160",
+    "UPE180": "UPE180",
+    "UPE200": "UPE200",
+    "UPE220": "UPE220",
+    "UPE240": "UPE240",
+    "UPE270": "UPE270",
+    "UPE300": "UPE300",
+    "UPE330": "UPE330",
+    "UPE360": "UPE360",
+    "UPE400": "UPE400",
+    "UPE80": "UPE80",
+    "UPN100": "UPN100",
+    "UPN120": "UPN120",
+    "UPN140": "UPN140",
+    "UPN160": "UPN160",
+    "UPN180": "UPN180",
+    "UPN200": "UPN200",
+    "UPN220": "UPN220",
+    "UPN240": "UPN240",
+    "UPN260": "UPN260",
+    "UPN280": "UPN280",
+    "UPN300": "UPN300",
+    "UPN320": "UPN320",
+    "UPN350": "UPN350",
+    "UPN380": "UPN380",
+    "UPN400": "UPN400",
+    "UPN50": "UPN50",
+    "UPN65": "UPN65",
+    "UPN80": "UPN80"
+  }
+}

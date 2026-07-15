@@ -6,12 +6,18 @@ Workflow:
   1. Run convert_dwg_to_dxf.py  (once, converts all DWGs to DXF)
   2. Run explore_dxf.py         (optional, inspect DXF structure)
   3. Run this script             (extracts weld data -> Excel)
+
+Core API for CLI / future GUI / exe:
+  JobConfig + run_pipeline(config)
 """
 import ezdxf
 import math
 import re
 import os
 import glob
+import json
+from dataclasses import dataclass, field
+from typing import Callable, Optional
 from collections import defaultdict, Counter
 
 from ifc_reader import read_ifc
@@ -24,6 +30,8 @@ from openpyxl.styles import Font, PatternFill, Alignment
 # ============================================================
 FOLDER   = os.path.dirname(os.path.abspath(__file__))
 OUTPUT   = os.path.join(FOLDER, "焊缝统计_auto.xlsx")
+# EU catalog path lives in weld_extractor_eu; keep alias for compatibility
+from weld_extractor_eu import EU_SECTIONS_DEFAULT  # noqa: E402
 
 # Scale: 1 CAD unit = SCALE mm  (confirmed: 44.042 CAD = 440.4 mm → scale=10)
 SCALE    = 10.0
@@ -31,6 +39,96 @@ SCALE    = 10.0
 # Arrow-tip to Part-line snap tolerance (CAD units)
 SNAP_TOL  = 1.5
 MAX_HF    = 20    # cap; very large annotations are plate thickness proxies, but hf=16 is valid
+
+# ============================================================
+# Job config (CLI / GUI / exe share the same pipeline)
+# ============================================================
+@dataclass
+class JobConfig:
+    standard: str = "both"                     # "gb" | "eu" | "both"
+    dxf_paths: list = field(default_factory=list)
+    output_dir: str = FOLDER
+    section_catalog_path: Optional[str] = None  # eu_sections.json
+    ifc_dir: Optional[str] = None
+    skip_names: list = field(default_factory=list)
+    run_annotate: bool = True                   # EU annotate only when True
+    progress: Optional[Callable] = None         # progress(msg, pct 0-100)
+
+
+def _default_progress(msg, pct=None):
+    if pct is None:
+        print(msg)
+    else:
+        print(f"[{pct:5.1f}%] {msg}")
+
+
+def extract_comp_id(dxf_path):
+    """Extract assembly mark from filename (BE/CO or AB/AC/AP/AT/AX)."""
+    name = os.path.basename(dxf_path)
+    m = re.search(r'-(BE\d+|CO\d+)_', name, re.I)
+    if m:
+        return m.group(1).upper()
+    m = re.search(r'(AB|AC|AP|AT|AX)\d{4}', name, re.I)
+    if m:
+        return m.group(0).upper()
+    return os.path.splitext(name)[0]
+
+
+def detect_standard(dxf_paths):
+    has_eu = any(re.search(r'(AB|AC|AP|AT|AX)\d{4}', os.path.basename(p), re.I)
+                 for p in dxf_paths)
+    has_gb = any(re.search(r'-(BE\d+|CO\d+)_', os.path.basename(p), re.I)
+                 for p in dxf_paths)
+    if has_eu and has_gb:
+        return 'both'
+    if has_eu:
+        return 'eu'
+    return 'gb'
+
+
+def is_eu_comp(comp):
+    return bool(re.match(r'^A[BCPTX]\d{4}$', comp or '', re.I))
+
+
+def is_gb_comp(comp):
+    c = (comp or '').upper()
+    return bool(re.match(r'^(BE|CO)\d+$', c))
+
+
+def is_column_like(comp):
+    c = (comp or '').upper()
+    return c.startswith('CO') or c.startswith('AC')
+
+
+def is_beam_like(comp):
+    c = (comp or '').upper()
+    return c.startswith('BE') or c.startswith('AB')
+
+
+def is_eu_dxf(path):
+    return bool(re.search(r'(AB|AC|AP|AT|AX)\d{4}', os.path.basename(path), re.I))
+
+
+def is_gb_dxf(path):
+    return bool(re.search(r'-(BE\d+|CO\d+)_', os.path.basename(path), re.I))
+
+
+def split_dxf_paths(dxf_paths):
+    gb = [p for p in dxf_paths if is_gb_dxf(p)]
+    eu = [p for p in dxf_paths if is_eu_dxf(p)]
+    return gb, eu
+
+
+# Re-export EU catalog helpers (implementation in weld_extractor_eu)
+from weld_extractor_eu import (  # noqa: E402
+    load_eu_catalog, normalize_eu_profile, lookup_eu_section, PART_RE_EU,
+)
+
+PART_RE_GB = re.compile(r'^[sS]?[pP]\d+$|^[A-Z]{2,3}\d+$|^\d{3,}$')
+
+
+def part_re_for(standard):
+    return PART_RE_EU if (standard or 'gb').lower() == 'eu' else PART_RE_GB
 
 # ============================================================
 # Component-specific configuration
@@ -292,6 +390,9 @@ def parse_weldmark(blk):
                 groove_above = True
             else:
                 groove_below = True
+        elif re.match(r'^[23]S\.?$', txt.strip(), re.I):
+            # EU shorthand: 2S. / 3S. → 2 SIDES / 3 SIDES
+            annotation = '2 SIDES' if txt.strip().upper().startswith('2') else '3 SIDES'
         elif any(kw in txt.upper() for kw in ['SIDE', '围', '全', 'ALL']):
             annotation = txt
     # TYP / TYP. = typical weld (applies to multiple symmetric instances)
@@ -404,14 +505,15 @@ def part_centroid(lines):
 # ============================================================
 # Find part labels (text that looks like a part number)
 # ============================================================
-PART_RE = re.compile(r'^[sS]?[pP]\d+$|^[A-Z]{2,3}\d+$|^\d{3,}$')
+PART_RE = PART_RE_GB  # default GB; eu uses PART_RE_EU via find_all_labels(standard=)
 
-def find_all_labels(doc):
+def find_all_labels(doc, standard='gb'):
     """
     Scan Mark blocks for text matching part-number patterns.
     Extracts leader_tip = farthest line endpoint from the text position,
     which is the point where the leader arrow touches the labelled part.
     """
+    pre = part_re_for(standard)
     labels = []
     for blk in doc.blocks:
         blk_name = blk.name
@@ -445,7 +547,7 @@ def find_all_labels(doc):
                                   (e.dxf.end.x,   e.dxf.end.y)))
                 except:
                     pass
-        label = next((t for t in texts if PART_RE.match(t)), None)
+        label = next((t for t in texts if pre.match(t)), None)
         if not label or not txt_pos:
             continue
         if lines:
@@ -603,81 +705,86 @@ def hf_from_thickness(t):
     return 10
 
 # ============================================================
-# BOM parser  (Unknown block part schedule)
+# BOM parser  (Unknown block / PART_LIST)
 # ============================================================
-def parse_bom(doc, comp):
-    """
-    Parse the part schedule (BOM) from the Unknown block that contains
-    part mark + PLt×W / HWd×b×tw×tf entries.
+def _collect_bom_rows_from_block(blk):
+    """Collect TEXT/MTEXT grouped into y-rows → list of vals (left→right)."""
+    raw = []
+    for e in blk:
+        if e.dxftype() not in ('TEXT', 'MTEXT'):
+            continue
+        try:
+            txt = (e.dxf.text if e.dxftype() == 'TEXT' else e.text).strip()
+            x = round(e.dxf.insert.x, 0)
+            y = round(e.dxf.insert.y, 1)
+            if txt:
+                raw.append((y, x, txt))
+        except Exception:
+            pass
+    rows = defaultdict(dict)
+    for y, x, txt in raw:
+        rows[round(y)][x] = txt
+    result = []
+    for yk in sorted(rows, reverse=True):
+        vals_sorted = sorted(rows[yk].items())
+        result.append([txt for _, txt in vals_sorted])
+    return result
 
-    Returns:
-      part_dims  : {label -> {'thick': t, 'width': w, 'bom_len': l, 'qty': q}}
-      comp_dims  : {'depth': d, 'flange_w': b, 'web_t': tw, 'flange_t': tf} or {}
+
+def _bom_row_qty_len(vals, spec):
+    nums = []
+    for v in vals:
+        if v == spec:
+            continue
+        try:
+            fv = float(v)
+            if fv > 50:
+                nums.append(fv)
+        except Exception:
+            pass
+    bom_len = max(nums) if nums else None
+    small_nums = [int(v) for v in vals if re.match(r'^\d{1,2}$', v)]
+    qty = small_nums[1] if len(small_nums) >= 2 else (small_nums[0] if small_nums else 1)
+    return qty, bom_len
+
+
+def parse_bom(doc, comp, standard='gb', catalog_path=None):
     """
+    Parse the part schedule (BOM).
+
+    GB: Unknown blocks — mark p/sp + PL/HW/HN/HM with x separator.
+    EU: delegated to weld_extractor_eu.parse_bom_eu (PART_LIST / HEA).
+    """
+    standard = (standard or 'gb').lower()
+    if standard == 'eu':
+        from weld_extractor_eu import parse_bom_eu
+        return parse_bom_eu(doc, comp, catalog_path)
+    return _parse_bom_gb(doc, comp)
+
+
+def _parse_bom_gb(doc, comp):
     part_dims = {}
     comp_dims = {}
 
     for blk in doc.blocks:
-        # Global Unknown blocks only (no " - XXXX" suffix)
         if not (blk.name.startswith('Unknown') and ' - ' not in blk.name):
             continue
 
-        # Collect all TEXT/MTEXT with position
-        raw = []
-        for e in blk:
-            if e.dxftype() not in ('TEXT', 'MTEXT'):
-                continue
-            try:
-                txt = (e.dxf.text if e.dxftype() == 'TEXT' else e.text).strip()
-                x = round(e.dxf.insert.x, 0)
-                y = round(e.dxf.insert.y, 1)
-                if txt:
-                    raw.append((y, x, txt))
-            except:
-                pass
-
-        # Group into rows by y (tolerant bucketing to avoid row collisions)
-        rows = defaultdict(dict)
-        for y, x, txt in raw:
-            # Round y to nearest integer; group rows within 1.5 units
-            rows[round(y)][x] = txt
-
         found_any = False
-        for yk in sorted(rows, reverse=True):
-            rowvals = rows[yk]
-            # Sort by x-coordinate so columns read left→right:
-            #  [drawing#] [seq] [qty] [mark] [spec] [grade] [len] [note] [weight]
-            vals_sorted = sorted(rowvals.items())
-            vals = [txt for _, txt in vals_sorted]
-            mark  = next((v for v in vals if re.match(r'^(?:sp|p)\d+$', v, re.I) or v == comp), None)
-            spec  = next((v for v in vals if re.search(r'(?:PL|HW|HN|HM)\d+[xX]', v, re.I)), None)
+        for vals in _collect_bom_rows_from_block(blk):
+            mark = next((v for v in vals if re.match(r'^(?:sp|p)\d+$', v, re.I) or v == comp), None)
+            spec = next((v for v in vals if re.search(r'(?:PL|HW|HN|HM)\d+[xX]', v, re.I)), None)
             if not (mark and spec):
                 continue
             found_any = True
-            # Parse plate spec PLt×W or PLt×W×L
             pm = re.match(r'PL(\d+(?:\.\d+)?)[xX×](\d+(?:\.\d+)?)', spec, re.I)
-            # Parse H-section HWd×b×tw×tf
-            hm = re.match(r'H[WNMQwq](\d+(?:\.\d+)?)[xX×](\d+(?:\.\d+)?)[xX×](\d+(?:\.\d+)?)[xX×](\d+(?:\.\d+)?)', spec, re.I)
-            # BOM length column (largest number > 50 in the row, not the spec itself)
-            nums = []
-            for v in vals:
-                if v == spec: continue
-                try:
-                    fv = float(v)
-                    if fv > 50:
-                        nums.append(fv)
-                except:
-                    pass
-            bom_len = max(nums) if nums else None
-            # Qty: second 1-2 digit number (first is seq number, see column order above)
-            small_nums = [int(v) for v in vals if re.match(r'^\d{1,2}$', v)]
-            qty = small_nums[1] if len(small_nums) >= 2 else (small_nums[0] if small_nums else 1)
+            hm = re.match(
+                r'H[WNMQwq](\d+(?:\.\d+)?)[xX×](\d+(?:\.\d+)?)[xX×](\d+(?:\.\d+)?)[xX×](\d+(?:\.\d+)?)',
+                spec, re.I)
+            qty, bom_len = _bom_row_qty_len(vals, spec)
 
             if pm:
                 t, w = float(pm.group(1)), float(pm.group(2))
-                # Filter: if the found "length" is unreasonably large compared
-                # to the plate width (e.g. weight column misread as length),
-                # discard it.  Typical plate aspect ratio L/W <= 4.
                 if bom_len and w > 0 and bom_len > w * 4:
                     bom_len = None
                 part_dims[mark] = {'thick': t, 'width': w, 'bom_len': bom_len, 'qty': qty}
@@ -687,23 +794,34 @@ def parse_bom(doc, comp):
                 part_dims[mark] = {'thick': tf, 'width': b, 'bom_len': bom_len, 'qty': qty}
 
         if found_any:
-            break   # use first BOM block found
+            break
 
     return part_dims, comp_dims
 
 # ============================================================
 # Main per-file extraction
 # ============================================================
-def extract_welds(dxf_path):
-    comp_m = re.search(r'-(BE\d+|CO\d+)_', os.path.basename(dxf_path), re.I)
-    comp   = comp_m.group(1).upper() if comp_m else os.path.splitext(os.path.basename(dxf_path))[0]
+def extract_welds(dxf_path, config=None):
+    """Internal shared extractor. Prefer extract_gb / extract_eu entry points."""
+    if config is None:
+        std = 'eu' if is_eu_dxf(dxf_path) else 'gb'
+        config = JobConfig(standard=std, dxf_paths=[dxf_path],
+                           section_catalog_path=EU_SECTIONS_DEFAULT if std == 'eu' else None)
+    standard = (config.standard or 'gb').lower()
+    catalog_path = config.section_catalog_path or EU_SECTIONS_DEFAULT
+    ifc_dir = config.ifc_dir or os.path.join(FOLDER, 'ifc格式')
 
-    print(f"\n{'='*60}\n{os.path.basename(dxf_path)}  [{comp}]")
+    comp = extract_comp_id(dxf_path)
+
+    print(f"\n{'='*60}\n{os.path.basename(dxf_path)}  [{comp}]  standard={standard}")
 
     doc = ezdxf.readfile(dxf_path)
 
+    # Per-component overrides (GB COMP_CONFIG); empty for EU / unknown comps
+    _cfg = COMP_CONFIG.get(comp, {})
+
     # Parse BOM for part dimensions and comp section properties
-    part_dims, comp_dims = parse_bom(doc, comp)
+    part_dims, comp_dims = parse_bom(doc, comp, standard=standard, catalog_path=catalog_path)
     _bom_labels = set(part_dims.keys())  # original BOM labels (before inference)
     comp_web_t    = comp_dims.get('web_t',    None)   # e.g. 9  for HW250×250×9×14
     comp_flange_t = comp_dims.get('flange_t', None)   # e.g. 14
@@ -711,7 +829,7 @@ def extract_welds(dxf_path):
     if comp_dims:
         print(f"  Comp section: {comp_dims}")
 
-    ifc_path = os.path.join(FOLDER, 'ifc格式', f'{comp}.ifc')
+    ifc_path = os.path.join(ifc_dir, f'{comp}.ifc')
     ifc_dims, ifc_adj, ifc_inst = read_ifc(ifc_path)
     if ifc_dims:
         for lbl, dims in ifc_dims.items():
@@ -794,6 +912,18 @@ def extract_welds(dxf_path):
     print(f"  Views with WeldMarks : {sorted(wm_by_view)}")
     print(f"  Views with Parts     : {sorted(part_by_view)}")
 
+    # EU Tekla: map view_id → section letter / main elev via drawing labels
+    _eu_view_roles = {'letter_by_view': {}, 'view_by_letter': {}, 'main_views': set()}
+    if standard == 'eu':
+        from weld_extractor_eu import discover_eu_view_roles
+        _eu_view_roles = discover_eu_view_roles(doc)
+        _lv = _eu_view_roles.get('letter_by_view') or {}
+        _mv = sorted(_eu_view_roles.get('main_views') or [])
+        if _lv or _mv:
+            _sec = ', '.join(f"{v}={L}-{L}" for v, L in sorted(_lv.items()))
+            print(f"  [EU views] sections: {_sec or '(none)'}; "
+                  f"main elev: {_mv or '(none)'}")
+
     # Build part geometry maps
     part_lines_map = {}    # view_id -> {part_name: [lines]}
 
@@ -820,10 +950,19 @@ def extract_welds(dxf_path):
     # Populated in a deferred step after label assignment.
 
     # Assign part labels via Mark block leader tips
-    all_labels      = find_all_labels(doc)
+    all_labels      = find_all_labels(doc, standard=standard)
     part_number_map = assign_labels_by_leader_tip(all_labels, part_lines_map)
     print(f"  Part label candidates: {[x['label'] for x in all_labels]}")
     print(f"  Part→label map : {part_number_map}")
+
+    # EU: recover plate labels missing in the weld view (common on AT assemblies)
+    if standard == 'eu':
+        from weld_extractor_eu import assign_eu_unlabeled_from_bom
+        part_number_map, _eu_asg = assign_eu_unlabeled_from_bom(
+            part_number_map, part_lines_map, part_dims, comp, scale=SCALE)
+        if _eu_asg:
+            print(f"  [EU unlabeled→BOM] {_eu_asg}")
+            print(f"  Part→label map : {part_number_map}")
 
     # Build part_cope map: {part_label: cope_mm}
     # Derives the cope deduction from the max ARC radius in each Part block.
@@ -1154,6 +1293,9 @@ def extract_welds(dxf_path):
     _peers_data = []       # [(view_id, thick, gusset_label, [(edge_len, other_label)])]
     _synth_pairs = set()   # (part1, part2) pairs from synthetic CIRCLE edges, skip pos-refine
     _gussets_3s = set()    # track gussets processed in 3-SIDES/CIRCLE WMs (cross-view dedup)
+    _eu_typ_seeds = []     # EU TYP seeds for similar-structure expansion
+    _eu_ms_pairs = {}      # view_id -> set of frozenset({p1,p2}) from 2S/3S
+    _eu_typ_wm_views = set()  # views whose WM carried TYP
 
     _pp_arrow_map = {}  # pp_extra WM arrow positions
     for view_id, weldmarks in wm_by_view.items():
@@ -1174,6 +1316,9 @@ def extract_welds(dxf_path):
             if not matches:
                 skipped.append((wm_name, f"no Part at arrow_tip {arrow}"))
                 continue
+
+            if standard == 'eu' and parsed.get('is_typ'):
+                _eu_typ_wm_views.add(view_id)
 
             # '3 SIDES' / '2 SIDES' / '围' / '全' all indicate a perimeter gusset weld
             # where edges of the attachment plate must be enumerated.
@@ -1245,6 +1390,7 @@ def extract_welds(dxf_path):
                             _pp_arrow_map.setdefault(_k, []).append((arrow, view_id))
 
                 _synth = _use_largest_gusset and bool(comp_dims.get('flange_w'))
+                _eu_ms_done = False
                 if _synth:
                     _, _wl, _ = choose_weld_line(arrow, matches)
                     _fw_cad = comp_dims['flange_w'] / SCALE
@@ -1359,13 +1505,60 @@ def extract_welds(dxf_path):
                     else:
                         skipped.append((wm_name, 'CIRCLE: no weld line'))
                         continue
-                if not _synth:
 
-                # Collect edges per gusset block (each gusset processed independently)
-                # to support multi-instance assemblies (e.g. haunches on both flanges).
-                # Build pass-through for unlabeled parts: find which labeled
-                # part each unlabeled part is adjacent to (e.g. a small filler
-                # plate sandwiched between the gusset and the main part).
+                # EU: arrow → plate; each edge keeps real neighbour (main and/or plate)
+                if (standard == 'eu' and not is_circle_wm and not _synth):
+                    from weld_extractor_eu import (
+                        enumerate_eu_multiside_edges,
+                        find_eu_typ_sibling_edges,
+                    )
+                    _eu_res = enumerate_eu_multiside_edges(
+                        arrow, matches, view_parts, part_number_map, part_dims,
+                        comp, expected_edges, adj_tol=ADJ_TOL, scale=SCALE,
+                        min_edge_cad=MIN_EDGE, comp_dims=comp_dims,
+                    )
+                    if _eu_res and _eu_res.get('weld_edges_by_gusset'):
+                        weld_edges_by_gusset = _eu_res['weld_edges_by_gusset']
+                        gusset_name = _eu_res['gusset_name']
+                        gusset_names = list(_eu_res['gusset_names'])
+                        gusset_blk_set = set(gusset_names)
+                        _eu_partner = _eu_res.get('partner_lbl')
+                        _n_eu = sum(len(v) for v in weld_edges_by_gusset.values())
+                        _ep = _eu_res.get('edge_partners') or []
+                        print(f"    [EU-ms] kind={_eu_res.get('section_kind')} "
+                              f"partners={_eu_partner} edges={_n_eu} "
+                              f"seed_mm={_eu_res.get('seed_mm')} "
+                              f"gusset={part_number_map.get(gusset_name, '?')}")
+                        for _eg, _op, _el, _fc in _ep:
+                            print(f"      edge {_eg}/{_op} L={_el} face={_fc}")
+                        if parsed.get('is_typ'):
+                            _n_sib = find_eu_typ_sibling_edges(
+                                weld_edges_by_gusset, gusset_names, _eu_partner,
+                                view_parts, part_number_map, expected_edges,
+                                adj_tol=ADJ_TOL, scale=SCALE,
+                                section_kind=_eu_res.get('section_kind') or 'H',
+                                main_blocks=_eu_res.get('main_blocks') or [],
+                                comp=comp, part_dims=part_dims, arrow=arrow)
+                            if _n_sib:
+                                print(f"    [EU-TYP] +{_n_sib} sibling plate(s) in view")
+                                gusset_names = list(dict.fromkeys(
+                                    list(gusset_names) + list(weld_edges_by_gusset.keys())))
+                                gusset_blk_set = set(gusset_names)
+                        # Record allowed pairs for cleanup
+                        _eu_ms_pairs.setdefault(view_id, set())
+                        for _gn, _edges in weld_edges_by_gusset.items():
+                            _gl = part_number_map.get(_gn, '?')
+                            for _leng, _ob, _fr in _edges:
+                                _ol = part_number_map.get(_ob, comp)
+                                _eu_ms_pairs[view_id].add(frozenset((_gl, _ol)))
+                        _eu_ms_done = True
+
+                if not _synth and not _eu_ms_done:
+                    # Collect edges per gusset block (each gusset processed independently)
+                    # to support multi-instance assemblies (e.g. haunches on both flanges).
+                    # Build pass-through for unlabeled parts: find which labeled
+                    # part each unlabeled part is adjacent to (e.g. a small filler
+                    # plate sandwiched between the gusset and the main part).
                     unlabeled_passthru = {}
                     _unlabeled = {pn for pn in view_parts
                                   if pn not in part_number_map and pn not in gusset_blk_set}
@@ -1677,7 +1870,8 @@ def extract_welds(dxf_path):
                 # Connected-part enumeration when the 3-SIDES gusset IS the comp body
                 # (e.g. BE021).  The gusset's own edges are column construction lines,
                 # not weld seams.  Real welds are on the attached non-comp plates.
-                if not _synth and part_number_map.get(gusset_name, comp) == comp:
+                if (not _synth and not _eu_ms_done
+                        and part_number_map.get(gusset_name, comp) == comp):
                     _cp_edges = {}
                     for _cpn, _cplns in view_parts.items():
                         if _cpn in gusset_blk_set:
@@ -1777,7 +1971,7 @@ def extract_welds(dxf_path):
                 # TYP multiplier: count candidate non-comp labels in the main assembly view.
                 # Uses the gusset label and all other-part labels from collected edges.
                 typ_mul_3s = 1
-                if parsed['is_typ']:
+                if parsed['is_typ'] and not _eu_ms_done:
                     _cand = {part_number_map.get(op, comp)
                              for _, op, _, _ in weld_edges_all
                              if part_number_map.get(op, comp) != comp}
@@ -1794,6 +1988,9 @@ def extract_welds(dxf_path):
                     typ_mul_3s = max(1, typ_mul_3s // len(gusset_names))
                     if typ_mul_3s > 1:
                         print(f"    [TYP x{typ_mul_3s}]")
+                elif parsed['is_typ'] and _eu_ms_done:
+                    # EU TYP siblings already expanded geometrically into weld_edges_by_gusset
+                    pass
                 # hf correction for 3-SIDES: skip when CJP annotation is present
                 # or both sides have the same valid fillet size.
                 _sz3_a = parsed['size_above']
@@ -1809,7 +2006,7 @@ def extract_welds(dxf_path):
                 # Rank-based BOM mapping for 3-SIDES gussets with known dimensions.
                 # Consistent rounding helper for BOM values (CO: int+0.49, others: round)
                 def _br(val):
-                    return int(val + 0.49) if comp.startswith('CO') else round(val)
+                    return int(val + 0.49) if is_column_like(comp) else round(val)
                 # Two strategies depending on edge-length distribution:
                 #
                 #   A) 2 distinct lengths with one appearing twice (e.g. p42 edges
@@ -1875,7 +2072,7 @@ def extract_welds(dxf_path):
                                         _bom_edge_map[(_cg, _g)] = _br(_comp_depth)
                                     else:
                                         # Other edges → plate width
-                                        if comp.startswith('CO'):
+                                        if is_column_like(comp):
                                             _bom_edge_map[(_cg, _g)] = int(_bw3 + 0.49)
                                         else:
                                             _bom_edge_map[(_cg, _g)] = round(_bw3)
@@ -2258,7 +2455,9 @@ def extract_welds(dxf_path):
                     # (85-120mm). These are geometry artifacts: the plates
                     # touch in the DXF view but weld through an intermediate
                     # ghost plate (e.g. P101/P124 → P100/P101 + P100/P124).
-                    if p1 != comp and p2 != comp and 85 < final_edge_mm < 120:
+                    # EU multiside path already filtered by partner+length — do not drop.
+                    if (standard != 'eu' and p1 != comp and p2 != comp
+                            and 85 < final_edge_mm < 120):
                         _bw1 = part_dims.get(p1, {}).get('width', 999)
                         _bw2 = part_dims.get(p2, {}).get('width', 999)
                         if _bw1 < 150 and _bw2 < 150:
@@ -2362,8 +2561,9 @@ def extract_welds(dxf_path):
                                         if _bom_w > 0: er['length_mm'] = float(_bom_w)
                                     _fixed += 1
                 # PP multi-edge dedup: keep best edge per plate pair
+                # (GB only — EU multiside already selected the weld sides)
                 _cfg = COMP_CONFIG.get(comp, {})
-                if len(edge_rows) > 1:
+                if standard != 'eu' and len(edge_rows) > 1:
                     _pp_groups = defaultdict(list)
                     for i, er in enumerate(edge_rows):
                         if er['part1'] != comp and er['part2'] != comp:
@@ -2460,6 +2660,12 @@ def extract_welds(dxf_path):
                 # TYP symmetric mirroring: when _ext_mul > 1, mirror copy[1..n-1]
                 # x-coordinates about the global component centre.
                 # Mirrored copies get view_id of the cross-view (same gusset label).
+                if standard == 'eu' and parsed.get('is_typ') and edge_rows:
+                    _eu_typ_seeds.append({
+                        'view_id': view_id,
+                        'n_sides': expected_edges,
+                        'rows': [dict(er) for er in edge_rows],
+                    })
                 if _ext_mul > 1:
                     # Mirror centre: gusset-label x-range midpoint (e.g. p18 instances on
                     # left and right flanges define the true symmetry axis).
@@ -2592,16 +2798,17 @@ def extract_welds(dxf_path):
 
             # BOM fallback: when the WM finds only comp-labeled parts (self-weld),
             # the non-comp plate is not visible in the elevation view.  Scan BOM
-            # for a part whose bom_width ≈ geo (within 15 %) to recover the label.
+            # for a part whose bom_width or bom_len ≈ geo (within 15 %) to recover.
             if lbl_non_comp == comp and part_dims and weld_len_mm > 0:
                 _best_ratio = 0.15
                 _best_lbl   = None
                 for _plbl, _pdims in part_dims.items():
                     if _plbl == comp:
                         continue
-                    _bw = _pdims.get('width')
-                    if _bw and _bw > 0:
-                        _r = abs(weld_len_mm - _bw) / weld_len_mm
+                    for _dim in (_pdims.get('width'), _pdims.get('bom_len')):
+                        if not _dim or _dim <= 0:
+                            continue
+                        _r = abs(weld_len_mm - _dim) / max(weld_len_mm, 1)
                         if _r < _best_ratio:
                             _best_ratio = _r
                             _best_lbl   = _plbl
@@ -2611,23 +2818,29 @@ def extract_welds(dxf_path):
                     bom_fallback_count = sum(
                         1 for lbl in part_number_map.values()
                         if lbl == _best_lbl
-                    )
+                    ) or 1
+                    print(f"    [BOM fallback-label] {_best_lbl} ratio={_best_ratio:.3f}")
 
             # TYP multiplier: for CO components, stiffeners may appear in
             # separate section views.  Use BOM qty when the plate has 0-1
             # visible instances in the WM's view (BOM is the only reference
             # for sparsely-shown plates).  Otherwise use view-based count.
+            # EU: do not stack blind copies at the arrow — similar-structure
+            # expansion fills same/other views after all WMs are processed.
             if parsed['is_typ'] and lbl_non_comp != comp:
-                _bom_qty = part_dims.get(lbl_non_comp, {}).get('qty', 1)
-                _view_n  = sum(1 for k, v in part_number_map.items()
-                                if v == lbl_non_comp and k.split(' - ')[-1] == view_id)
-                if comp.startswith('CO') and _bom_qty and _view_n < 2:
-                    _typ_n = max(_bom_qty, _view_n)  # sparse view; BOM may be more complete
+                if standard == 'eu':
+                    bom_fallback_count = 1
                 else:
-                    _typ_n = _view_n
-                if _typ_n > 1:
-                    bom_fallback_count = _typ_n
-                    print(f"    [TYP x{bom_fallback_count}] {lbl_non_comp}")
+                    _bom_qty = part_dims.get(lbl_non_comp, {}).get('qty', 1)
+                    _view_n  = sum(1 for k, v in part_number_map.items()
+                                    if v == lbl_non_comp and k.split(' - ')[-1] == view_id)
+                    if is_column_like(comp) and _bom_qty and _view_n < 2:
+                        _typ_n = max(_bom_qty, _view_n)  # sparse view; BOM may be more complete
+                    else:
+                        _typ_n = _view_n
+                    if _typ_n > 1:
+                        bom_fallback_count = _typ_n
+                        print(f"    [TYP x{bom_fallback_count}] {lbl_non_comp}")
 
             # Stiffener flange-face override (any match type):
             # When the non-comp plate width ≈ comp flange width (cover/stiffener plate
@@ -2682,7 +2895,7 @@ def extract_welds(dxf_path):
                                 # the full plate length (bom_len) but actual weld is on
                                 # the beam web: depth - 2*cope(25) - 2*flange_t
                                 _wfw_bl = 0
-                                if comp.startswith('BE') and comp_dims.get('depth') and comp_dims.get('flange_t'):
+                                if is_beam_like(comp) and comp_dims.get('depth') and comp_dims.get('flange_t'):
                                     _wfw_bl = round(comp_dims['depth'] - 2*25 - 2*comp_dims['flange_t'])
                                 # 仅当板宽接近翼缘宽时才使用腹板公式（腹板加劲板）
                                 _is_web_stiffener = False
@@ -2733,8 +2946,8 @@ def extract_welds(dxf_path):
                         elif abs(weld_len_mm - bw) / weld_len_mm < BOM_WIDTH_TOL:
                             print(f"    [BOM case3] {lbl_non_comp} geo={weld_len_mm} bw={bw}")
                             if bl and bl > 0:
-                                _bw_rounded = int(bw + 0.49) if comp.startswith('CO') else round(bw)
-                                _bl_rounded = int(bl + 0.49) if comp.startswith('CO') else round(bl)
+                                _bw_rounded = int(bw + 0.49) if is_column_like(comp) else round(bw)
+                                _bl_rounded = int(bl + 0.49) if is_column_like(comp) else round(bl)
                                 _d_bw = abs(weld_len_mm - _bw_rounded)
                                 _d_bl = abs(weld_len_mm - _bl_rounded)
                                 if _d_bl < _d_bw * 0.5:
@@ -2749,7 +2962,7 @@ def extract_welds(dxf_path):
                 # CO section-view fallback: column-type section cuts show plates
                 # in foreshortened projection (e.g. p124 geo=90.5 → bw=116,
                 # geo=170 → bl=220).  Standard beam tolerances are too strict.
-                if (comp.startswith('CO')
+                if (is_column_like(comp)
                         and not stiffener_override_applied
                         and lbl_non_comp != comp
                         and lbl_non_comp in part_dims
@@ -2870,8 +3083,17 @@ def extract_welds(dxf_path):
                   f"  annot={parsed['annotation']!r}")
 
             if lbl1 == lbl2:
-                # self-reference — skip
-                continue
+                # Self-reference — normally skip.  EU single-member assemblies
+                # (e.g. AT0001: only UPN in BOM, no plate Part) still have real
+                # WeldMarks on the profile; keep those rows.
+                _eu_solo = (
+                    standard == 'eu'
+                    and lbl1 == comp
+                    and not any(k != comp for k in part_dims)
+                )
+                if not _eu_solo:
+                    continue
+                print(f"    [EU solo-member] keep self-weld {lbl1}/{lbl2}")
 
             # WM 焊缝直接用箭头指向点作为标注位置
             _weld_pos = arrow
@@ -2983,6 +3205,7 @@ def extract_welds(dxf_path):
 
             _rep_vid = view_id
             _rep_pos = _typ_positions
+            _eu_wm_row0 = len(results)
             if cjp_sides:
                 # CJP side → always 'Above', hf=None, note='CJP'
                 # y-snap to WM arrow level
@@ -3051,6 +3274,13 @@ def extract_welds(dxf_path):
                             'view_id':    _rep_vid,
                         })
 
+            if standard == 'eu' and parsed.get('is_typ') and len(results) > _eu_wm_row0:
+                _eu_typ_seeds.append({
+                    'view_id': view_id,
+                    'n_sides': 1,
+                    'rows': [dict(r) for r in results[_eu_wm_row0:]],
+                })
+
     # Post-processing: connected-part enumeration for 3-SIDES views
     # where gusset is the comp body. Only for BE (non-CO) components.
             # Helper: compute midpoint of a line dict
@@ -3058,7 +3288,7 @@ def extract_welds(dxf_path):
         return ((ln['start'][0] + ln['end'][0]) / 2,
                 (ln['start'][1] + ln['end'][1]) / 2)
 
-    if not comp.startswith('CO') and part_lines_map and part_dims:
+    if not is_column_like(comp) and part_lines_map and part_dims:
         _ADJ = SNAP_TOL + 0.5
         _MIN_EDGE_CAD = 1.5
         _plates_done = set()
@@ -3213,7 +3443,7 @@ def extract_welds(dxf_path):
     # Post-processing: BOM-based comp→plate enumeration for CO components.
     # Pair-level guard for uncovered plates.  Also fills missing BOM-length
     # edges for plates that already have comp→plate coverage (e.g. p125 [220]).
-    if comp.startswith('CO') and comp not in ('CO009','CO010') and part_dims:
+    if is_column_like(comp) and comp not in ('CO009','CO010') and part_dims:
         _pairs_covered = set()
         _triples_covered = set()
         for r in results:
@@ -3291,7 +3521,7 @@ def extract_welds(dxf_path):
     # Post-processing: geometry enumeration with bolt-hole filter for CO.
     # For plates with Part blocks but no WM annotation, enumerate DXF geometry
     # edges that touch comp or adjacent plates. Skip bolted connections.
-    if comp.startswith('CO') and part_dims and part_lines_map:
+    if is_column_like(comp) and part_dims and part_lines_map:
         _ADJ = SNAP_TOL + 0.5
         _MIN_EDGE_MM = 30.0
         _pairs_covered = set()
@@ -4169,7 +4399,7 @@ def extract_welds(dxf_path):
     _bl_pairs = _cfg.get('bl_weld_pairs', [])
     _pp_extras = _cfg.get('pp_extra', [])
     # Auto pp for new components (not in COMP_CONFIG): match BOM length + same view
-    if not _bl_pairs and not _pp_extras and comp.startswith('CO') and comp not in COMP_CONFIG:
+    if not _bl_pairs and not _pp_extras and is_column_like(comp) and comp not in COMP_CONFIG:
         _by_bl = defaultdict(list)
         for _plbl, _pdims in part_dims.items():
             if _plbl == comp: continue
@@ -4259,7 +4489,7 @@ def extract_welds(dxf_path):
 
     # PP long-side BOM weld: when peer-rep copies short projection edges
     # to a plate that welds to a large base plate, use the plate's BOM length.
-    if comp.startswith('CO') and part_dims:
+    if is_column_like(comp) and part_dims:
         for _plbl, _pdims in part_dims.items():
             if _plbl == comp: continue
             _bom_len = round(_pdims.get('bom_len') or 0)
@@ -4568,82 +4798,85 @@ def extract_welds(dxf_path):
                             circle_vid='1800')
 
     # 通用对称板镜像：对 plate→plate 边，检测对称板并 x-镜像复制
+    # EU uses [EU-TYP] face-adjacent siblings instead; this GB heuristic
+    # invents false pairs when section-dim "main" blocks keep BOM plate labels.
     _pp_mirrored = 0
-    for _vid, _vparts in part_lines_map.items():
-        _pp_results = [r for r in results if r.get('component') == comp
-                       and r.get('part1') != comp and r.get('part2') != comp
-                       and r.get('view_id') == _vid]
-        if not _pp_results:
-            continue
-        _vx_vals = []
-        _plate_bbox = {}
-        for _pn, _plns in _vparts.items():
-            _plbl = part_number_map.get(_pn, comp)
-            if _plbl == comp: continue
-            _pxs = [p[0] for ln in _plns for p in (ln['start'], ln['end'])]
-            _pys = [p[1] for ln in _plns for p in (ln['start'], ln['end'])]
-            if _pxs:
-                _plate_bbox[_plbl] = (min(_pxs), max(_pxs), min(_pys), max(_pys))
-                _vx_vals.extend([min(_pxs), max(_pxs)])
-        if len(_plate_bbox) < 2:
-            continue
-        _vx_c = (min(_vx_vals) + max(_vx_vals)) / 2 if _vx_vals else 0
-        _pp_pairs = set(tuple(sorted((r['part1'], r['part2']))) for r in _pp_results)
-        for (_pa, _pb) in list(_pp_pairs):
-            _pa_bb = _plate_bbox.get(_pa, (0,0,0,0))
-            _pb_bb = _plate_bbox.get(_pb, (0,0,0,0))
-            _pa_w = abs(_pa_bb[1] - _pa_bb[0]); _pa_h = abs(_pa_bb[3] - _pa_bb[2])
-            _pb_w = abs(_pb_bb[1] - _pb_bb[0]); _pb_h = abs(_pb_bb[3] - _pb_bb[2])
-            _pa_cx = (_pa_bb[0] + _pa_bb[1]) / 2
-            _pb_cx = (_pb_bb[0] + _pb_bb[1]) / 2
-            # Try both plates as anchor
-            for _anchor, _anchor_bb, _anchor_w, _anchor_h, _anchor_cx in [
-                (_pa, _pa_bb, _pa_w, _pa_h, _pa_cx),
-                (_pb, _pb_bb, _pb_w, _pb_h, _pb_cx),
-            ]:
-                if _anchor_w < 1 or _anchor_h < 1: continue
-                for _pc, _pc_bb in _plate_bbox.items():
-                    if _pc in (_pa, _pb): continue
-                    _mirror_pair = tuple(sorted((_anchor, _pc)))
-                    if _mirror_pair in _pp_pairs: continue
-                    _pc_w = abs(_pc_bb[1] - _pc_bb[0])
-                    _pc_h = abs(_pc_bb[3] - _pc_bb[2])
-                    if _pc_w < 1 or _pc_h < 1: continue
-                    _w_d = abs(_anchor_w - _pc_w) / max(_anchor_w, _pc_w, 1)
-                    _h_d = abs(_anchor_h - _pc_h) / max(_anchor_h, _pc_h, 1)
-                    if _w_d + _h_d > 0.4: continue
-                    _pc_cx = (_pc_bb[0] + _pc_bb[1]) / 2
-                    if not ((_anchor_cx < _vx_c and _pc_cx > _vx_c) or (_anchor_cx > _vx_c and _pc_cx < _vx_c)):
-                        continue
-                    _other = _pb if _anchor == _pa else _pa
-                    _other_bb = _plate_bbox.get(_other)
-                    _mir_x_fixed = None
-                    if _other_bb:
-                        _other_cx = (_other_bb[0] + _other_bb[1]) / 2
-                        _mir_x_fixed = _pc_bb[1] if _other_cx > _pc_cx else _pc_bb[0]
-                    for _r in _pp_results:
-                        if {_r['part1'], _r['part2']} != {_pa, _pb}: continue
-                        _src_pos = _r.get('dxf_pos')
-                        if not _src_pos: continue
-                        _nr = dict(_r)
-                        _nr['part1'] = _pc if _r['part1'] == _anchor else _other
-                        _nr['part2'] = _pc if _r['part2'] == _anchor else _other
-                        _mir_x = _mir_x_fixed if _mir_x_fixed is not None else (
-                            2 * ((_anchor_cx + _pc_cx) / 2) - _src_pos[0])
-                        _nr['dxf_pos'] = (_mir_x, _src_pos[1])
-                        _nr['_no_refine'] = True
-                        _nr['_mirrored'] = True
-                        for _pos in ('Above', 'Below'):
-                            _nr2 = dict(_nr, position=_pos)
-                            _exist = any(r2 for r2 in results
-                                         if {r2['part1'], r2['part2']} == {_other, _pc}
-                                         and r2['position'] == _pos
-                                         and abs(r2['length_mm'] - _nr['length_mm']) < 0.5)
-                            if not _exist:
-                                results.append(_nr2)
-                                _pp_mirrored += 1
-                                print(f"    [pp-mirror] {_anchor}/{_other}→{_pc}/{_other} in view {_vid} x-mirrored")
-                        break
+    if standard != 'eu':
+        for _vid, _vparts in part_lines_map.items():
+            _pp_results = [r for r in results if r.get('component') == comp
+                           and r.get('part1') != comp and r.get('part2') != comp
+                           and r.get('view_id') == _vid]
+            if not _pp_results:
+                continue
+            _vx_vals = []
+            _plate_bbox = {}
+            for _pn, _plns in _vparts.items():
+                _plbl = part_number_map.get(_pn, comp)
+                if _plbl == comp: continue
+                _pxs = [p[0] for ln in _plns for p in (ln['start'], ln['end'])]
+                _pys = [p[1] for ln in _plns for p in (ln['start'], ln['end'])]
+                if _pxs:
+                    _plate_bbox[_plbl] = (min(_pxs), max(_pxs), min(_pys), max(_pys))
+                    _vx_vals.extend([min(_pxs), max(_pxs)])
+            if len(_plate_bbox) < 2:
+                continue
+            _vx_c = (min(_vx_vals) + max(_vx_vals)) / 2 if _vx_vals else 0
+            _pp_pairs = set(tuple(sorted((r['part1'], r['part2']))) for r in _pp_results)
+            for (_pa, _pb) in list(_pp_pairs):
+                _pa_bb = _plate_bbox.get(_pa, (0,0,0,0))
+                _pb_bb = _plate_bbox.get(_pb, (0,0,0,0))
+                _pa_w = abs(_pa_bb[1] - _pa_bb[0]); _pa_h = abs(_pa_bb[3] - _pa_bb[2])
+                _pb_w = abs(_pb_bb[1] - _pb_bb[0]); _pb_h = abs(_pb_bb[3] - _pb_bb[2])
+                _pa_cx = (_pa_bb[0] + _pa_bb[1]) / 2
+                _pb_cx = (_pb_bb[0] + _pb_bb[1]) / 2
+                # Try both plates as anchor
+                for _anchor, _anchor_bb, _anchor_w, _anchor_h, _anchor_cx in [
+                    (_pa, _pa_bb, _pa_w, _pa_h, _pa_cx),
+                    (_pb, _pb_bb, _pb_w, _pb_h, _pb_cx),
+                ]:
+                    if _anchor_w < 1 or _anchor_h < 1: continue
+                    for _pc, _pc_bb in _plate_bbox.items():
+                        if _pc in (_pa, _pb): continue
+                        _mirror_pair = tuple(sorted((_anchor, _pc)))
+                        if _mirror_pair in _pp_pairs: continue
+                        _pc_w = abs(_pc_bb[1] - _pc_bb[0])
+                        _pc_h = abs(_pc_bb[3] - _pc_bb[2])
+                        if _pc_w < 1 or _pc_h < 1: continue
+                        _w_d = abs(_anchor_w - _pc_w) / max(_anchor_w, _pc_w, 1)
+                        _h_d = abs(_anchor_h - _pc_h) / max(_anchor_h, _pc_h, 1)
+                        if _w_d + _h_d > 0.4: continue
+                        _pc_cx = (_pc_bb[0] + _pc_bb[1]) / 2
+                        if not ((_anchor_cx < _vx_c and _pc_cx > _vx_c) or (_anchor_cx > _vx_c and _pc_cx < _vx_c)):
+                            continue
+                        _other = _pb if _anchor == _pa else _pa
+                        _other_bb = _plate_bbox.get(_other)
+                        _mir_x_fixed = None
+                        if _other_bb:
+                            _other_cx = (_other_bb[0] + _other_bb[1]) / 2
+                            _mir_x_fixed = _pc_bb[1] if _other_cx > _pc_cx else _pc_bb[0]
+                        for _r in _pp_results:
+                            if {_r['part1'], _r['part2']} != {_pa, _pb}: continue
+                            _src_pos = _r.get('dxf_pos')
+                            if not _src_pos: continue
+                            _nr = dict(_r)
+                            _nr['part1'] = _pc if _r['part1'] == _anchor else _other
+                            _nr['part2'] = _pc if _r['part2'] == _anchor else _other
+                            _mir_x = _mir_x_fixed if _mir_x_fixed is not None else (
+                                2 * ((_anchor_cx + _pc_cx) / 2) - _src_pos[0])
+                            _nr['dxf_pos'] = (_mir_x, _src_pos[1])
+                            _nr['_no_refine'] = True
+                            _nr['_mirrored'] = True
+                            for _pos in ('Above', 'Below'):
+                                _nr2 = dict(_nr, position=_pos)
+                                _exist = any(r2 for r2 in results
+                                             if {r2['part1'], r2['part2']} == {_other, _pc}
+                                             and r2['position'] == _pos
+                                             and abs(r2['length_mm'] - _nr['length_mm']) < 0.5)
+                                if not _exist:
+                                    results.append(_nr2)
+                                    _pp_mirrored += 1
+                                    print(f"    [pp-mirror] {_anchor}/{_other}→{_pc}/{_other} in view {_vid} x-mirrored")
+                            break
     if _pp_mirrored:
         print(f"  [pp-mirror] generated {_pp_mirrored} symmetric plate-to-plate edges")
 
@@ -4851,7 +5084,7 @@ def extract_welds(dxf_path):
                     r['annotation'] = f'PL{round(_gt)}mm'
     # CO 组件长度四舍五入修正：int(x+0.49) 替代 round()，避免 banker's rounding 偏差
     for r in results:
-        if r.get('component','').startswith('CO') and isinstance(r.get('length_mm'), (int, float)):
+        if is_column_like(r.get('component','')) and isinstance(r.get('length_mm'), (int, float)):
             _len = r['length_mm']
             _len_int = int(_len + 0.5)
             if _len_int > 30 and abs(_len - _len_int) < 0.01 and _len > _len_int - 0.01:
@@ -5083,10 +5316,147 @@ def extract_welds(dxf_path):
     if _refined:
         print(f"  [pos-refine] refined {_refined} positions to contact edge")
 
-    # 为每个结果添加构件全称
-    _comp_full = os.path.splitext(os.path.basename(dxf_path))[0].rsplit('_', 1)[0]
+    # EU TYP: expand to similar face-adj weld structures (same + other views)
+    _main_vids = set((_eu_view_roles or {}).get('main_views') or [])
+    if standard == 'eu' and _eu_typ_seeds and part_lines_map:
+        from weld_extractor_eu import (
+            expand_eu_typ_from_seeds, mirror_eu_long_elev_native,
+            cleanup_eu_elev_to_native_plates, cleanup_eu_plate_face_expands,
+            fill_eu_sparse_fillet_plates, expand_eu_fillet_typ_siblings,
+            refine_eu_section_expand_mids,
+        )
+        _n_typ = expand_eu_typ_from_seeds(
+            results, _eu_typ_seeds, part_lines_map, part_number_map, comp,
+            comp_dims=comp_dims, scale=SCALE, adj_tol=ADJ_TOL,
+            part_dims=part_dims, wm_views=set(wm_by_view.keys()),
+            main_view_ids=_main_vids)
+        if _n_typ:
+            print(f"  [EU-TYP expand] +{_n_typ} rows from similar structures")
+        _n_refine = refine_eu_section_expand_mids(
+            results, part_lines_map, part_number_map, comp,
+            comp_dims=comp_dims, scale=SCALE, adj_tol=ADJ_TOL,
+            main_view_ids=_main_vids)
+        if _n_refine:
+            print(f"  [EU mid-refine] snapped {_n_refine} section expand mid(s)")
+        _n_plate = fill_eu_sparse_fillet_plates(
+            results, part_lines_map, part_number_map, comp,
+            part_dims=part_dims, comp_dims=comp_dims, scale=SCALE, adj_tol=ADJ_TOL,
+            wm_views=set(wm_by_view.keys()), main_view_ids=_main_vids)
+        if _n_plate:
+            print(f"  [EU plate-sides] +{_n_plate} rows from sparse fillet WMs")
+        _n_fsib = expand_eu_fillet_typ_siblings(
+            results, part_lines_map, part_number_map, comp,
+            part_dims=part_dims, comp_dims=comp_dims, scale=SCALE, adj_tol=ADJ_TOL,
+            wm_views=set(wm_by_view.keys()), main_view_ids=_main_vids)
+        if _n_fsib:
+            print(f"  [EU fillet-sib] +{_n_fsib} rows for same-label TYP plates")
+        # Drop elev fingerprint junk before L/R mirror so left matches cleaned right
+        _n_elev_clean = cleanup_eu_elev_to_native_plates(
+            results, part_lines_map, part_number_map, comp,
+            comp_dims=comp_dims, scale=SCALE, main_view_ids=_main_vids)
+        if _n_elev_clean:
+            print(f"  [EU elev clean] dropped {_n_elev_clean} non-native-plate row(s)")
+        _n_pf = cleanup_eu_plate_face_expands(
+            results, part_lines_map, comp_dims=comp_dims, scale=SCALE,
+            part_number_map=part_number_map, comp=comp, main_view_ids=_main_vids)
+        if _n_pf:
+            print(f"  [EU plate-face] dropped {_n_pf} expand row(s)")
+        _n_mir = mirror_eu_long_elev_native(
+            results, part_lines_map, part_number_map, comp,
+            comp_dims=comp_dims, scale=SCALE, adj_tol=ADJ_TOL,
+            main_view_ids=_main_vids)
+        if _n_mir:
+            print(f"  [EU elev L/R] +{_n_mir} rows mirrored to opposite end")
+
+    # Main elev with no WeldMarks → must stay empty (e.g. AB0001)
+    if standard == 'eu' and _main_vids and results:
+        _drop_main = 0
+        _kept_m = []
+        for r in results:
+            vid = r.get('view_id')
+            if vid in _main_vids and vid not in wm_by_view:
+                _drop_main += 1
+                continue
+            _kept_m.append(r)
+        if _drop_main:
+            print(f"  [EU main] dropped {_drop_main} row(s) on SectionMark "
+                  f"elev with no WeldMark")
+            results[:] = _kept_m
+
+    # EU: drop thickness-stub / stray blank welds outside 2S/3S pairs
+    if standard == 'eu' and results:
+        from weld_extractor_eu import (
+            _eu_view_bbox, _eu_is_bolt_or_plate_face_view, _eu_is_assembly_view,
+        )
+        _kept = []
+        _drop_n = 0
+        # Assembly-view pair fingerprints (for suppressing duplicate plate-face labels)
+        _assy_pairs = set()
+        _plate_side_by_view = defaultdict(set)
+        for r in results:
+            if r.get('_eu_plate_sides') or r.get('_eu_fillet_sib'):
+                _plate_side_by_view[r.get('view_id')].update(
+                    (r.get('part1'), r.get('part2')))
+            vid = r.get('view_id')
+            vparts = part_lines_map.get(vid) or {}
+            vbb = _eu_view_bbox(vparts)
+            if vbb and _eu_is_assembly_view(vparts, vbb):
+                _assy_pairs.add((
+                    frozenset((r.get('part1'), r.get('part2'))),
+                    round(float(r.get('length_mm') or 0), -1),  # ~10mm
+                ))
+        for r in results:
+            L = float(r.get('length_mm') or 0)
+            ann = (r.get('annotation') or '').strip()
+            vid = r.get('view_id')
+            if L < 40 and not ann and not r.get('_eu_typ_expand') and not r.get('_eu_plate_sides'):
+                _drop_n += 1
+                continue
+            pair = frozenset((r.get('part1'), r.get('part2')))
+            ms = _eu_ms_pairs.get(vid)
+            _ps_marks = _plate_side_by_view.get(vid) or set()
+            if (ms and not ann
+                    and not r.get('_eu_typ_expand')
+                    and not r.get('_eu_typ_mirror')
+                    and not r.get('_eu_typ_rematch')
+                    and not r.get('_eu_plate_sides')
+                    and not r.get('_eu_fillet_sib')
+                    and pair not in ms
+                    and not (pair & _ps_marks)):
+                _drop_n += 1
+                continue
+            # Plate-face / bolt views: drop if same pair+length already in main elev
+            vparts = part_lines_map.get(vid) or {}
+            vbb = _eu_view_bbox(vparts)
+            if (vbb and _eu_is_bolt_or_plate_face_view(
+                    vparts, vbb, comp_dims=comp_dims, scale=SCALE)
+                    and (comp not in pair)
+                    and (pair, round(L, -1)) in _assy_pairs):
+                _drop_n += 1
+                continue
+            _kept.append(r)
+        if _drop_n:
+            print(f"  [EU cleanup] dropped {_drop_n} stub/stray weld row(s)")
+            results[:] = _kept
+
+    # EU: same weld pair in elev + section → keep WM/TYP preferred view only
+    if standard == 'eu' and results and part_lines_map:
+        from weld_extractor_eu import dedupe_eu_cross_view_welds
+        _n_xview = dedupe_eu_cross_view_welds(
+            results, set(wm_by_view.keys()), part_lines_map,
+            typ_wm_views=_eu_typ_wm_views, comp_dims=comp_dims, scale=SCALE,
+            part_number_map=part_number_map, comp=comp,
+            main_view_ids=set(_eu_view_roles.get('main_views') or []))
+        if _n_xview:
+            print(f"  [EU cross-view] dropped {_n_xview} duplicate row(s) "
+                  f"(prefer WM/TYP view)")
+
+    # 为每个结果添加构件全称 + 源 DXF（同构件多修订如 _00/_01 时标注要按文件过滤）
+    _dxf_base = os.path.basename(dxf_path)
+    _comp_full = os.path.splitext(_dxf_base)[0].rsplit('_', 1)[0]
     for r in results:
         r['comp_full'] = _comp_full
+        r['source_dxf'] = _dxf_base
 
     # 抽检焊缝：按构件固定种子随机抽样，标记 _sampled
     _sample_pct = _cfg.get('_sampled_percent', 0.2) if isinstance(_cfg, dict) else 0.2
@@ -5108,168 +5478,365 @@ def extract_welds(dxf_path):
 
     return results, skipped
 
+
+def extract_gb(dxf_path, config=None):
+    """GB-only extraction entry. Rejects EU drawings."""
+    comp = extract_comp_id(dxf_path)
+    if is_eu_comp(comp) or not is_gb_dxf(dxf_path):
+        raise ValueError(f"extract_gb refused non-GB component {comp!r} from {dxf_path}")
+    if config is None:
+        config = JobConfig(standard='gb', dxf_paths=[dxf_path])
+    else:
+        config = JobConfig(
+            standard='gb',
+            dxf_paths=list(config.dxf_paths or [dxf_path]),
+            output_dir=config.output_dir,
+            section_catalog_path=None,
+            ifc_dir=config.ifc_dir,
+            skip_names=list(config.skip_names or []),
+            run_annotate=False,
+            progress=config.progress,
+        )
+    return extract_welds(dxf_path, config)
+
 # ============================================================
 # Excel output
 # ============================================================
-def write_excel(all_results, all_skipped, output_path):
-    wb = openpyxl.Workbook()
+_EXCEL_HEADERS = [
+    '序号', '位置(上/下)', '焊脚尺寸hf(mm)', '焊缝长度(mm)',
+    '备注', '零件1', '零件2', '构件号',
+    '接头类型', '焊缝类型',
+    '接头类型汇总', '焊缝类型汇总',
+    '接头类型汇总数量', '焊缝类型汇总数量',
+]
 
-    # Sort by component for grouped output
-    all_results.sort(key=lambda r: r['component'])
 
-    # Pre-compute per-component type counts and summary strings
-    _jt_cnt = defaultdict(lambda: 0)   # (comp, joint_type) -> count
-    _wt_cnt = defaultdict(lambda: 0)   # (comp, weld_type) -> count
-    _comp_jt_sum = {}  # comp -> "TJ, LJ"
-    _comp_wt_sum = {}  # comp -> "CJP, FW, PP"
-    _comp_jt_cnt_str = {}  # comp -> "TJ:40, LJ:8"
-    _comp_wt_cnt_str = {}  # comp -> "CJP:6, FW:34, PP:8"
+def _comp_summaries(all_results):
+    _jt_cnt = defaultdict(lambda: 0)
+    _wt_cnt = defaultdict(lambda: 0)
     for r in all_results:
         c = r['component']
-        jt = r.get('joint_type', '')
-        wt = r.get('weld_type', '')
-        _jt_cnt[(c, jt)] += 1
-        _wt_cnt[(c, wt)] += 1
+        _jt_cnt[(c, r.get('joint_type', ''))] += 1
+        _wt_cnt[(c, r.get('weld_type', ''))] += 1
+    jt_sum, wt_sum, jt_cnt_str, wt_cnt_str = {}, {}, {}, {}
     for c in sorted(set(r['component'] for r in all_results)):
         _jts = sorted(set(k[1] for k in _jt_cnt if k[0] == c))
         _wts = sorted(set(k[1] for k in _wt_cnt if k[0] == c))
-        _comp_jt_sum[c] = ', '.join(_jts)
-        _comp_wt_sum[c] = ', '.join(_wts)
-        _comp_jt_cnt_str[c] = ', '.join(f'{t}:{_jt_cnt[(c,t)]}' for t in _jts)
-        _comp_wt_cnt_str[c] = ', '.join(f'{t}:{_wt_cnt[(c,t)]}' for t in _wts)
+        jt_sum[c] = ', '.join(_jts)
+        wt_sum[c] = ', '.join(_wts)
+        jt_cnt_str[c] = ', '.join(f'{t}:{_jt_cnt[(c, t)]}' for t in _jts)
+        wt_cnt_str[c] = ', '.join(f'{t}:{_wt_cnt[(c, t)]}' for t in _wts)
+    return jt_sum, wt_sum, jt_cnt_str, wt_cnt_str
 
-    # ---- Sheet 1: Weld statistics ----
-    wb = openpyxl.Workbook()
 
-    ws = wb.active
-    ws.title = "焊缝统计"
+def _write_stats_sheet(wb, title, all_results, hdr_fill, hdr_font, center, use_active=False):
+    all_results = sorted(all_results, key=lambda r: r['component'])
+    jt_sum, wt_sum, jt_cnt_str, wt_cnt_str = _comp_summaries(all_results) if all_results else ({}, {}, {}, {})
 
-    HDR_FILL = PatternFill("solid", fgColor="4472C4")
-    HDR_FONT = Font(bold=True, color="FFFFFF")
-    CENTER    = Alignment(horizontal='center', vertical='center')
+    if use_active:
+        ws = wb.active
+        ws.title = title
+    else:
+        ws = wb.create_sheet(title)
 
-    headers = ['序号', '位置(上/下)', '焊脚尺寸hf(mm)', '焊缝长度(mm)',
-               '备注', '零件1', '零件2', '构件号',
-               '接头类型', '焊缝类型',
-               '接头类型汇总', '焊缝类型汇总',
-               '接头类型汇总数量', '焊缝类型汇总数量']
-    for col, h in enumerate(headers, 1):
+    for col, h in enumerate(_EXCEL_HEADERS, 1):
         cell = ws.cell(row=1, column=col, value=h)
-        cell.fill = HDR_FILL
-        cell.font = HDR_FONT
-        cell.alignment = CENTER
+        cell.fill = hdr_fill
+        cell.font = hdr_font
+        cell.alignment = center
 
     for idx, r in enumerate(all_results, 1):
-        c = r['component']; jt = r.get('joint_type', ''); wt = r.get('weld_type', '')
-        # Track component boundaries: show summary only on first row per component
-        _is_first_of_comp = (idx == 1 or all_results[idx-2]['component'] != c)
-        ws.cell(row=idx+1, column=1, value=idx)
-        ws.cell(row=idx+1, column=2, value=r['position'])
-        ws.cell(row=idx+1, column=3, value=r['hf'])
-        ws.cell(row=idx+1, column=4, value=r['length_mm'])
-        ws.cell(row=idx+1, column=5, value=r['annotation'])
-        ws.cell(row=idx+1, column=6, value=r['part1'])
-        ws.cell(row=idx+1, column=7, value=r['part2'])
-        ws.cell(row=idx+1, column=8, value=r.get('comp_full', r['component']))
-        ws.cell(row=idx+1, column=9,  value=jt)
-        ws.cell(row=idx+1, column=10, value=wt)
-        # Only first row shows summaries; others leave blank for cleaner look
-        ws.cell(row=idx+1, column=11, value=_comp_jt_sum.get(c, '') if _is_first_of_comp else None)
-        ws.cell(row=idx+1, column=12, value=_comp_wt_sum.get(c, '') if _is_first_of_comp else None)
-        ws.cell(row=idx+1, column=13, value=_comp_jt_cnt_str.get(c, '') if _is_first_of_comp else None)
-        ws.cell(row=idx+1, column=14, value=_comp_wt_cnt_str.get(c, '') if _is_first_of_comp else None)
+        c = r['component']
+        jt = r.get('joint_type', '')
+        wt = r.get('weld_type', '')
+        _is_first = (idx == 1 or all_results[idx - 2]['component'] != c)
+        ws.cell(row=idx + 1, column=1, value=idx)
+        ws.cell(row=idx + 1, column=2, value=r['position'])
+        ws.cell(row=idx + 1, column=3, value=r['hf'])
+        ws.cell(row=idx + 1, column=4, value=r['length_mm'])
+        ws.cell(row=idx + 1, column=5, value=r['annotation'])
+        ws.cell(row=idx + 1, column=6, value=r['part1'])
+        ws.cell(row=idx + 1, column=7, value=r['part2'])
+        ws.cell(row=idx + 1, column=8, value=r.get('comp_full', r['component']))
+        ws.cell(row=idx + 1, column=9, value=jt)
+        ws.cell(row=idx + 1, column=10, value=wt)
+        ws.cell(row=idx + 1, column=11, value=jt_sum.get(c, '') if _is_first else None)
+        ws.cell(row=idx + 1, column=12, value=wt_sum.get(c, '') if _is_first else None)
+        ws.cell(row=idx + 1, column=13, value=jt_cnt_str.get(c, '') if _is_first else None)
+        ws.cell(row=idx + 1, column=14, value=wt_cnt_str.get(c, '') if _is_first else None)
 
     for col in ws.columns:
         w = max((len(str(cell.value or '')) for cell in col), default=0)
         ws.column_dimensions[col[0].column_letter].width = max(w + 3, 14)
+    return jt_sum, wt_sum, jt_cnt_str, wt_cnt_str
 
-    # ---- Sheet 2: Skipped / errors ----
-    ws2 = wb.create_sheet("异常报告")
-    ws2.cell(row=1, column=1, value="WeldMark 名称").font = Font(bold=True)
-    ws2.cell(row=1, column=2, value="原因").font = Font(bold=True)
+
+def _write_skip_sheet(wb, title, all_skipped):
+    ws = wb.create_sheet(title)
+    ws.cell(row=1, column=1, value="WeldMark 名称").font = Font(bold=True)
+    ws.cell(row=1, column=2, value="原因").font = Font(bold=True)
     for idx, (name, reason) in enumerate(all_skipped, 2):
-        ws2.cell(row=idx, column=1, value=name)
-        ws2.cell(row=idx, column=2, value=reason)
-    ws2.column_dimensions['A'].width = 50
-    ws2.column_dimensions['B'].width = 40
+        ws.cell(row=idx, column=1, value=name)
+        ws.cell(row=idx, column=2, value=reason)
+    ws.column_dimensions['A'].width = 50
+    ws.column_dimensions['B'].width = 40
 
-    # ---- Sheet 3: 抽检清单 ----
+
+def _write_sample_sheet(wb, title, all_results, hdr_fill, hdr_font, center,
+                        jt_sum, wt_sum, jt_cnt_str, wt_cnt_str):
     _sampled_rows = [r for r in all_results if r.get('_sampled')]
-    if _sampled_rows:
-        ws3 = wb.create_sheet("抽检清单")
-        for col, h in enumerate(headers, 1):
-            cell = ws3.cell(row=1, column=col, value=h)
-            cell.fill = HDR_FILL
-            cell.font = HDR_FONT
-            cell.alignment = CENTER
-        _sampled_rows.sort(key=lambda r: r.get('comp_full', r['component']))
-        _sc = defaultdict(lambda: 0)
-        for idx, r in enumerate(_sampled_rows, 1):
-            c = r['component']; jt = r.get('joint_type', ''); wt = r.get('weld_type', '')
-            _sc[c] += 1
-            _is_first = (idx == 1 or _sampled_rows[idx-2]['component'] != c)
-            ws3.cell(row=idx+1, column=1, value=idx)
-            ws3.cell(row=idx+1, column=2, value=r['position'])
-            ws3.cell(row=idx+1, column=3, value=r['hf'])
-            ws3.cell(row=idx+1, column=4, value=r['length_mm'])
-            ws3.cell(row=idx+1, column=5, value=r['annotation'])
-            ws3.cell(row=idx+1, column=6, value=r['part1'])
-            ws3.cell(row=idx+1, column=7, value=r['part2'])
-            ws3.cell(row=idx+1, column=8, value=r.get('comp_full', c))
-            ws3.cell(row=idx+1, column=9, value=jt)
-            ws3.cell(row=idx+1, column=10, value=wt)
-            ws3.cell(row=idx+1, column=11, value=_comp_jt_sum.get(c, '') if _is_first else None)
-            ws3.cell(row=idx+1, column=12, value=_comp_wt_sum.get(c, '') if _is_first else None)
-            ws3.cell(row=idx+1, column=13, value=_comp_jt_cnt_str.get(c, '') if _is_first else None)
-            ws3.cell(row=idx+1, column=14, value=_comp_wt_cnt_str.get(c, '') if _is_first else None)
-        for col in ws3.columns:
-            w = max((len(str(cell.value or '')) for cell in col), default=0)
-            ws3.column_dimensions[col[0].column_letter].width = max(w + 3, 14)
-        _sc_summary = ', '.join(f'{c}:{n}' for c, n in sorted(_sc.items()))
-        print(f"  [抽检清单] {len(_sampled_rows)} rows → {_sc_summary}")
+    if not _sampled_rows:
+        return
+    ws = wb.create_sheet(title)
+    for col, h in enumerate(_EXCEL_HEADERS, 1):
+        cell = ws.cell(row=1, column=col, value=h)
+        cell.fill = hdr_fill
+        cell.font = hdr_font
+        cell.alignment = center
+    _sampled_rows.sort(key=lambda r: r.get('comp_full', r['component']))
+    _sc = defaultdict(int)
+    for idx, r in enumerate(_sampled_rows, 1):
+        c = r['component']
+        _sc[c] += 1
+        _is_first = (idx == 1 or _sampled_rows[idx - 2]['component'] != c)
+        ws.cell(row=idx + 1, column=1, value=idx)
+        ws.cell(row=idx + 1, column=2, value=r['position'])
+        ws.cell(row=idx + 1, column=3, value=r['hf'])
+        ws.cell(row=idx + 1, column=4, value=r['length_mm'])
+        ws.cell(row=idx + 1, column=5, value=r['annotation'])
+        ws.cell(row=idx + 1, column=6, value=r['part1'])
+        ws.cell(row=idx + 1, column=7, value=r['part2'])
+        ws.cell(row=idx + 1, column=8, value=r.get('comp_full', c))
+        ws.cell(row=idx + 1, column=9, value=r.get('joint_type', ''))
+        ws.cell(row=idx + 1, column=10, value=r.get('weld_type', ''))
+        ws.cell(row=idx + 1, column=11, value=jt_sum.get(c, '') if _is_first else None)
+        ws.cell(row=idx + 1, column=12, value=wt_sum.get(c, '') if _is_first else None)
+        ws.cell(row=idx + 1, column=13, value=jt_cnt_str.get(c, '') if _is_first else None)
+        ws.cell(row=idx + 1, column=14, value=wt_cnt_str.get(c, '') if _is_first else None)
+    for col in ws.columns:
+        w = max((len(str(cell.value or '')) for cell in col), default=0)
+        ws.column_dimensions[col[0].column_letter].width = max(w + 3, 14)
+    _sc_summary = ', '.join(f'{c}:{n}' for c, n in sorted(_sc.items()))
+    print(f"  [{title}] {len(_sampled_rows)} rows → {_sc_summary}")
+
+
+def write_excel_dual(gb_results, gb_skipped, eu_results, eu_skipped, output_path):
+    """Write GB and EU stats into separate sheets of one workbook."""
+    wb = openpyxl.Workbook()
+    # remove default sheet after we create named ones
+    default = wb.active
+
+    HDR_FILL = PatternFill("solid", fgColor="4472C4")
+    HDR_FONT = Font(bold=True, color="FFFFFF")
+    CENTER = Alignment(horizontal='center', vertical='center')
+
+    wrote_active = False
+    gb_sums = ({}, {}, {}, {})
+    eu_sums = ({}, {}, {}, {})
+
+    if gb_results is not None:
+        gb_sums = _write_stats_sheet(
+            wb, "国标焊缝统计", gb_results or [], HDR_FILL, HDR_FONT, CENTER,
+            use_active=True)
+        wrote_active = True
+        _write_skip_sheet(wb, "国标异常报告", gb_skipped or [])
+        _write_sample_sheet(
+            wb, "国标抽检清单", gb_results or [], HDR_FILL, HDR_FONT, CENTER, *gb_sums)
+
+    if eu_results is not None:
+        eu_sums = _write_stats_sheet(
+            wb, "欧标焊缝统计", eu_results or [], HDR_FILL, HDR_FONT, CENTER,
+            use_active=not wrote_active)
+        wrote_active = True
+        _write_skip_sheet(wb, "欧标异常报告", eu_skipped or [])
+        _write_sample_sheet(
+            wb, "欧标抽检清单", eu_results or [], HDR_FILL, HDR_FONT, CENTER, *eu_sums)
+
+    if not wrote_active:
+        default.title = "空"
+    elif default.title not in ("国标焊缝统计", "欧标焊缝统计") and default.title == "Sheet":
+        try:
+            wb.remove(default)
+        except Exception:
+            pass
 
     wb.save(output_path)
     print(f"\nSaved → {output_path}")
-    print(f"Total weld rows : {len(all_results)}")
-    print(f"Total skipped   : {len(all_skipped)}")
+    print(f"  GB weld rows : {len(gb_results or [])}")
+    print(f"  EU weld rows : {len(eu_results or [])}")
+
+
+def write_excel(all_results, all_skipped, output_path, standard='gb'):
+    """Backward-compatible single-standard writer."""
+    standard = (standard or 'gb').lower()
+    if standard == 'eu':
+        write_excel_dual(None, None, all_results, all_skipped, output_path)
+    else:
+        write_excel_dual(all_results, all_skipped, None, None, output_path)
 
 # ============================================================
-# Entry point
+# Entry point / pipeline API
 # ============================================================
-if __name__ == '__main__':
+def run_pipeline(config: JobConfig):
+    """
+    Run extract → Excel → (EU-only) annotate.
+    standard=both writes both GB and EU sheets; annotate only EU.
+    """
     import time as _time
-    _t_pipeline0 = _time.perf_counter()
-    dxf_files = sorted([f for f in glob.glob(os.path.join(FOLDER, "*.dxf")) if '(2)' not in f])
+    progress = config.progress or _default_progress
+    _t0 = _time.perf_counter()
+
+    dxf_files = list(config.dxf_paths or [])
     if not dxf_files:
-        print("No DXF files found. Run convert_dwg_to_dxf.py first.")
-        raise SystemExit(1)
+        progress("No DXF files in JobConfig.dxf_paths", 0)
+        return {'results_gb': [], 'results_eu': [], 'excel_path': None, 'sampled': []}
 
-    all_results = []
-    all_skipped = []
+    skip = set(config.skip_names or [])
+    out_dir = config.output_dir or FOLDER
+    os.makedirs(out_dir, exist_ok=True)
+    excel_path = os.path.join(out_dir, "焊缝统计_auto.xlsx")
+    if config.section_catalog_path is None:
+        config.section_catalog_path = EU_SECTIONS_DEFAULT
 
-    for dxf_path in dxf_files:
-        # Skip CO010 extract (not annotated; saves wall-clock toward ~3min target)
-        if 'CO010' in os.path.basename(dxf_path):
-            print(f"\nSKIP extract {os.path.basename(dxf_path)} (not annotated)")
+    standard = (config.standard or 'both').lower()
+    if standard == 'auto':
+        standard = detect_standard(dxf_files)
+
+    gb_paths, eu_paths = split_dxf_paths(dxf_files)
+    if standard == 'gb':
+        eu_paths = []
+    elif standard == 'eu':
+        gb_paths = []
+
+    gb_results, gb_skipped = [], []
+    eu_results, eu_skipped = [], []
+
+    work = []
+    if standard in ('gb', 'both'):
+        work.extend(('gb', p) for p in gb_paths)
+    if standard in ('eu', 'both'):
+        work.extend(('eu', p) for p in eu_paths)
+
+    n = max(len(work), 1)
+    for i, (side, dxf_path) in enumerate(work):
+        base = os.path.basename(dxf_path)
+        if any(s in base for s in skip):
+            progress(f"SKIP extract {base}", 100.0 * i / n)
             continue
         try:
-            results, skipped = extract_welds(dxf_path)
-            all_results.extend(results)
-            all_skipped.extend(skipped)
+            progress(f"Extract [{side}] {base}", 100.0 * i / n)
+            if side == 'gb':
+                results, skipped = extract_gb(dxf_path, config)
+                gb_results.extend(results)
+                gb_skipped.extend(skipped)
+            else:
+                from weld_extractor_eu import extract_eu
+                results, skipped = extract_eu(dxf_path, config)
+                eu_results.extend(results)
+                eu_skipped.extend(skipped)
+        except Exception:
+            import traceback
+            progress(f"ERROR: {dxf_path}\n{traceback.format_exc()}", None)
+
+    progress("Writing Excel", 90)
+
+    def _write_excel(path):
+        if standard == 'gb':
+            write_excel_dual(gb_results, gb_skipped, None, None, path)
+        elif standard == 'eu':
+            write_excel_dual(None, None, eu_results, eu_skipped, path)
+        else:
+            write_excel_dual(gb_results, gb_skipped, eu_results, eu_skipped, path)
+
+    try:
+        _write_excel(excel_path)
+    except PermissionError:
+        alt = os.path.join(out_dir, "焊缝统计_auto_rerun.xlsx")
+        progress(f"Excel locked, writing {os.path.basename(alt)} instead", 90)
+        _write_excel(alt)
+        excel_path = alt
+
+    sampled = []
+    # Annotation: EU only (never call GB annotate in this pipeline)
+    if config.run_annotate and eu_results:
+        try:
+            import dxf_annotator_eu
+            progress("Annotating EU DXF", 95)
+            eu_anno = [f for f in eu_paths if not any(s in os.path.basename(f) for s in skip)]
+            sampled = dxf_annotator_eu.annotate_eu(eu_results, eu_anno) or []
+            progress("EU DXF annotation complete.", 99)
         except Exception as exc:
             import traceback
-            print(f"\nERROR: {dxf_path}\n{traceback.format_exc()}")
+            progress(f"EU DXF annotation failed: {exc}\n{traceback.format_exc()}", None)
 
-    write_excel(all_results, all_skipped, OUTPUT)
+    progress(f"Pipeline wall: {_time.perf_counter() - _t0:.1f}s", 100)
+    return {
+        'results_gb': gb_results,
+        'results_eu': eu_results,
+        'skipped_gb': gb_skipped,
+        'skipped_eu': eu_skipped,
+        'excel_path': excel_path,
+        'sampled': sampled,
+        # aliases for older callers
+        'results': gb_results + eu_results,
+        'skipped': gb_skipped + eu_skipped,
+    }
 
-    # DXF annotation — add weld labels to drawings（跳过 CO010）
-    _anno_files = [f for f in dxf_files if 'CO010' not in os.path.basename(f)]
-    try:
-        import dxf_annotator
-        dxf_annotator.annotate(all_results, _anno_files)
-        print("\nDXF annotation complete.")
-    except Exception as exc:
-        import traceback
-        print(f"\nDXF annotation failed: {exc}\n{traceback.format_exc()}")
 
-    print(f"\nPipeline wall: {_time.perf_counter() - _t_pipeline0:.1f}s")
+if __name__ == '__main__':
+    import argparse
+
+    ap = argparse.ArgumentParser(description='Weld statistics extractor')
+    ap.add_argument('--standard', choices=['gb', 'eu', 'both', 'auto'], default='both')
+    ap.add_argument('--dxf', nargs='*', default=None,
+                    help='DXF files (default: all *.dxf in folder)')
+    ap.add_argument('--eu-only', action='store_true',
+                    help='Only process AB/AC/AP/AT/AX drawings')
+    ap.add_argument('--gb-only', action='store_true',
+                    help='Only process BE/CO drawings')
+    ap.add_argument('--no-annotate', action='store_true')
+    ap.add_argument('--catalog', default=None, help='Path to eu_sections.json')
+    ap.add_argument('--pdf', default=None,
+                    help='Path to 欧标型钢规格 PDF (used with --refresh-catalog)')
+    ap.add_argument('--refresh-catalog', action='store_true',
+                    help='Rebuild eu_sections.json from PDF then continue')
+    ap.add_argument('--out', default=FOLDER, help='Output directory')
+    args = ap.parse_args()
+
+    catalog_path = args.catalog or EU_SECTIONS_DEFAULT
+    if args.refresh_catalog:
+        from eu_catalog_from_pdf import refresh_eu_catalog
+        doc = refresh_eu_catalog(args.pdf, catalog_path)
+        print(f"[catalog] refreshed {doc['_meta']['section_count']} sections "
+              f"from {doc['_meta']['source_pdf']} → {catalog_path}")
+
+    dxf_files = sorted(args.dxf) if args.dxf else sorted(
+        [f for f in glob.glob(os.path.join(FOLDER, "*.dxf")) if '(2)' not in f])
+    if args.eu_only:
+        dxf_files = [f for f in dxf_files if is_eu_dxf(f)]
+    elif args.gb_only:
+        dxf_files = [f for f in dxf_files if is_gb_dxf(f)]
+
+    if not dxf_files:
+        if args.refresh_catalog:
+            raise SystemExit(0)
+        print("No DXF files found.")
+        raise SystemExit(1)
+
+    standard = args.standard
+    if standard == 'auto':
+        standard = detect_standard(dxf_files)
+    if args.eu_only:
+        standard = 'eu'
+    elif args.gb_only:
+        standard = 'gb'
+
+    cfg = JobConfig(
+        standard=standard,
+        dxf_paths=dxf_files,
+        output_dir=args.out,
+        section_catalog_path=catalog_path,
+        skip_names=[],
+        run_annotate=not args.no_annotate,
+    )
+    run_pipeline(cfg)

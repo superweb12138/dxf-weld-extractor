@@ -1,0 +1,5 @@
+ezdxf
+openpyxl
+pymupdf
+pdfplumber
+pypdf

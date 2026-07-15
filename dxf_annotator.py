@@ -850,9 +850,16 @@ def _build_line_grid(lines, cell=50):
 
 
 def annotate(results, dxf_paths=None):
-    """Main entry point. Annotates DXF files with weld labels.
-    Returns list of sampled weld label entries for Excel output."""
+    """GB-only annotation entry. For EU drawings use dxf_annotator_eu.annotate_eu."""
     import time
+    from weld_extractor import is_eu_comp
+
+    bad = sorted({r.get('component', '') for r in results if is_eu_comp(r.get('component', ''))})
+    if bad:
+        raise ValueError(
+            f"annotate() is GB-only; refused EU components {bad}. "
+            f"Use dxf_annotator_eu.annotate_eu instead.")
+
     os.makedirs(ANNOTATED_DIR, exist_ok=True)
 
     by_comp = defaultdict(list)
@@ -863,20 +870,36 @@ def annotate(results, dxf_paths=None):
         import glob
         dxf_paths = sorted([f for f in glob.glob(os.path.join(FOLDER, "*.dxf")) if '(2)' not in f])
 
+    # Only process GB drawings in this entry
+    dxf_paths = [p for p in dxf_paths
+                 if re.search(r'-(BE\d+|CO\d+)_', os.path.basename(p), re.I)]
+
     all_sampled_labels = []
     _t_all0 = time.perf_counter()
 
     for dxf_path in dxf_paths:
         comp_m = re.search(r'-(BE\d+|CO\d+)_', os.path.basename(dxf_path), re.I)
-        comp = comp_m.group(1).upper() if comp_m else os.path.splitext(os.path.basename(dxf_path))[0]
+        if comp_m:
+            comp = comp_m.group(1).upper()
+        else:
+            continue
         comp_full = os.path.splitext(os.path.basename(dxf_path))[0].rsplit('_', 1)[0]
 
         if comp not in by_comp:
             print(f"  SKIP {comp_full}: no weld data")
             continue
 
-        comp_welds = by_comp[comp]
-        print(f"\n  Annotating {comp_full} ({len(comp_welds)} welds) → {os.path.basename(dxf_path)}")
+        # Prefer welds extracted from this exact DXF (multi-revision _00/_01).
+        _base = os.path.basename(dxf_path)
+        _all = by_comp[comp]
+        if any(r.get('source_dxf') for r in _all):
+            comp_welds = [r for r in _all if r.get('source_dxf') == _base]
+        else:
+            comp_welds = _all
+        if not comp_welds:
+            print(f"  SKIP {comp_full}: no weld data for {_base}")
+            continue
+        print(f"\n  [GB] Annotating {comp_full} ({len(comp_welds)} welds) → {_base}")
 
         try:
             doc = ezdxf.readfile(dxf_path)
@@ -917,7 +940,7 @@ def annotate(results, dxf_paths=None):
             print(f"    ERROR annotating {comp}: {e}")
             traceback.print_exc()
 
-    print(f"  All annotate wall: {time.perf_counter() - _t_all0:.1f}s")
+    print(f"  [GB] All annotate wall: {time.perf_counter() - _t_all0:.1f}s")
     return all_sampled_labels
 
 
@@ -1726,7 +1749,7 @@ def _separate_close_text_labels(placements, placed_bboxes, placed_text_bboxes,
     """强制拉开文字中心过近或 AABB 重叠的标签（含 W1/W5）。"""
     n = len(placements)
     min_cy = max(_lh() * 1.5, 2.8)
-    for _round in range(5):
+    for _round in range(3):
         moved = False
         for i in range(n):
             for j in range(i + 1, n):
@@ -2183,7 +2206,7 @@ def _annotate_view_place(msp, groups, no_pos_welds, lines, text_bboxes, circles,
 
     # ---- 最终清理：检测并微调残留重叠（含中心过近）----
     _cln_did = False
-    for _cln_iter in range(6):
+    for _cln_iter in range(3):
         _any_cln = False
         for ki in range(len(_placements)):
             for kj in range(ki + 1, len(_placements)):
@@ -3808,12 +3831,12 @@ def _search_placement(weld_pos, lines, text_bboxes, circles, placed_bboxes,
         # 走廊不再并入象限：只作 prefer / 短距快路径提示
         _eff_max = max_dist_local if max_dist_local is not None else (
             max_dist if max_dist is not None else _max_len)
-        distances = list(range(PREFERRED_DIAG_MIN, _eff_max + 1, 2))
+        # Coarser length step: fewer conflict checks, still finds free poses
+        distances = list(range(PREFERRED_DIAG_MIN, _eff_max + 1, 3))
         if is_pair:
             distances = [d + 4 for d in distances]
-        _full_ao = [0, 5, -5, 10, -10, 15, -15, 20, -20, 25, -25, 30, -30,
-                     35, -35, 40, -40, 45, -45, 50, -50, 55, -55, 60, -60,
-                     70, -70, 80, -80, 90, -90, 100, -100, 120, -120, 150, -150, 180]
+        _full_ao = [0, 8, -8, 15, -15, 25, -25, 35, -35, 45, -45, 60, -60,
+                     80, -80, 100, -100, 120, -120, 150, -150, 180]
 
         def _try_place(dist, ao_list, base_ang=None):
             _base = _ideal_ang if base_ang is None else base_ang
@@ -3823,22 +3846,18 @@ def _search_placement(weld_pos, lines, text_bboxes, circles, placed_bboxes,
                 if abs(math.sin(rad)) < math.sin(math.radians(ANGLE_MIN)): continue
                 if abs(math.cos(rad)) < math.cos(math.radians(ANGLE_MAX)): continue
                 if not _has_conflict(angle, dist, _db):
-                    ft = _fine_tune(dist, angle, _db)
-                    if ft is None:
-                        return 0, (angle, dist, 0)
-                    _fa, _fd, _fs = ft
-                    if not _has_conflict(_fa, _fd, _db):
-                        return _fs, (_fa, _fd, 0)
+                    # Skip fine_tune on every hit — final snap happens once at end
+                    return 0, (angle, dist, 0)
             return None
 
         def _try_place_bases(dist, ao_list):
-            # corridor first, then prefer / radial
+            # corridor first, then prefer / radial (dedupe bases)
             bases = [_ideal_ang]
-            if prefer_ang is not None and _angle_delta_deg(_ideal_ang, prefer_ang) > 1:
+            if prefer_ang is not None and _angle_delta_deg(_ideal_ang, prefer_ang) > 3:
                 bases.append(prefer_ang % 360)
-            if _gap_ang is not None and _angle_delta_deg(_ideal_ang, _gap_ang) > 1:
+            if _gap_ang is not None and _angle_delta_deg(_ideal_ang, _gap_ang) > 3:
                 bases.append(_gap_ang)
-            if _angle_delta_deg(_ideal_ang, _radial_ang) > 1:
+            if _angle_delta_deg(_ideal_ang, _radial_ang) > 3:
                 bases.append(_radial_ang)
             for _b in bases:
                 result = _try_place(dist, ao_list, base_ang=_b)
@@ -3882,7 +3901,7 @@ def _search_placement(weld_pos, lines, text_bboxes, circles, placed_bboxes,
                         _best_hit = (na, nd, 0)
             if _best_hit is not None:
                 return 0, _best_hit
-            for dist in range(PREFERRED_DIAG_MIN, _gap_cap + 1, 2):
+            for dist in range(PREFERRED_DIAG_MIN, _gap_cap + 1, 3):
                 for da in (0, 8, -8, 16, -16, 25, -25, 35, -35, 45, -45, 55, -55):
                     _ga = (_gap_ang + da) % 360
                     if not _has_conflict(_ga, dist, _db):
@@ -3895,15 +3914,14 @@ def _search_placement(weld_pos, lines, text_bboxes, circles, placed_bboxes,
                                 return 0, (_ga, dist, 0)
                         else:
                             return 0, (_ga, dist, 0)
-            for dist in range(PREFERRED_DIAG_MIN, _gap_cap + 1, 2):
+            for dist in range(PREFERRED_DIAG_MIN, _gap_cap + 1, 3):
                 for da in (0, 10, -10, 20, -20, 30, -30):
                     _ga = (_gap_ang + da) % 360
                     if not _has_conflict(_ga, dist, _db):
                         return 0, (_ga, dist, 0)
 
-        _wide_ao = [0, 5, -5, 10, -10, 15, -15, 20, -20, 25, -25, 30, -30,
-                    35, -35, 40, -40, 45, -45, 50, -50, 55, -55, 60, -60]
-        _mid_ao = [0, 8, -8, 15, -15, 22, -22, 30, -30, 38, -38, 45, -45]
+        _wide_ao = [0, 8, -8, 15, -15, 25, -25, 35, -35, 45, -45, 55, -55]
+        _mid_ao = [0, 10, -10, 20, -20, 30, -30, 40, -40]
         # 1) 短甜区 20–28 优先
         for dist in distances:
             if dist < 20 or dist > 28:
@@ -3933,12 +3951,12 @@ def _search_placement(weld_pos, lines, text_bboxes, circles, placed_bboxes,
             if result:
                 return result
 
-        # 评分兜底：无走廊时稀疏；有走廊时围绕 gap 角加分扫，保证空白利用
+        # 评分兜底：稀疏扫描（仅当前阶段均失败时）
         _best_score = -999999999
         _best_result = None
         if _gap_ang is not None:
             _score_dists = [d for d in distances if d <= 44][::2] or distances[::3]
-            _score_offs = list(range(0, 90, 15)) + list(range(0, -90, -15))
+            _score_offs = list(range(0, 90, 20)) + list(range(0, -90, -20))
             _bases_sc = [_gap_ang, _ideal_ang]
             if prefer_ang is not None:
                 _bases_sc.append(prefer_ang % 360)
@@ -3947,7 +3965,7 @@ def _search_placement(weld_pos, lines, text_bboxes, circles, placed_bboxes,
                 PREFERRED_DIAG_MIN, 24, 30, 38, 46) or (distances and d == distances[-1])]
             if not _score_dists:
                 _score_dists = distances[::4]
-            _score_offs = list(range(0, 360, 60))
+            _score_offs = list(range(0, 360, 45))
             _bases_sc = [_ideal_ang]
         for _base in _bases_sc:
             for dist in _score_dists:
@@ -4048,6 +4066,11 @@ def _search_placement(weld_pos, lines, text_bboxes, circles, placed_bboxes,
 
     # 硬约束：钳制过水平/过垂直并落入合法象限带
     _fa, _fd = result[1][0], result[1][1]
+    ft = _fine_tune(_fd, _fa, draw_bbox)
+    if ft is not None:
+        _fa2, _fd2, _ = ft
+        if not _has_conflict(_fa2, _fd2, draw_bbox):
+            _fa, _fd = _fa2, _fd2
     _fa = _snap_leader_angle(_fa, home_q)
     # 仅当结果跑出允许象限时才钳回
     if home_q is not None and not any(
