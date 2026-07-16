@@ -8,7 +8,8 @@ Rules:
   - Left-half welds → leader line points left
   - Right-half welds → leader line points right
   - Above/Below pair at same position → one leader, two labels stacked
-  - Output: annotated/ directory, new layer WELD_LABELS in magenta
+  - Output: annotated/gb/ directory, new layer WELD_LABELS in magenta
+    (EU annotations go to annotated/eu/ via dxf_annotator_eu)
 """
 
 import os, math, re
@@ -17,7 +18,7 @@ from collections import defaultdict
 import ezdxf
 
 FOLDER = os.path.dirname(os.path.abspath(__file__))
-ANNOTATED_DIR = os.path.join(FOLDER, "annotated")
+ANNOTATED_DIR = os.path.join(FOLDER, "annotated", "gb")
 
 SCALE = 10          # 1 CAD unit = 10 mm
 LABEL_HEIGHT = 2.5  # text height in CAD units (default / sparse views)
@@ -992,8 +993,10 @@ def _build_line_grid(lines, cell=50):
     return grid
 
 
-def annotate(results, dxf_paths=None):
-    """GB-only annotation entry. For EU drawings use dxf_annotator_eu.annotate_eu."""
+def annotate(results, dxf_paths=None, out_dir=None):
+    """GB-only annotation entry. For EU drawings use dxf_annotator_eu.annotate_eu.
+    Writes to annotated/gb/ by default.
+    """
     import time
     from weld_extractor import is_eu_comp
 
@@ -1003,7 +1006,8 @@ def annotate(results, dxf_paths=None):
             f"annotate() is GB-only; refused EU components {bad}. "
             f"Use dxf_annotator_eu.annotate_eu instead.")
 
-    os.makedirs(ANNOTATED_DIR, exist_ok=True)
+    out_dir = out_dir or ANNOTATED_DIR
+    os.makedirs(out_dir, exist_ok=True)
 
     by_comp = defaultdict(list)
     for r in results:
@@ -1057,7 +1061,7 @@ def annotate(results, dxf_paths=None):
             sampled_labels = _annotate_one(doc, comp_welds)
             print(f"    annotate wall: {time.perf_counter() - _t0:.1f}s")
             all_sampled_labels.extend(sampled_labels)
-            out_path = os.path.join(ANNOTATED_DIR, os.path.basename(dxf_path))
+            out_path = os.path.join(out_dir, os.path.basename(dxf_path))
             for _retry in range(3):
                 try:
                     doc.saveas(out_path)

@@ -5430,7 +5430,10 @@ def extract_welds(dxf_path, config=None):
             cleanup_eu_tall_elev_outliers,
             align_eu_h_section_sibling_views,
             cleanup_eu_main_elev_typ_rows, drop_eu_compact_section_typ_dup_main,
-            drop_eu_u_cut_bottom_seat, cleanup_eu_h_section_bottom_redundant,
+            drop_eu_section_typ_when_u_wrap_present,
+            drop_eu_u_cut_bottom_seat, cleanup_eu_u_cut_typ_when_u_wrap,
+            cleanup_eu_h_section_bottom_redundant,
+            ensure_eu_bottom_flange_lr,
             ensure_eu_section_fillet_pairs,
             prune_eu_h_section_mid_outer_natives,
             add_eu_h_section_web_junction,
@@ -5525,6 +5528,17 @@ def extract_welds(dxf_path, config=None):
             main_view_ids=_main_vids)
         if _n_uwrap:
             print(f"  [EU U-wrap] relocated CIRCLE/hf5 → U-cut (+{_n_uwrap} rows)")
+        _n_mir2 = mirror_eu_long_elev_native(
+            results, part_lines_map, part_number_map, comp,
+            comp_dims=comp_dims, scale=SCALE, adj_tol=ADJ_TOL,
+            main_view_ids=_main_vids)
+        if _n_mir2:
+            print(f"  [EU elev L/R post-U] +{_n_mir2} rows mirrored to opposite end")
+        _n_bfl = ensure_eu_bottom_flange_lr(
+            results, part_lines_map, part_number_map, comp,
+            comp_dims=comp_dims, scale=SCALE, main_view_ids=_main_vids)
+        if _n_bfl:
+            print(f"  [EU bottom L/R] +{_n_bfl} bottom flange row(s) mirrored")
         _n_main_typ = cleanup_eu_main_elev_typ_rows(
             results, part_lines_map, part_number_map, comp,
             comp_dims=comp_dims, scale=SCALE, main_view_ids=_main_vids)
@@ -5535,6 +5549,16 @@ def extract_welds(dxf_path, config=None):
             comp_dims=comp_dims, scale=SCALE, main_view_ids=_main_vids)
         if _n_c_dup:
             print(f"  [EU section dup] dropped {_n_c_dup} TYP row(s) on Main dup")
+        _n_u_typ = drop_eu_section_typ_when_u_wrap_present(
+            results, part_lines_map, part_number_map, comp,
+            comp_dims=comp_dims, scale=SCALE, main_view_ids=_main_vids)
+        if _n_u_typ:
+            print(f"  [EU U-wrap dup] dropped {_n_u_typ} redundant section TYP row(s)")
+        _n_uc_typ = cleanup_eu_u_cut_typ_when_u_wrap(
+            results, part_lines_map, part_number_map, comp,
+            comp_dims=comp_dims, scale=SCALE, main_view_ids=_main_vids)
+        if _n_uc_typ:
+            print(f"  [EU U-cut clean] dropped {_n_uc_typ} edge TYP row(s) on A-A")
         _n_useat = drop_eu_u_cut_bottom_seat(
             results, part_lines_map, part_number_map, comp,
             comp_dims=comp_dims, scale=SCALE, main_view_ids=_main_vids)

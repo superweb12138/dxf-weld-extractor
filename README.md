@@ -14,6 +14,7 @@
 - [DXF 结构约定](#dxf-结构约定)
 - [关键参数与常量](#关键参数与常量)
 - [算法流程](#算法流程)
+- [欧标（EU）流水线](#欧标eu流水线)
 - [当前精度状态](#当前精度状态)
 - [已知遗留问题](#已知遗留问题)
 
@@ -32,7 +33,7 @@
 - 焊缝类型（CJP 全熔透 / PP 板间焊 / FW 填角焊）
 - 分类汇总数量（按构件按类型统计）
 
-输出文件：`焊缝统计_auto.xlsx`（14 列，含分类汇总）+ `annotated/*.dxf`（含焊缝编号标注的 DXF 图纸）
+输出文件：`焊缝统计_auto.xlsx`（14 列，含分类汇总）+ `annotated/gb|eu/*.dxf`（含焊缝编号标注的 DXF 图纸）
 
 ---
 
@@ -59,8 +60,11 @@ pip install ezdxf openpyxl ifcopenshell
 
 | 文件 | 用途 |
 |------|------|
-| `weld_extractor.py` | **核心**：读取所有 DXF + IFC → 输出 Excel 统计表 + 调用标注 |
+| `weld_extractor.py` | **核心**：读取所有 DXF + IFC → 输出 Excel 统计表 + 调用标注（国标/欧标分流） |
+| `weld_extractor_eu.py` | **欧标提取**：U 型围焊、TYP 扩展、A-A 剖面 U-cut 重定位、双 U 分流 |
 | `dxf_annotator.py` | **DXF 标注引擎**：象限约束、碰撞规避、引出标注 |
+| `dxf_annotator_eu.py` | **欧标标注入口**：调用 `dxf_annotator` 并输出至 `annotated/eu/` |
+| `eu_catalog_from_pdf.py` | 从欧标型钢 PDF 生成 `eu_sections.json`（截面尺寸） |
 | `ifc_reader.py` | IFC 3D 解析：板尺寸、包围盒邻接、构件类型 |
 | `convert_dwg_to_dxf.py` | 批量 DWG → DXF（管理员一次性） |
 | `compare_r3.py` | 与人工标准答案对比行数 / 松匹配率 |
@@ -73,7 +77,8 @@ pip install ezdxf openpyxl ifcopenshell
 |------|------|
 | `焊缝统计_auto.xlsx` | 自动焊缝统计（焊缝统计 / 异常报告 / 抽检清单） |
 | `焊缝统计R3_auto(1).xlsx` | 人工标准答案（精度对比用） |
-| `annotated/*.dxf` | 带编号标注的 DXF（每次运行覆盖） |
+| `annotated/gb/*.dxf` | 国标带编号标注的 DXF（每次运行覆盖） |
+| `annotated/eu/*.dxf` | 欧标带编号标注的 DXF（每次运行覆盖） |
 | `*.dxf` / `*.dwg` | 源图纸 |
 
 ### 输出表结构（14 列）
@@ -99,6 +104,18 @@ CO006  CO007  CO008  CO009  CO010
 
 > CO010 参与 Excel 统计，但**暂不参与 DXF 标注**（流水线中跳过）。
 
+### 欧标源图纸（项目根目录 `8901IR004I01*.dxf`）
+
+```
+AB0001  AB0002  AB0002_01  AB0003
+AC0001  AC0002  AC0003
+AP0001  AP0002  AP0003
+AT0001  AT0002  AT0003
+AX0001  AX0002  AX0003
+```
+
+流水线按文件名自动识别 `standard=eu`，输出至 `annotated/eu/`（含同名 PDF 预览）。
+
 ---
 
 ## 快速开始
@@ -112,7 +129,7 @@ python weld_extractor.py
 输出：
 
 - `焊缝统计_auto.xlsx`（含 CO010）
-- `annotated/*.dxf`（BE018–CO009 标注；约 3 分钟）
+- `annotated/gb/*.dxf`（BE018–CO009 标注；约 3 分钟）
 
 质检（可选）：
 
@@ -165,11 +182,15 @@ python compare_r3.py
 
 ```
 annotated/
-  361-RC3210-S-01-BE018_00.dxf
-  ...
+  gb/          # 国标 BE/CO
+    361-RC3210-S-01-BE018_00.dxf
+    ...
+  eu/          # 欧标 AB/AC/AP/AT/AX
+    8901IR004I01AC0001_00.dxf
+    ...
 ```
 
-标注写在模型空间；用 CAD 打开 `annotated/` 下 DXF 即可查看。
+标注写在模型空间；用 CAD 打开 `annotated/gb/` 或 `annotated/eu/` 下 DXF 即可查看。
 
 ---
 
@@ -217,12 +238,56 @@ DXF 文件
   ├─ 普通 WM / 3-SIDES / CIRCLE 分支提取焊缝
   ├─ 后处理：TYP 分发、ARC、pos-fill、列体 cleanup
   ├─ 写入 焊缝统计_auto.xlsx
-  └─ dxf_annotator.annotate → annotated/*.dxf
+  └─ dxf_annotator.annotate → annotated/gb/*.dxf
+       (EU: dxf_annotator_eu.annotate_eu → annotated/eu/*.dxf)
        ├─ 象限归属 + 同半区分向
        ├─ 短距优先搜索 + 走廊偏好（不并入额外象限）
        ├─ 冲突解决 / 引线交叉修复 / 近距字分槽
        └─ 绘制前角度钳位（水平/垂直 ±10°）
 ```
+
+---
+
+## 欧标（EU）流水线
+
+欧标与国标共用 `python weld_extractor.py` 入口；`weld_extractor_eu.extract_eu` 完成提取后由 `dxf_annotator_eu.annotate_eu` 标注。
+
+### U 型围焊（CIRCLE / hf5）重定位
+
+主视图上的 U 型零件围焊标记会重定位到 **A-A 剖面**（U-cut 视图），核心函数 `relocate_eu_circle_wraps_to_u_cut`：
+
+| 场景 | A-A 剖面 | 主视图 |
+|------|----------|--------|
+| **单 U** | 4 对焊缝全保留（3 单焊 + 1 短边分叉） | 剥离 CIRCLE wrap |
+| **双 U** | 每 lane 仅保留短边分叉（V 形引线） | 左右各 3 对（共 6 点）回主视图 |
+
+短边分叉使用 `_draw_branched_paired_weld_label`：引线 V 口朝向短边开口端（`_eu_u_short_tips`）。
+
+### 双 U 不对称截面（AC0003）
+
+主视图左右 U 板底边 Y 可能相差约 2 mm（L 板更低、R 板更高）。A-A 剖面有时只露出一块板（如 AC0003 上层仅 R 板）。此时：
+
+- 用主视图 `dual_pairs` 的 L/R bbox 底边识别可见板属于哪一侧；
+- L 板 → lane0（右侧开口），R 板 → lane1（左侧开口）；
+- 缺失的一侧从主视图对应板 bbox Y + 完整双板截面的 X 模板推断短边 tips（**不**简单镜像 Y）。
+
+对称双 U（AC0002 st3–st7，A-A 双板齐全）仍走原有几何拾取路径，不受影响。
+
+### 其他欧标后处理（`weld_extractor_eu.py`）
+
+- `expand_eu_typ_from_seeds`：相似结构 TYP 扩展
+- `mirror_eu_long_elev_native` / `ensure_eu_bottom_flange_lr`：主视图左右端镜像、底法兰三对
+- `cleanup_eu_u_cut_typ_when_u_wrap`：A-A 有 U-wrap 后清理冗余 TYP
+- `drop_eu_section_typ_when_u_wrap_present`：剖面 B/C/D 冗余 TYP 剔除
+
+### 当前欧标标注状态
+
+| 图纸 | 主视图 | A-A 剖面 | 备注 |
+|------|--------|----------|------|
+| **AC0002** | 双 U st3–7 各 6 点 + 底部 L/C/R | 单 U 全 4 对；双 U 仅短边 | 对称 U，双板完整 |
+| **AC0003** | 双 U st0/st1 各 6 点 | 仅短边分叉；上层单板不对称补全 | F31/F32 下方 tip y≈73 |
+| **AB0001** | — | — | 基线锁定，不必每次回归 |
+| **AB/AC/AT** 其余 | 持续迭代 | — | 见 `annotated/eu/` |
 
 ---
 
@@ -249,6 +314,12 @@ DXF 文件
 
 CO010 标注仍在迭代，默认跳过。
 
+### 欧标
+
+- 流水线可批量处理根目录全部 `8901IR004I01*.dxf`
+- U-cut / 双 U / 底法兰逻辑以 AC0002、AC0003 为回归样例
+- 个别 AP/AX 图纸仍在扩展 TYP 与剖面清理规则
+
 ---
 
 ## 已知遗留问题
@@ -268,10 +339,18 @@ CO010 标注仍在迭代，默认跳过。
 | 个别板间焊几何边界场景依赖 COMP_CONFIG | 可配置覆盖 |
 | CJP paired fillet 未覆盖全部非配置板 | 待扩展 |
 
+### 欧标（EU）
+
+| 问题 | 状态 |
+|------|------|
+| A-A 仅单板时 L/R 不对称需主视图补全 | AC0003 已修；推广至同类图纸 |
+| 剖面 B/C/D 偶发冗余 TYP | 部分 cleanup 已加，持续观察 |
+| 主视图密区 6 点 wrap 碰撞 | 依赖标注引擎全局冲突解决 |
+
 ---
 
 ## COMP_CONFIG 与新构件
 
 `weld_extractor.py` 中 `COMP_CONFIG` 为**可选覆盖**；新构件可先零配置运行，再按需补 `hf_map` / `pp_extra` / `cjp_plates` 等。
 
-添加新构件：将 `项目号-构件号_版本.dxf` 放入项目根目录后执行 `python weld_extractor.py`，检查 Excel 与 `annotated/` 即可。
+添加新构件：将 `项目号-构件号_版本.dxf` 放入项目根目录后执行 `python weld_extractor.py`，检查 Excel 与 `annotated/gb/` 或 `annotated/eu/` 即可。

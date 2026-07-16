@@ -4,7 +4,11 @@ import ezdxf
 from collections import defaultdict
 
 FOLDER = os.path.dirname(os.path.abspath(__file__))
-ANNOTATED_DIR = os.path.join(FOLDER, "annotated")
+ANNOTATED_ROOT = os.path.join(FOLDER, "annotated")
+ANNOTATED_DIRS = [
+    os.path.join(ANNOTATED_ROOT, "gb"),
+    os.path.join(ANNOTATED_ROOT, "eu"),
+]
 
 def _seg_intersect(p1, p2, p3, p4):
     def ccw(a, b, c):
@@ -150,11 +154,16 @@ def check_file(path):
 
 print(f"{'File':<45} {'Labels':>8} {'Cross':>8} {'OutFrame':>9} {'BOM':>5}")
 print("-" * 80)
-for fn in sorted(os.listdir(ANNOTATED_DIR)):
-    if not fn.endswith('.dxf'): continue
-    path = os.path.join(ANNOTATED_DIR, fn)
-    try:
-        n, c, o, b, inner = check_file(path)
-        print(f"{fn:<45} {n:>8} {c:>8} {o:>9} {b:>5}")
-    except Exception as e:
-        print(f"{fn:<45} ERROR: {e}")
+for adir in ANNOTATED_DIRS:
+    if not os.path.isdir(adir):
+        continue
+    tag = os.path.basename(adir)
+    for fn in sorted(os.listdir(adir)):
+        if not fn.endswith('.dxf'):
+            continue
+        path = os.path.join(adir, fn)
+        try:
+            n, c, o, b, inner = check_file(path)
+            print(f"{tag}/{fn:<42} {n:>8} {c:>8} {o:>9} {b:>5}")
+        except Exception as e:
+            print(f"{tag}/{fn:<42} ERROR: {e}")

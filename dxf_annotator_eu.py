@@ -3,7 +3,7 @@ European-standard DXF annotation entry.
 
 Reuses placement/layout helpers from dxf_annotator but must NOT share the
 GB annotate() entry — call annotate_eu only for AB/AC/AP/AT/AX assemblies.
-Output goes to annotated/eu/ to avoid mixing with GB annotated/.
+Output goes to annotated/eu/; GB annotations go to annotated/gb/.
 """
 from __future__ import annotations
 
