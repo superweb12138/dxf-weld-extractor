@@ -20,7 +20,7 @@ def discover_eu_view_roles(doc):
     """
     Map Tekla view_id → section letter / main elev using drawing labels.
 
-    - Unknown-*… - {vid} containing a single letter A–F → that view is A-A / B-B / …
+    - Unknown-*… - {vid} containing a single letter A–H → that view is A-A / B-B / …
     - SectionMark-*… - {vid} → that view is the main elevation (cut markers)
 
     Returns
@@ -50,7 +50,7 @@ def discover_eu_view_roles(doc):
                 t = t.strip()
             else:
                 continue
-            if re.match(r'^[A-Fa-f]$', t):
+            if re.match(r'^[A-Ha-h]$', t):
                 letters.append(t.upper())
         if not letters:
             continue
@@ -1094,6 +1094,7 @@ def _eu_collect_plate_face_edges(pn, view_parts, part_number_map, main_body_set,
             'gusset': lbl,
             'gusset_pn': pn,
             'face': bool(face_i),
+            'line': g_ln,
         })
     # Dedup
     dedup, seen = [], set()
@@ -1107,19 +1108,28 @@ def _eu_collect_plate_face_edges(pn, view_parts, part_number_map, main_body_set,
 
 
 def _eu_match_fingerprint(edges, ref_lens, len_rel=0.22):
-    """Greedy match of edge lengths to seed fingerprint. Returns matched edges or None."""
+    """Match each seed length to the closest unused edge (prefer face)."""
     if not ref_lens or not edges:
         return None
-    used = [False] * len(ref_lens)
+    used_e = [False] * len(edges)
     matched = []
-    for e in sorted(edges, key=lambda x: -x['length_mm']):
-        for i, r in enumerate(ref_lens):
-            if used[i]:
+    # Shortest refs first so 71 is not stolen by a near-miss 90 edge.
+    for r in sorted(ref_lens):
+        tol = max(8.0, len_rel * r)
+        best_i, best_sc = None, 1e18
+        for i, e in enumerate(edges):
+            if used_e[i]:
                 continue
-            if abs(e['length_mm'] - r) <= max(8.0, len_rel * r):
-                used[i] = True
-                matched.append(e)
-                break
+            d = abs(e['length_mm'] - r)
+            if d > tol:
+                continue
+            sc = d + (0.0 if e.get('face') else 6.0)
+            if sc < best_sc:
+                best_sc, best_i = sc, i
+        if best_i is None:
+            continue
+        used_e[best_i] = True
+        matched.append(edges[best_i])
     uniq_ref = len(set(round(x, 0) for x in ref_lens))
     # Require covering all unique fingerprint lengths
     uniq_matched = len(set(round(e['length_mm'], 0) for e in matched))
@@ -1135,6 +1145,9 @@ def _eu_refine_match_cluster_y(matched, pool, len_rel=0.22):
     Prefer face edges whose mid.y sits with the cluster (section cuts).
     Fixes fingerprints that land on a vertical outline mid far below the
     contact band used by sibling welds in the same group.
+
+    Length must stay close to the fingerprint edge — do not swap 71↔90
+    just because both fall inside a loose relative tol.
     """
     if not matched or len(matched) < 2 or not pool:
         return matched
@@ -1145,7 +1158,9 @@ def _eu_refine_match_cluster_y(matched, pool, len_rel=0.22):
         new_out = []
         used_mids = set()
         for e in out:
-            tol = max(8.0, len_rel * e['length_mm'])
+            # Tight length band for replacements; cluster-y is about y, not L.
+            tol = min(max(5.0, 0.10 * e['length_mm']),
+                      max(8.0, len_rel * e['length_mm']))
             alts = [
                 a for a in pool
                 if abs(a['length_mm'] - e['length_mm']) <= tol
@@ -1154,12 +1169,13 @@ def _eu_refine_match_cluster_y(matched, pool, len_rel=0.22):
             ]
             if e not in alts:
                 alts.append(e)
-            def _sc(a):
+            def _sc(a, _e=e):
                 mid_key = (round(a['mid'][0], 1), round(a['mid'][1], 1),
                            round(a['length_mm'], 0))
                 pen = 40.0 if mid_key in used_mids else 0.0
                 face_bonus = 0.0 if a.get('face') else 8.0
-                return abs(a['mid'][1] - med) + face_bonus + pen
+                len_pen = abs(a['length_mm'] - _e['length_mm']) * 1.5
+                return abs(a['mid'][1] - med) + face_bonus + pen + len_pen
             best = min(alts, key=_sc)
             used_mids.add((round(best['mid'][0], 1), round(best['mid'][1], 1),
                            round(best['length_mm'], 0)))
@@ -1343,11 +1359,23 @@ def fill_eu_sparse_fillet_plates(
 
         for lbl, entries in plate_geos.items():
             uniq = {}
+            native_only = {}
+            multi_only = {}
             for r, key in entries:
                 uniq.setdefault(key, r)
-            if len(uniq) != 1:
+                if r.get('_eu_multi_arrow'):
+                    multi_only.setdefault(key, r)
+                else:
+                    native_only.setdefault(key, r)
+            # Exactly one true WM seed (ignore multi-arrow extras that land
+            # on the same plate — those must not block 3-side fill).
+            # Do not seed from a lone multi-arrow tip: that tip is already
+            # the weld; using it as sparse-fill seed invents extra sides.
+            multi_seed = False
+            if len(native_only) == 1:
+                seed_r = next(iter(native_only.values()))
+            else:
                 continue
-            seed_r = next(iter(uniq.values()))
             seed_L = float(seed_r.get('length_mm') or 0)
             # Compact plate from BOM
             dims = (part_dims or {}).get(lbl) or {}
@@ -1603,11 +1631,41 @@ def fill_eu_sparse_fillet_plates(
             # Final stub filter
             selected = [e for e in selected
                         if e['length_mm'] >= max(50.0, seed_L * 0.45)]
+            # Sparse fill is for the seed plate against its known partners /
+            # main body — do not invent contacts to unrelated nearby plates
+            # (e.g. seat WM picking up an adjacent stiffener thickness edge).
+            _allowed = {comp} | set(main_lbls)
+            for _p in (seed_r.get('part1'), seed_r.get('part2')):
+                if _p:
+                    _allowed.add(_p)
+            selected = [
+                e for e in selected
+                if lbl in (e.get('gusset'), e.get('partner'))
+                and (
+                    (e.get('gusset') == lbl and e.get('partner') in _allowed)
+                    or (e.get('partner') == lbl and e.get('gusset') in _allowed)
+                )
+            ]
             if len(selected) < 3:
                 continue
 
             seed_side = seed_r.get('position') or 'Above'
             hf = seed_r.get('hf') if seed_r.get('hf') is not None else 6.0
+            seed_ann = seed_r.get('annotation') or ''
+            seed_wt = seed_r.get('weld_type') or 'PP'
+            # Never invent CJP / PL* sides from a fillet seed on H cuts.
+            seed_is_cjp = (
+                seed_wt == 'CJP'
+                or (isinstance(seed_ann, str)
+                    and (seed_ann.upper().startswith('CJP')
+                         or seed_ann.upper().startswith('PL')))
+                or hf is None
+            )
+            if seed_is_cjp:
+                continue
+            # Multi-arrow-only seed: emit at most one complementary new mid
+            # (the dual tip already counts as one side).
+            n_added_here = 0
             for e in selected:
                 p1, p2 = sorted((e['gusset'], e['partner']))
                 mid = e['mid']
@@ -1623,21 +1681,24 @@ def fill_eu_sparse_fillet_plates(
                     for r2 in results
                 ):
                     continue
+                if multi_seed and n_added_here >= 1:
+                    break
                 for side in ('Above', 'Below'):
                     results.append({
                         'component': comp,
                         'position': side,
                         'hf': hf,
                         'length_mm': L,
-                        'annotation': seed_r.get('annotation') or '',
+                        'annotation': seed_ann,
                         'part1': p1,
                         'part2': p2,
                         'dxf_pos': mid,
                         'view_id': vid,
                         '_eu_plate_sides': True,
-                        'weld_type': seed_r.get('weld_type') or 'PP',
+                        'weld_type': seed_wt if seed_wt != 'CJP' else 'PP',
                     })
                     added += 1
+                n_added_here += 1
     return added
 
 
@@ -1777,15 +1838,134 @@ def expand_eu_fillet_typ_siblings(
                     continue
                 half_seen.add(key)
                 half_rows.append(r)
-            ref_lens = [float(r.get('length_mm') or 0) for r in half_rows]
+            src_geos = half_rows or per_pn[src_pn]
+            ref_lens = [float(r.get('length_mm') or 0) for r in src_geos]
             if len(ref_lens) < 2:
                 ref_lens = [float(r.get('length_mm') or 0) for r in per_pn[src_pn]]
+                src_geos = per_pn[src_pn]
+
+            # Relative role of each seed mid inside the source plate bbox
+            # (keeps "top L=107" from matching "bottom L=107" on the sibling).
+            def _rel(mid, bb):
+                return (
+                    (mid[0] - bb[0]) / max(bb[2] - bb[0], 1e-6),
+                    (mid[1] - bb[1]) / max(bb[3] - bb[1], 1e-6),
+                )
+
+            seed_roles = []
+            for r in src_geos:
+                pos = r['dxf_pos']
+                seed_roles.append((
+                    float(r.get('length_mm') or 0),
+                    _rel(pos, src_bb),
+                    r,
+                ))
+
+            # Tip snapped onto a longer flange while sitting on a same-label
+            # plate top/bottom face: rewrite length/role to that plate edge so
+            # the sibling gets the plate bottom/top mid (not flange outer tip).
+            src_face = _eu_collect_plate_face_edges(
+                src_pn, vparts, part_number_map, main_body_set,
+                comp, adj_tol, scale, face_only=True)
+            rewritten = []
+            used_face = set()
+            for Lref, (rx, ry), sr in seed_roles:
+                tip = sr['dxf_pos']
+                best_e, best_d = None, 3.0
+                for e in src_face:
+                    if e.get('gusset') != lbl and e.get('gusset_pn') != src_pn:
+                        if part_number_map.get(e.get('gusset_pn')) != lbl:
+                            continue
+                    mid = e['mid']
+                    d = math.hypot(mid[0] - tip[0], mid[1] - tip[1])
+                    if d >= best_d:
+                        continue
+                    # Prefer horizontal face edges when tip is near top/bottom
+                    ln = e.get('line') or {}
+                    s0, s1 = ln.get('start'), ln.get('end')
+                    horiz = bool(
+                        s0 and s1
+                        and abs(s1[0] - s0[0]) >= abs(s1[1] - s0[1]) * 1.2)
+                    if not horiz and abs(ry - 0.5) < 0.25:
+                        continue
+                    best_d, best_e = d, e
+                if best_e is not None:
+                    mid = best_e['mid']
+                    key = (round(mid[0], 1), round(mid[1], 1),
+                           round(best_e['length_mm'], 1))
+                    used_face.add(key)
+                    nr = dict(sr)
+                    nr['length_mm'] = round(best_e['length_mm'], 1)
+                    nr['dxf_pos'] = mid
+                    if best_e.get('partner'):
+                        p1, p2 = sorted((lbl, best_e['partner']))
+                        nr['part1'], nr['part2'] = p1, p2
+                    rewritten.append((
+                        float(best_e['length_mm']),
+                        _rel(mid, src_bb),
+                        nr,
+                    ))
+                else:
+                    rewritten.append((Lref, (rx, ry), sr))
+            seed_roles = rewritten
+
+            # Also include opposite-role same-length face edges on the source
+            # plate (top L=107 seed → also bottom L=107) so TYP siblings get
+            # the full 3-side stiffener set.
+            for e in src_face:
+                mid = e['mid']
+                key = (round(mid[0], 1), round(mid[1], 1),
+                       round(e['length_mm'], 1))
+                if key in used_face:
+                    continue
+                if e.get('gusset') != lbl and part_number_map.get(
+                        e.get('gusset_pn')) != lbl:
+                    if e.get('gusset_pn') != src_pn:
+                        continue
+                Lmm = float(e['length_mm'])
+                erx, ery = _rel(mid, src_bb)
+                # Need a same-length seed already on the opposite y role
+                mate = False
+                for Lref, (rx, ry), _sr in seed_roles:
+                    if abs(Lref - Lmm) > max(10.0, len_rel * max(Lref, Lmm)):
+                        continue
+                    if (ry > 0.55 and ery < 0.45) or (ry < 0.45 and ery > 0.55):
+                        mate = True
+                        break
+                if not mate:
+                    continue
+                if any(
+                    abs(mid[0] - sr['dxf_pos'][0]) < 2.5
+                    and abs(mid[1] - sr['dxf_pos'][1]) < 2.5
+                    for _L, _r, sr in seed_roles
+                ):
+                    continue
+                syn = {
+                    'dxf_pos': mid,
+                    'length_mm': round(Lmm, 1),
+                    'position': 'Above',
+                    'hf': (src_geos[0].get('hf') if src_geos else 6),
+                    'annotation': '',
+                    'part1': lbl,
+                    'part2': e.get('partner') or comp,
+                }
+                seed_roles.append((Lmm, (erx, ery), syn))
+                used_face.add(key)
 
             template = {}
-            for r in (half_rows or per_pn[src_pn]):
+            for r in src_geos:
                 template[r.get('position')] = {
                     'hf': r.get('hf'), 'annotation': r.get('annotation') or ''}
-            sides = list(template.keys()) or ['Above', 'Below']
+            # Always emit Above+Below so annotator can pair (half_rows dedupes
+            # by tip and may only keep one side in template).
+            sides = ['Above', 'Below']
+            if not template:
+                template = {
+                    'Above': {'hf': (src_geos[0].get('hf') if src_geos else 6),
+                              'annotation': ''},
+                    'Below': {'hf': (src_geos[0].get('hf') if src_geos else 6),
+                              'annotation': ''},
+                }
 
             for sib in pns:
                 if sib == src_pn or per_pn.get(sib):
@@ -1823,48 +2003,138 @@ def expand_eu_fillet_typ_siblings(
                         continue
                     seen_e.add(k)
                     dedup.append(e)
-                matched = _match_edges(dedup, ref_lens)
-                need = len(set(round(x, 0) for x in ref_lens))
+
+                # Pair each seed to best same-length + same relative role edge
+                matched, used = [], set()
+                for Lref, (rx, ry), _sr in seed_roles:
+                    seed_mid = _sr['dxf_pos']
+                    flip_x = 2 * vcx - seed_mid[0]
+                    best, best_sc = None, 1e18
+                    for i, e in enumerate(dedup):
+                        if i in used:
+                            continue
+                        if abs(e['length_mm'] - Lref) > max(10.0, len_rel * Lref):
+                            continue
+                        # Prefer edges belonging to the sibling plate itself
+                        pen = 0.0 if (
+                            e.get('gusset_pn') == sib
+                            or e.get('gusset') == part_number_map.get(sib)
+                        ) else 10.0
+                        erx, ery = _rel(e['mid'], sib_bb)
+                        # y role must match; x uses flipped seed + relative role
+                        sc = abs(ery - ry) * 55.0
+                        sc += abs(erx - (1.0 - rx)) * 18.0
+                        sc += abs(e['mid'][0] - flip_x) * 0.45
+                        sc += abs(e['length_mm'] - Lref) / max(Lref, 1.0) * 5.0
+                        sc += pen
+                        if not e.get('face'):
+                            sc += 4.0
+                        if sc < best_sc:
+                            best_sc, best = sc, (i, e)
+                    if best is not None:
+                        used.add(best[0])
+                        matched.append(best[1])
+
+                if len(matched) < max(2, len(seed_roles) - 1):
+                    # Fallback to pure length fingerprint
+                    matched = _match_edges(dedup, ref_lens)
+                need = len(seed_roles) if seed_roles else len(
+                    set(round(x, 0) for x in ref_lens))
                 if len(matched) < max(2, need - 1):
                     continue
                 if len(matched) > need:
-                    keep, rest = [matched[0]], matched[1:]
-                    while len(keep) < need and rest:
-                        cms = [e['mid'] for e in keep]
-                        best_i, best_sc = -1, -1
-                        for i, e in enumerate(rest):
-                            spr = min(math.hypot(e['mid'][0] - c[0], e['mid'][1] - c[1])
-                                      for c in cms)
-                            if spr > best_sc:
-                                best_sc, best_i = spr, i
-                        keep.append(rest.pop(best_i))
-                    matched = keep
-                sib_lbl = part_number_map.get(sib)
-                preferred = [e for e in matched if e.get('gusset') == sib_lbl]
-                # Prefer sibling-plate edges but never drop unique fingerprint lengths
-                if preferred:
-                    pref_lens = {round(e['length_mm'], 0) for e in preferred}
-                    need_lens = {round(x, 0) for x in ref_lens}
-                    if pref_lens >= need_lens or len(preferred) >= need:
-                        matched = preferred[:need] if len(preferred) > need else preferred
-                    else:
-                        # Keep preferred + fill missing lengths from full match
-                        have = set(pref_lens)
-                        extra = [e for e in matched
-                                 if round(e['length_mm'], 0) not in have]
-                        matched = list(preferred)
-                        for e in extra:
-                            if len(matched) >= need:
-                                break
-                            matched.append(e)
+                    matched = matched[:need]
+                # Ensure sibling plate's own unmatched face edges of the same
+                # lengths as seeds are kept (inner vertical often loses the
+                # role-score race to a near-duplicate web-gap tip).
+                _matched_mids = {
+                    (round(e['mid'][0], 1), round(e['mid'][1], 1),
+                     round(e['length_mm'], 1))
+                    for e in matched
+                }
+                _seed_lens = [float(Lref) for Lref, _r, _sr in seed_roles]
+                for e in dedup:
+                    if e.get('gusset_pn') != sib and e.get('gusset') != part_number_map.get(sib):
+                        continue
+                    if not e.get('face'):
+                        continue
+                    Lmm = float(e['length_mm'])
+                    if not any(
+                        abs(Lmm - sl) <= max(10.0, len_rel * max(Lmm, sl))
+                        for sl in _seed_lens
+                    ):
+                        continue
+                    mk = (round(e['mid'][0], 1), round(e['mid'][1], 1),
+                          round(Lmm, 1))
+                    if mk in _matched_mids:
+                        continue
+                    matched.append(e)
+                    _matched_mids.add(mk)
                 for e in matched:
                     p1, p2 = sorted((e['gusset'], e['partner']))
                     mid, L = e['mid'], round(e['length_mm'], 1)
+                    # Long horizontal fillet on a non-sibling plate (e.g. flange
+                    # strip): put tip on the outer end. Same-label stiffener
+                    # edges keep their edge mid (plate top/bottom center).
+                    ln = e.get('line') or {}
+                    s0, s1 = ln.get('start'), ln.get('end')
+                    sib_lbl = part_number_map.get(sib)
+                    if (s0 and s1 and L >= 180
+                            and e.get('gusset') != sib_lbl
+                            and abs(s1[0] - s0[0]) >= abs(s1[1] - s0[1]) * 2.5):
+                        if sib_half == 'R':
+                            mid = s0 if s0[0] >= s1[0] else s1
+                        else:
+                            mid = s0 if s0[0] <= s1[0] else s1
                     if _eu_result_covers(results, vid, L, (p1, p2), mid, tol=5.0):
+                        continue
+                    # Near-dup only when conflict tip is inside THIS sibling
+                    # plate bbox. Web-gap native mid (~0.8mm from sib face)
+                    # must not suppress the sib's own inner vertical.
+                    _near_dup = False
+                    _sbb = sib_bb
+                    for _er in results:
+                        if _er.get('view_id') != vid or not _er.get('dxf_pos'):
+                            continue
+                        if abs((_er.get('length_mm') or 0) - L) > max(
+                                8.0, 0.15 * max(L, 1.0)):
+                            continue
+                        _ep = _er['dxf_pos']
+                        if (abs(_ep[0] - mid[0]) > 6.0
+                                or abs(_ep[1] - mid[1]) > 6.0):
+                            continue
+                        # Tight pad: web-gap tips sit ~0.8mm outside the
+                        # plate face and must remain non-blocking.
+                        if (_sbb[0] - 0.25 <= _ep[0] <= _sbb[2] + 0.25
+                                and _sbb[1] - 0.25 <= _ep[1] <= _sbb[3] + 0.25):
+                            _near_dup = True
+                            break
+                    if _near_dup:
                         continue
                     for side in sides:
                         meta = template.get(side) or next(
                             iter(template.values()), {'hf': 6, 'annotation': ''})
+                        # Skip only if this side already exists on THIS sibling
+                        # plate (web-gap native tip is ~5mm away but off-plate).
+                        _side_dup = False
+                        for _er in results:
+                            if (_er.get('view_id') != vid
+                                    or _er.get('position') != side
+                                    or not _er.get('dxf_pos')):
+                                continue
+                            if abs((_er.get('length_mm') or 0) - L) > max(
+                                    8.0, 0.15 * max(L, 1.0)):
+                                continue
+                            _ep = _er['dxf_pos']
+                            if (abs(_ep[0] - mid[0]) > 3.0
+                                    or abs(_ep[1] - mid[1]) > 3.0):
+                                continue
+                            if (_sbb[0] - 0.25 <= _ep[0] <= _sbb[2] + 0.25
+                                    and _sbb[1] - 0.25 <= _ep[1] <= _sbb[3] + 0.25):
+                                _side_dup = True
+                                break
+                        if _side_dup:
+                            continue
                         results.append({
                             'component': comp, 'position': side,
                             'hf': meta.get('hf'), 'length_mm': L,
@@ -1965,17 +2235,26 @@ def refine_eu_section_expand_mids(
                     and (e.get('gusset') in pair or e.get('partner') in pair)
                 ]
             if alts:
-                best = min(alts, key=lambda e: abs(e['mid'][1] - med) + (
-                    0 if e.get('face') else 6))
-                if abs(best['mid'][1] - med) <= 12.0 and (
-                        abs(best['mid'][1] - med) + 1.0 < abs(pos[1] - med)):
-                    r['dxf_pos'] = best['mid']
-                    r['length_mm'] = round(best['length_mm'], 1)
-                    n_fix += 1
+                # Prefer face mid near cluster median; slight preference for
+                # staying close in x so left-plate right edges keep identity.
+                best = min(alts, key=lambda e: (
+                    abs(e['mid'][1] - med)
+                    + 0.35 * abs(e['mid'][0] - pos[0])
+                    + (0 if e.get('face') else 6)))
+                if abs(best['mid'][1] - med) <= 14.0 and (
+                        abs(best['mid'][1] - med) + 0.5 < abs(pos[1] - med)
+                        or abs(best['mid'][0] - pos[0]) + abs(best['mid'][1] - pos[1])
+                        < abs(pos[1] - med)):
+                    if (abs(best['mid'][0] - pos[0]) > 0.3
+                            or abs(best['mid'][1] - pos[1]) > 0.3):
+                        r['dxf_pos'] = best['mid']
+                        r['length_mm'] = round(best['length_mm'], 1)
+                        n_fix += 1
                     continue
             # Last resort for true loners only — keep x, snap y to cluster
-            r['dxf_pos'] = (pos[0], med)
-            n_fix += 1
+            if abs(pos[1] - med) > 8.0:
+                r['dxf_pos'] = (pos[0], med)
+                n_fix += 1
     return n_fix
 
 
@@ -2093,6 +2372,19 @@ def _eu_is_section_cut_view(vparts, bbox, comp_dims=None, scale=10.0):
     flange = float((comp_dims or {}).get('flange_w') or 0)
     if depth and flange and _eu_dims_match_section(w, h, depth, flange, tol=0.30):
         return True
+    # Stiffener cuts with a protruding plate (e.g. AB0003 C-C/D-D): view AABB
+    # is elongated, but one part still matches the HE/I outline.
+    if depth and flange and 2 <= len(vparts) <= 10:
+        for _lns in vparts.values():
+            _bb = _eu_part_bbox(_lns)
+            if not _bb:
+                continue
+            _pw = (_bb[2] - _bb[0]) * scale
+            _ph = (_bb[3] - _bb[1]) * scale
+            if min(_pw, _ph) < min(depth, flange) * 0.55:
+                continue
+            if _eu_dims_match_section(_pw, _ph, depth, flange, tol=0.28):
+                return True
     # Stiffener sections often extend slightly beyond flange×depth
     return aspect <= 1.6 and 2 <= len(vparts) <= 10
 
@@ -2530,6 +2822,11 @@ def expand_eu_typ_from_seeds(
                 continue
             if vid in rematch_done or vid in soft_done:
                 continue
+            # Never invent TYP rematch onto SectionMark main elev
+            if main_view_ids and vid in main_view_ids:
+                continue
+            if is_long_elev:
+                continue
             if len(vparts) > 12 or len(vparts) < 2:
                 continue
             seed_n = len(part_lines_map.get(seed_view) or {})
@@ -2813,8 +3110,24 @@ def mirror_eu_long_elev_native(results, part_lines_map, part_number_map, comp,
                 view_id=vid, main_view_ids=main_view_ids if main_view_ids else None):
             continue
         sx0, sy0, sx1, sy1 = tbb
-        cx = 0.5 * (sx0 + sx1)
         tw = max(sx1 - sx0, 1e-6)
+        th = max(sy1 - sy0, 1e-6)
+
+        main_body_set, _ = _eu_find_main_body_blocks(
+            vparts, part_number_map, comp, comp_dims=comp_dims, scale=scale)
+        main_lbls = {comp} | {part_number_map.get(mb, comp) for mb in main_body_set}
+        # Tall column elev: flip across main-body centre (flange↔flange),
+        # not the elongated view AABB (which includes protruding plates).
+        cx = 0.5 * (sx0 + sx1)
+        if th / tw >= 2.0 and main_body_set:
+            mxs, mys = [], []
+            for mb in main_body_set:
+                for ln in vparts.get(mb, []):
+                    mxs.extend([ln['start'][0], ln['end'][0]])
+                    mys.extend([ln['start'][1], ln['end'][1]])
+            if mxs:
+                cx = 0.5 * (min(mxs) + max(mxs))
+                tw = max(max(mxs) - min(mxs), tw * 0.15)
 
         # Unique geos (ignore Above/Below duplication): prefer native first
         geos = {}
@@ -2830,27 +3143,36 @@ def mirror_eu_long_elev_native(results, part_lines_map, part_number_map, comp,
                 geos[key] = r
 
         items = list(geos.values())
-        right = [r for r in items if r['dxf_pos'][0] >= cx + 0.08 * tw]
-        left = [r for r in items if r['dxf_pos'][0] <= cx - 0.08 * tw]
+        # Ignore tips far outside the view AABB (CIRCLE TYP distribute junk)
+        pad = max(tw, th) * 0.05
+        in_view = [
+            r for r in items
+            if (sx0 - pad <= r['dxf_pos'][0] <= sx1 + pad
+                and sy0 - pad <= r['dxf_pos'][1] <= sy1 + pad)
+        ]
+        if not in_view:
+            in_view = items
+        right = [r for r in in_view if r['dxf_pos'][0] >= cx + 0.08 * tw]
+        left = [r for r in in_view if r['dxf_pos'][0] <= cx - 0.08 * tw]
         # Prefer mirroring the richer side onto the poorer side
         if len(right) >= len(left):
             src, dst_sign = right, -1
         else:
             src, dst_sign = left, 1
 
-        main_body_set, _ = _eu_find_main_body_blocks(
-            vparts, part_number_map, comp, comp_dims=comp_dims, scale=scale)
-        main_lbls = {comp} | {part_number_map.get(mb, comp) for mb in main_body_set}
         plates = [pn for pn in vparts
                   if part_number_map.get(pn) not in (None, comp)
                   and pn not in main_body_set]
+
+        tall_col = th / max(tw, 1e-6) >= 2.0
+        cover_tol = 8.0 if tall_col else 16.0
 
         for r in src:
             ox, oy = r['dxf_pos']
             mx, my = (2 * cx - ox), oy
             L = float(r.get('length_mm') or 0)
             pair = (r.get('part1'), r.get('part2'))
-            if _eu_result_covers(results, vid, L, pair, (mx, my), tol=16.0):
+            if _eu_result_covers(results, vid, L, pair, (mx, my), tol=cover_tol):
                 continue
             is_cjp = (r.get('weld_type') == 'CJP'
                       or (r.get('annotation') or '').upper().startswith('CJP')
@@ -2870,7 +3192,8 @@ def mirror_eu_long_elev_native(results, part_lines_map, part_number_map, comp,
                         continue
                     if dst_sign > 0 and e['mid'][0] < cx:
                         continue
-                    if not (e['gusset'] in seed_plates or e['partner'] in seed_plates):
+                    if not (e['gusset'] in seed_plates or e['partner'] in seed_plates
+                            or e['partner'] == comp or e['gusset'] == comp):
                         continue
                     if abs(e['mid'][1] - my) > (60.0 if is_cjp else 40.0):
                         continue
@@ -2884,28 +3207,49 @@ def mirror_eu_long_elev_native(results, part_lines_map, part_number_map, comp,
             # Keep seed y if snap jumped to a different flange level
             if best and abs(best['mid'][1] - my) > 10.0:
                 mid = (best['mid'][0], my)
+            # Tall column: keep pure x-flip if snap drifted too far in x
+            if tall_col and abs(mid[0] - mx) > max(6.0, 0.35 * tw):
+                mid = (mx, my)
+            # Never emit mirrors outside the elev AABB
+            if not (sx0 - pad <= mid[0] <= sx1 + pad
+                    and sy0 - pad <= mid[1] <= sy1 + pad):
+                continue
+            # Tall column: also keep within main-body x band when available
+            if tall_col and main_body_set:
+                mxs = []
+                for mb in main_body_set:
+                    for ln in vparts.get(mb, []):
+                        mxs.extend([ln['start'][0], ln['end'][0]])
+                if mxs:
+                    mx0, mx1 = min(mxs), max(mxs)
+                    mpad = max(mx1 - mx0, 1.0) * 0.35
+                    if not (mx0 - mpad <= mid[0] <= mx1 + mpad):
+                        continue
             L_out = L if (is_cjp or not best) else best['length_mm']
-            if is_cjp:
+            if is_cjp or tall_col:
                 L_out = L
             p1, p2 = sorted(pair)
+
             sides = ['Above'] if is_cjp else ['Above', 'Below']
             for side in sides:
+                x_tol = 5.0 if tall_col else 8.0
                 if any(x for x in results
                        if x.get('view_id') == vid
                        and x.get('position') == side
                        and frozenset((x.get('part1'), x.get('part2'))) == frozenset((p1, p2))
                        and x.get('dxf_pos')
-                       and abs(x['dxf_pos'][0] - mid[0]) < 8
+                       and abs(x['dxf_pos'][0] - mid[0]) < x_tol
                        and abs(x['dxf_pos'][1] - mid[1]) < 8):
                     continue
                 # Also skip if same pair+length already at mirrored y±3 (any x nearby)
+                x_near = 5.0 if tall_col else 12.0
                 if any(x for x in results
                        if x.get('view_id') == vid
                        and x.get('position') == side
                        and frozenset((x.get('part1'), x.get('part2'))) == frozenset((p1, p2))
                        and abs((x.get('length_mm') or 0) - L_out) < 1.0
                        and x.get('dxf_pos')
-                       and abs(x['dxf_pos'][0] - mid[0]) < 12
+                       and abs(x['dxf_pos'][0] - mid[0]) < x_near
                        and abs(x['dxf_pos'][1] - mid[1]) < 3):
                     continue
                 row = {
@@ -2925,5 +3269,1618 @@ def mirror_eu_long_elev_native(results, part_lines_map, part_number_map, comp,
                     row['_eu_cjp_mirror'] = True
                 results.append(row)
                 added += 1
+    return added
+
+
+def cleanup_eu_tall_elev_outliers(
+        results, part_lines_map, part_number_map, comp, comp_dims=None,
+        scale=10.0, main_view_ids=None):
+    """Drop expand tips that landed far outside the main-body x band on tall elevs."""
+    if not results or not part_lines_map:
+        return 0
+    main_view_ids = set(main_view_ids or [])
+    drop = set()
+    by_view = {}
+    for i, r in enumerate(results):
+        by_view.setdefault(r.get('view_id'), []).append((i, r))
+    for vid, items in by_view.items():
+        vparts = part_lines_map.get(vid) or {}
+        tbb = _eu_view_bbox(vparts)
+        if not tbb:
+            continue
+        tw = max(tbb[2] - tbb[0], 1e-6)
+        th = max(tbb[3] - tbb[1], 1e-6)
+        if th / tw < 2.0:
+            continue
+        if not _eu_is_long_elevation(
+                vparts, tbb, part_number_map=part_number_map, comp=comp,
+                view_id=vid, main_view_ids=main_view_ids if main_view_ids else None):
+            continue
+        main_body_set, _ = _eu_find_main_body_blocks(
+            vparts, part_number_map, comp, comp_dims=comp_dims, scale=scale)
+        if not main_body_set:
+            continue
+        mxs = []
+        for mb in main_body_set:
+            for ln in vparts.get(mb, []):
+                mxs.extend([ln['start'][0], ln['end'][0]])
+        if not mxs:
+            continue
+        mx0, mx1 = min(mxs), max(mxs)
+        pad = max(mx1 - mx0, 1.0) * 0.5
+        for i, r in items:
+            if not (r.get('_eu_typ_expand') or r.get('_eu_typ_mirror')):
+                continue
+            pos = r.get('dxf_pos')
+            if not pos:
+                continue
+            if pos[0] < mx0 - pad or pos[0] > mx1 + pad:
+                drop.add(i)
+    if not drop:
+        return 0
+    results[:] = [r for i, r in enumerate(results) if i not in drop]
+    return len(drop)
+
+
+def drop_eu_section_cjp_near_multiside(
+        results, part_lines_map, part_number_map, comp, comp_dims=None,
+        scale=10.0, main_view_ids=None, cluster_tol=18.0):
+    """
+    Drop native CJP rows that sit inside a 2S/3S fillet tip cluster on the
+    same non-elev view (e.g. A-A extra PL10 between plates already in the 3S set).
+    """
+    import math
+    from collections import defaultdict
+
+    if not results or not part_lines_map:
+        return 0
+
+    main_view_ids = set(main_view_ids or [])
+    by_view = defaultdict(list)
+    for i, r in enumerate(results):
+        by_view[r.get('view_id')].append((i, r))
+
+    drop = set()
+    for vid, items in by_view.items():
+        if main_view_ids and vid in main_view_ids:
+            continue
+        vparts = part_lines_map.get(vid) or {}
+        tbb = _eu_view_bbox(vparts)
+        if not tbb:
+            continue
+        if _eu_is_long_elevation(
+                vparts, tbb, part_number_map=part_number_map, comp=comp,
+                view_id=vid, main_view_ids=main_view_ids if main_view_ids else None):
+            continue
+        main_body_set, _ = _eu_find_main_body_blocks(
+            vparts, part_number_map, comp, comp_dims=comp_dims, scale=scale)
+        main_lbls = {comp} | {part_number_map.get(mb, comp) for mb in main_body_set}
+
+        fillet_tips = []
+        fillet_parts = set()
+        for _i, r in items:
+            if r.get('_eu_typ_expand') or r.get('_eu_plate_sides'):
+                continue
+            ann = (r.get('annotation') or '')
+            wt = r.get('weld_type') or ''
+            is_cjp = (wt == 'CJP' or ann.upper().startswith('CJP')
+                      or ann.upper().startswith('PL') or r.get('hf') is None)
+            if is_cjp:
+                continue
+            pos = r.get('dxf_pos')
+            if not pos:
+                continue
+            fillet_tips.append(pos)
+            for p in (r.get('part1'), r.get('part2')):
+                if p and p not in main_lbls:
+                    fillet_parts.add(p)
+        if len(fillet_tips) < 2:
+            continue
+
+        for i, r in items:
+            ann = (r.get('annotation') or '')
+            wt = r.get('weld_type') or ''
+            is_cjp = (wt == 'CJP' or ann.upper().startswith('CJP')
+                      or ann.upper().startswith('PL') or (
+                          r.get('hf') is None and ann))
+            if not is_cjp:
+                continue
+            if r.get('_eu_typ_expand') or r.get('_eu_typ_mirror'):
+                continue
+            pos = r.get('dxf_pos')
+            if not pos:
+                continue
+            near = any(
+                math.hypot(pos[0] - t[0], pos[1] - t[1]) <= cluster_tol
+                for t in fillet_tips)
+            if not near:
+                continue
+            pair = {r.get('part1'), r.get('part2')} - {None}
+            # Plate–plate CJP inside a multi-side fillet tip cluster
+            if (len(pair) == 2 and not (pair & main_lbls)
+                    and (pair & fillet_parts or len(fillet_tips) >= 3)):
+                drop.add(i)
+
+    if not drop:
+        return 0
+    kept = [r for i, r in enumerate(results) if i not in drop]
+    n = len(results) - len(kept)
+    results[:] = kept
+    return n
+
+
+def drop_eu_cjp_plate_sides(results):
+    """Remove `_eu_plate_sides` rows that carried CJP/PL annotation."""
+    if not results:
+        return 0
+    kept = []
+    n = 0
+    for r in results:
+        if r.get('_eu_plate_sides'):
+            ann = (r.get('annotation') or '')
+            wt = r.get('weld_type') or ''
+            if (wt == 'CJP' or ann.upper().startswith('CJP')
+                    or ann.upper().startswith('PL') or r.get('hf') is None):
+                n += 1
+                continue
+        kept.append(r)
+    if n:
+        results[:] = kept
+    return n
+
+
+def _eu_u_edge_open_end(edge, spine_x=None):
+    """Open-side tip of a U flange short edge (farther from web / larger |Δx|)."""
+    s = edge.get('start')
+    e = edge.get('end')
+    if not s or not e:
+        return edge.get('mid')
+    if spine_x is None:
+        # Prefer the rightmost end for typical U opening to +X; else farthest mid-x.
+        return s if s[0] >= e[0] else e
+    ds = abs(s[0] - spine_x)
+    de = abs(e[0] - spine_x)
+    if abs(ds - de) < 1e-6:
+        return s if s[0] >= e[0] else e
+    return s if ds >= de else e
+
+
+def _pick_u_station_four_pairs(pn, bb, vparts, local_map, main_body_set, comp,
+                               adj_tol, scale):
+    """U-station welds per Figure-2 style:
+    3 singles = web back + top flange tip + bottom flange tip;
+    1 branched short_pair = two short-edge open ends (inner flange corners).
+    """
+    import math
+
+    cy = 0.5 * (bb[1] + bb[3])
+    y_lo, y_hi = bb[1] - 0.6, bb[3] + 0.6
+    spine_lbl = comp
+    for mbp in main_body_set:
+        spine_lbl = local_map.get(mbp) or spine_lbl
+        break
+    lbl = local_map.get(pn) or comp
+    edges = []
+
+    def _is_horiz(ln):
+        return abs(ln['start'][1] - ln['end'][1]) < 0.4
+
+    def _append_edge(g_ln, partner, face):
+        Lmm = g_ln.get('length', 0) * scale
+        if Lmm < 22:
+            return
+        mid = _eu_edge_mid(g_ln)
+        if mid[1] < y_lo or mid[1] > y_hi:
+            return
+        edges.append({
+            'length_mm': Lmm, 'partner': partner, 'gusset': lbl,
+            'mid': mid, 'face': bool(face),
+            'horiz': _is_horiz(g_ln),
+            'start': tuple(g_ln['start'][:2]),
+            'end': tuple(g_ln['end'][:2]),
+        })
+
+    for g_ln in vparts.get(pn, []):
+        nb = _eu_best_neighbor_for_edge(
+            g_ln, vparts, {pn}, local_map, main_body_set, comp, adj_tol + 3.0)
+        partner = (local_map.get(nb[0]) if nb else None) or spine_lbl
+        _append_edge(g_ln, partner, bool(nb and nb[2]))
+    for e in _eu_collect_plate_face_edges(
+            pn, vparts, local_map, main_body_set, comp, adj_tol, scale,
+            face_only=False):
+        g_ln = e.get('line')
+        if not g_ln:
+            continue
+        _append_edge(g_ln, e.get('partner') or spine_lbl, e.get('face'))
+
+    seen, dedup = set(), []
+    for e in edges:
+        key = (round(e['mid'][0], 1), round(e['mid'][1], 1),
+               round(e['length_mm'], 0))
+        if key in seen:
+            continue
+        seen.add(key)
+        dedup.append(e)
+    if not dedup:
+        return None
+
+    # Web back (vertical spine) — one single on left of U
+    longs = sorted(
+        [e for e in dedup if e['length_mm'] >= 68 and not e.get('horiz')],
+        key=lambda e: (
+            0 if e.get('face') else 1,
+            0 if e.get('partner') in (comp, spine_lbl) else 1,
+            e['mid'][0],
+            -e['length_mm'],
+        ))
+    if not longs:
+        longs = sorted(
+            [e for e in dedup if e['length_mm'] >= 68],
+            key=lambda e: (e['mid'][0], -e['length_mm']))
+    spine = longs[0] if longs else None
+    spine_x = spine['mid'][0] if spine else 0.5 * (bb[0] + bb[2])
+
+    # Horizontal shorts: extreme-Y = flange tips (singles);
+    # remaining pair = short-edge branch (open ends form the fork tips).
+    horiz = [e for e in dedup if e.get('horiz') and e['length_mm'] < 75]
+    if len(horiz) < 2:
+        horiz = [e for e in dedup if e['length_mm'] < 75]
+
+    top_tip = max(horiz, key=lambda e: e['mid'][1]) if horiz else None
+    bot_tip = min(horiz, key=lambda e: e['mid'][1]) if horiz else None
+    if top_tip is bot_tip:
+        bot_tip = None
+
+    remain_h = [e for e in horiz if e is not top_tip and e is not bot_tip]
+    if len(remain_h) >= 2:
+        # Shorter inset horizontals = short-edge branch pair
+        remain_h = sorted(remain_h, key=lambda e: (e['length_mm'], -e['mid'][0]))
+        top_half = [e for e in remain_h if e['mid'][1] >= cy]
+        bot_half = [e for e in remain_h if e['mid'][1] < cy]
+        if top_half and bot_half:
+            inner_top = min(top_half, key=lambda e: e['length_mm'])
+            inner_bot = min(bot_half, key=lambda e: e['length_mm'])
+        else:
+            inner_top = max(remain_h, key=lambda e: e['mid'][1])
+            inner_bot = min(remain_h, key=lambda e: e['mid'][1])
+            if inner_top is inner_bot:
+                inner_bot = None
+    else:
+        inner_top = inner_bot = None
+
+    # 3 singles: web back + top/bot flange tip edges (mid)
+    singles = []
+    for e in (spine, top_tip, bot_tip):
+        if e is not None and e not in singles:
+            singles.append(e)
+
+    # Short-edge bifurcation tips = open ends of the inset short edges
+    # (endpoint farther from web → natural open-flange x, ~227).
+    short_pair = None
+    if (inner_top and inner_bot and inner_top is not inner_bot
+            and abs(inner_top['mid'][1] - inner_bot['mid'][1]) >= 3.0):
+        tip_top = dict(inner_top)
+        tip_bot = dict(inner_bot)
+        tip_top['mid'] = _eu_u_edge_open_end(inner_top, spine_x)
+        tip_bot['mid'] = _eu_u_edge_open_end(inner_bot, spine_x)
+        tip_top['_open_tip'] = tip_top['mid']
+        tip_bot['_open_tip'] = tip_bot['mid']
+        short_pair = (tip_top, tip_bot)
+
+    # Fallback: keep 3 singles if inner pair missing
+    if len(singles) < 3:
+        used = {id(e) for e in singles}
+        if short_pair:
+            used |= {id(short_pair[0]), id(short_pair[1])}
+        remain = [e for e in dedup if id(e) not in used]
+        while len(singles) < 3 and remain:
+            cms = [e['mid'] for e in singles] or [(0.5 * (bb[0] + bb[2]), cy)]
+            best, best_sc = None, -1.0
+            for e in remain:
+                spr = min(
+                    math.hypot(e['mid'][0] - c[0], e['mid'][1] - c[1])
+                    for c in cms)
+                sc = spr + (3.0 if e.get('face') else 0.0)
+                if sc > best_sc:
+                    best_sc, best = sc, e
+            if best is None:
+                break
+            singles.append(best)
+            remain = [e for e in remain if e is not best]
+
+    return {
+        'singles': singles[:3],
+        'short_pair': short_pair,
+    }
+
+
+def _pick_u_station_four_edges(pn, bb, vparts, local_map, main_body_set, comp,
+                               adj_tol, scale):
+    """Backward-compatible wrapper → flat edge list for probes."""
+    packs = _pick_u_station_four_pairs(
+        pn, bb, vparts, local_map, main_body_set, comp, adj_tol, scale)
+    if not packs:
+        return []
+    out = list(packs.get('singles') or [])
+    sp = packs.get('short_pair')
+    if sp:
+        out.extend(sp)
+    return out[:4]
+
+
+def _eu_stiffener_group_bbox(vparts, main_body_set, part_number_map, comp,
+                             comp_dims=None, scale=10.0):
+    """BBox of compact stiffener plates in an H-section cut (excl. main body)."""
+    main_lbls = {comp} | {
+        part_number_map.get(mb, comp) for mb in (main_body_set or [])}
+    boxes = []
+    for pn, lns in (vparts or {}).items():
+        if pn in (main_body_set or set()):
+            continue
+        lbl = part_number_map.get(pn)
+        if lbl in main_lbls:
+            continue
+        bb = _eu_part_bbox(lns)
+        if not bb:
+            continue
+        pw = (bb[2] - bb[0]) * scale
+        ph = (bb[3] - bb[1]) * scale
+        if max(pw, ph) > max(
+                float((comp_dims or {}).get('depth') or 400),
+                float((comp_dims or {}).get('flange_w') or 400)) * 0.85:
+            continue
+        boxes.append(bb)
+    if not boxes:
+        return None
+    return (
+        min(b[0] for b in boxes), min(b[1] for b in boxes),
+        max(b[2] for b in boxes), max(b[3] for b in boxes),
+    )
+
+
+def _eu_is_u_channel_cut_view(vparts, bbox, part_number_map=None, comp=None,
+                              scale=10.0, min_stations=5):
+    """
+    Compact cut with many similar small plate stations (U / channel stack)
+    plus a long spine — typical B-B wrap detail, not an H stiffener cut.
+    """
+    if not vparts or not bbox:
+        return False
+    w = (bbox[2] - bbox[0]) * scale
+    h = (bbox[3] - bbox[1]) * scale
+    if max(w, h) < 80:
+        return False
+    # Prefer tall stacks of small plates
+    aspect = max(w, h) / max(min(w, h), 1.0)
+    if aspect < 1.8 and len(vparts) < min_stations + 2:
+        return False
+
+    small = []
+    for pn, lns in vparts.items():
+        bb = _eu_part_bbox(lns)
+        if not bb:
+            continue
+        pw = (bb[2] - bb[0]) * scale
+        ph = (bb[3] - bb[1]) * scale
+        if max(pw, ph) <= 0:
+            continue
+        # Small station: compact footprint, not the long spine
+        if max(pw, ph) < 180 and min(pw, ph) < 80:
+            small.append(bb)
+    if len(small) < min_stations:
+        return False
+    # Cluster by centre-x / centre-y so slanted extras don't inflate the span
+    from collections import defaultdict
+    by_cx = defaultdict(list)
+    by_cy = defaultdict(list)
+    for b in small:
+        by_cx[round(0.5 * (b[0] + b[2]), 0)].append(b)
+        by_cy[round(0.5 * (b[1] + b[3]), 0)].append(b)
+    best_x = max(by_cx.values(), key=len)
+    best_y = max(by_cy.values(), key=len)
+    if len(best_x) >= min_stations:
+        cys = [0.5 * (b[1] + b[3]) for b in best_x]
+        if (max(cys) - min(cys)) * scale >= 120:
+            return True
+    if len(best_y) >= min_stations:
+        cxs = [0.5 * (b[0] + b[2]) for b in best_y]
+        if (max(cxs) - min(cxs)) * scale >= 120:
+            return True
+    return False
+
+
+def relocate_eu_circle_wraps_to_u_cut(
+        results, part_lines_map, part_number_map, comp, comp_dims=None,
+        scale=10.0, adj_tol=4.5, main_view_ids=None):
+    """
+    Move CIRCLE / hf=5 wrap clusters off the main elev onto a U-channel cut
+    view: emit 4 Above(+Below) pairs per stack station (e.g. 9×4 = 36 tips).
+    """
+    import math
+    from collections import defaultdict
+
+    if not results or not part_lines_map:
+        return 0
+
+    main_view_ids = set(main_view_ids or [])
+    if not main_view_ids:
+        return 0
+
+    # Find U-cut destination
+    u_vid = None
+    for vid, vparts in part_lines_map.items():
+        if vid in main_view_ids:
+            continue
+        tbb = _eu_view_bbox(vparts)
+        if not tbb:
+            continue
+        if _eu_is_long_elevation(
+                vparts, tbb, part_number_map=part_number_map, comp=comp,
+                view_id=vid, main_view_ids=main_view_ids):
+            continue
+        if _eu_is_u_channel_cut_view(
+                vparts, tbb, part_number_map=part_number_map, comp=comp,
+                scale=scale):
+            u_vid = vid
+            break
+    if not u_vid:
+        return 0
+
+    # Collect elev wrap seeds (CIRCLE tag or hf=5 clusters on main)
+    wrap_rows = []
+    for r in results:
+        if r.get('view_id') not in main_view_ids:
+            continue
+        if r.get('_eu_circle_wrap'):
+            wrap_rows.append(r)
+            continue
+        if (r.get('hf') == 5 and r.get('dxf_pos')
+                and not (r.get('annotation') or '').upper().startswith('CJP')):
+            wrap_rows.append(r)
+    if not wrap_rows:
+        return 0
+
+    # Template hf / annotation from seeds
+    hf = 5.0
+    for r in wrap_rows:
+        if r.get('hf') is not None:
+            hf = r['hf']
+            break
+    ann = ''
+    for r in wrap_rows:
+        if r.get('annotation'):
+            ann = r['annotation']
+            break
+
+    vparts = part_lines_map[u_vid]
+    tbb = _eu_view_bbox(vparts)
+    main_body_set, _ = _eu_find_main_body_blocks(
+        vparts, part_number_map, comp, comp_dims=comp_dims, scale=scale)
+    main_lbls = {comp} | {part_number_map.get(mb, comp) for mb in main_body_set}
+    spine_lbl = comp
+    for mbp in main_body_set:
+        spine_lbl = part_number_map.get(mbp, comp)
+        break
+
+    # Plate marks from elev CIRCLE wraps (for U-cut part pairing)
+    wrap_plates = set()
+    for r in wrap_rows:
+        for p in (r.get('part1'), r.get('part2')):
+            if p and p != comp and p not in main_lbls:
+                wrap_plates.add(p)
+    plate_lbl = sorted(wrap_plates)[0] if wrap_plates else None
+
+    # Always strip elev CIRCLE/hf5 wraps once a U-cut destination exists
+    n_drop = 0
+    kept = []
+    for r in results:
+        if r.get('view_id') in main_view_ids and (
+                r.get('_eu_circle_wrap')
+                or (r.get('hf') == 5
+                    and not (r.get('annotation') or '').upper().startswith('CJP'))):
+            n_drop += 1
+            continue
+        if (r.get('view_id') == u_vid and r.get('hf') == 5
+                and not r.get('_eu_u_wrap')
+                and (r.get('_eu_typ_expand') or r.get('_eu_typ_soft'))):
+            n_drop += 1
+            continue
+        if r.get('view_id') == u_vid and r.get('_eu_u_wrap'):
+            n_drop += 1
+            continue
+        kept.append(r)
+    results[:] = kept
+
+    # Small plates = U stations. Include unlabeled Part blocks.
+    small_pns = []
+    for pn, lns in vparts.items():
+        if pn in main_body_set:
+            continue
+        bb = _eu_part_bbox(lns)
+        if not bb:
+            continue
+        pw = (bb[2] - bb[0]) * scale
+        ph = (bb[3] - bb[1]) * scale
+        if max(pw, ph) >= 200:
+            continue
+        if min(pw, ph) >= 90 and max(pw, ph) >= 160:
+            continue
+        small_pns.append((pn, bb))
+    if not small_pns:
+        return n_drop
+
+    by_cx = defaultdict(list)
+    for pn, bb in small_pns:
+        by_cx[round(0.5 * (bb[0] + bb[2]), 0)].append((pn, bb))
+    stack_sorted = sorted(
+        max(by_cx.values(), key=len),
+        key=lambda x: 0.5 * (x[1][1] + x[1][3]))
+
+    local_map = dict(part_number_map)
+    for i, (pn, _bb) in enumerate(stack_sorted):
+        if not local_map.get(pn):
+            local_map[pn] = f"$U{i}"
+
+    def _emit_edge(e, st_i, short_pair=False, short_tips=None):
+        nonlocal added
+        g = e.get('gusset')
+        p = e.get('partner')
+        ends = []
+        for x in (g, p):
+            if not x or (isinstance(x, str) and x.startswith('$U')):
+                continue
+            ends.append(x)
+        if plate_lbl and comp:
+            p1, p2 = sorted((plate_lbl, comp))
+        elif len(ends) >= 2 and ends[0] != ends[1]:
+            p1, p2 = sorted(ends[:2])
+        elif len(ends) == 1 and ends[0] != comp:
+            p1, p2 = sorted((ends[0], comp))
+        else:
+            p1, p2 = sorted((plate_lbl or spine_lbl or comp, comp))
+        if p1 == p2:
+            return
+        mid = e['mid']
+        if short_pair and short_tips:
+            mid = (
+                0.5 * (short_tips[0][0] + short_tips[1][0]),
+                0.5 * (short_tips[0][1] + short_tips[1][1]),
+            )
+        L = round(e['length_mm'], 1)
+        if _eu_result_covers(results, u_vid, L, (p1, p2), mid, tol=3.5):
+            return
+        for side in ('Above', 'Below'):
+            row = {
+                'component': comp,
+                'position': side,
+                'hf': hf,
+                'length_mm': L,
+                'annotation': ann,
+                'part1': p1,
+                'part2': p2,
+                'dxf_pos': mid,
+                'view_id': u_vid,
+                '_eu_typ_expand': True,
+                '_eu_u_wrap': True,
+                '_eu_u_station': st_i,
+            }
+            if short_pair and short_tips:
+                row['_eu_u_short_pair'] = True
+                row['_eu_u_short_tips'] = [tuple(short_tips[0]), tuple(short_tips[1])]
+            results.append(row)
+            added += 1
+
+    added = 0
+    for st_i, (pn, bb) in enumerate(stack_sorted):
+        packs = _pick_u_station_four_pairs(
+            pn, bb, vparts, local_map, main_body_set, comp, adj_tol, scale)
+        if not packs:
+            continue
+        for e in packs.get('singles') or []:
+            _emit_edge(e, st_i)
+        sp = packs.get('short_pair')
+        if sp:
+            top_e, bot_e = sp
+            tips = (
+                top_e.get('_open_tip') or top_e['mid'],
+                bot_e.get('_open_tip') or bot_e['mid'],
+            )
+            ref = top_e if top_e['length_mm'] >= bot_e['length_mm'] else bot_e
+            _emit_edge(ref, st_i, short_pair=True, short_tips=tips)
+    return added if added else n_drop
+
+
+def complete_eu_h_section_typ_pairs(
+        results, part_lines_map, part_number_map, comp, comp_dims=None,
+        scale=10.0, adj_tol=4.5, wm_views=None, main_view_ids=None,
+        target_n=6, len_rel=0.22):
+    """
+    H-section cuts with a partial native fillet set (e.g. 3 tips) → pad to
+    target_n by mirroring face-adj edges across the section centre (AB0002 C-C).
+    """
+    import math
+    from collections import defaultdict
+
+    if not results or not part_lines_map:
+        return 0
+
+    wm_views = set(wm_views or [])
+    main_view_ids = set(main_view_ids or [])
+    added = 0
+    by_view = defaultdict(list)
+    for r in results:
+        by_view[r.get('view_id')].append(r)
+
+    for vid, rows in by_view.items():
+        if vid not in wm_views:
+            continue
+        if main_view_ids and vid in main_view_ids:
+            continue
+        vparts = part_lines_map.get(vid) or {}
+        tbb = _eu_view_bbox(vparts)
+        if not tbb:
+            continue
+        if _eu_is_long_elevation(
+                vparts, tbb, part_number_map=part_number_map, comp=comp,
+                view_id=vid, main_view_ids=main_view_ids if main_view_ids else None):
+            continue
+        if _eu_is_u_channel_cut_view(
+                vparts, tbb, part_number_map=part_number_map, comp=comp,
+                scale=scale):
+            continue
+        if not _eu_is_section_cut_view(
+                vparts, tbb, comp_dims=comp_dims, scale=scale):
+            continue
+        if _eu_is_plan_or_bolt_view(
+                vparts, set(), bbox=tbb, comp_dims=comp_dims, scale=scale):
+            continue
+
+        main_body_set, sk = _eu_find_main_body_blocks(
+            vparts, part_number_map, comp, comp_dims=comp_dims, scale=scale)
+        if sk != 'H' and not main_body_set:
+            continue
+        main_lbls = {comp} | {part_number_map.get(mb, comp) for mb in main_body_set}
+        vcx = 0.5 * (tbb[0] + tbb[2])
+
+        # Unique native fillet Above tips
+        geos = {}
+        for r in rows:
+            if r.get('position') != 'Above':
+                continue
+            if (r.get('_eu_typ_expand') or r.get('_eu_typ_soft')
+                    or r.get('_eu_typ_rematch') or r.get('_eu_plate_sides')
+                    or r.get('_eu_fillet_sib') or r.get('_eu_u_wrap')):
+                continue
+            ann = (r.get('annotation') or '')
+            wt = r.get('weld_type') or ''
+            if (wt == 'CJP' or ann.upper().startswith('CJP')
+                    or ann.upper().startswith('PL') or r.get('hf') is None):
+                continue
+            pos = r.get('dxf_pos')
+            if not pos:
+                continue
+            key = (round(pos[0], 1), round(pos[1], 1),
+                   round(float(r.get('length_mm') or 0), 1))
+            geos[key] = r
+        if not (2 <= len(geos) <= target_n - 1):
+            continue
+        # Only pad fillet-to-main H stiffener sets (F-F / H-H), not pure
+        # plate–plate 3S clusters (G-G).
+        if not any(
+            comp in (r.get('part1'), r.get('part2'))
+            for r in geos.values()
+        ):
+            continue
+
+        ref_lens = [float(r.get('length_mm') or 0) for r in geos.values()]
+        template = {}
+        for r in geos.values():
+            template[r.get('position')] = {
+                'hf': r.get('hf'), 'annotation': r.get('annotation') or ''}
+        # Also keep Below template from any native below
+        for r in rows:
+            if r.get('position') == 'Below' and r.get('hf') is not None:
+                template.setdefault('Below', {
+                    'hf': r.get('hf'), 'annotation': r.get('annotation') or ''})
+
+        # Existing Above count (incl expands) — stop at target
+        exist_above = sum(
+            1 for r in rows
+            if r.get('position') == 'Above'
+            and r.get('dxf_pos')
+            and not (
+                (r.get('weld_type') == 'CJP')
+                or ((r.get('annotation') or '').upper().startswith('CJP'))
+                or ((r.get('annotation') or '').upper().startswith('PL'))
+            )
+        )
+        if exist_above >= target_n:
+            continue
+
+        pool = []
+        for pn in vparts:
+            if pn in main_body_set:
+                continue
+            pool.extend(_eu_collect_plate_face_edges(
+                pn, vparts, part_number_map, main_body_set,
+                comp, adj_tol, scale, face_only=False))
+        # Dedup
+        dedup, seen = [], set()
+        for e in pool:
+            k = (round(e['mid'][0], 1), round(e['mid'][1], 1),
+                 round(e['length_mm'], 1))
+            if k in seen:
+                continue
+            seen.add(k)
+            dedup.append(e)
+
+        need = target_n - exist_above
+        vcy = 0.5 * (tbb[1] + tbb[3])
+        # Stacked stiffener plates: flip across the plate-group centre, not
+        # the whole view AABB (which sits between the two plates).
+        seed_plates = set()
+        for r in geos.values():
+            for p in (r.get('part1'), r.get('part2')):
+                if p and p != comp and p not in main_lbls:
+                    seed_plates.add(p)
+        plate_cys = []
+        for pn in vparts:
+            if pn in main_body_set:
+                continue
+            lbl = part_number_map.get(pn)
+            # Same-label siblings, or any compact unlabeled plate in the cut
+            if lbl and lbl not in seed_plates and lbl not in main_lbls:
+                continue
+            if lbl in main_lbls or lbl == comp:
+                continue
+            bb = _eu_part_bbox(vparts.get(pn, []))
+            if not bb:
+                continue
+            pw = (bb[2] - bb[0]) * scale
+            ph = (bb[3] - bb[1]) * scale
+            if max(pw, ph) > max(
+                    float((comp_dims or {}).get('depth') or 300),
+                    float((comp_dims or {}).get('flange_w') or 300)) * 1.2:
+                continue
+            if lbl in seed_plates or not lbl:
+                plate_cys.append(0.5 * (bb[1] + bb[3]))
+        if len(plate_cys) >= 2:
+            vcy = 0.5 * (min(plate_cys) + max(plate_cys))
+        # Prefer flipping each native seed onto a same-length face edge
+        # (L/R and T/B). Soft length band covers BOM-corrected tips (135 vs 107).
+        cands = []
+        for r in geos.values():
+            ox, oy = r['dxf_pos']
+            L = float(r.get('length_mm') or 0)
+            seed_pair = (r.get('part1'), r.get('part2'))
+            targets = [
+                (2 * vcx - ox, oy),
+                (ox, 2 * vcy - oy),
+                (2 * vcx - ox, 2 * vcy - oy),
+            ]
+            if len(plate_cys) >= 2:
+                y_lo, y_hi = min(plate_cys), max(plate_cys)
+                # Outer face of the opposite stacked plate
+                targets.append((ox, y_lo if oy >= vcy else y_hi))
+                targets.append((2 * vcx - ox, y_lo if oy >= vcy else y_hi))
+            for mx, my in targets:
+                best, best_sc = None, 1e18
+                for e in dedup:
+                    dL = abs(e['length_mm'] - L)
+                    if dL > max(14.0, 0.35 * L):
+                        continue
+                    d = math.hypot(e['mid'][0] - mx, e['mid'][1] - my)
+                    if d > 22.0:
+                        continue
+                    sc = d + 0.15 * dL
+                    if sc < best_sc:
+                        best_sc, best = sc, e
+                if best is not None:
+                    # Emit with seed length so BOM-corrected tips stay consistent
+                    e2 = dict(best)
+                    e2['length_mm'] = L
+                    e2['_seed_parts'] = seed_pair
+                    cands.append((best_sc * 0.05, e2))
+
+        # Fallback: opposite-half edges whose length matches a seed length
+        left_n = sum(1 for r in geos.values() if r['dxf_pos'][0] <= vcx)
+        seed_left = left_n >= (len(geos) - left_n)
+        for e in dedup:
+            if seed_left and e['mid'][0] <= vcx:
+                continue
+            if (not seed_left) and e['mid'][0] > vcx:
+                continue
+            if not any(
+                abs(e['length_mm'] - rl) <= max(8.0, 0.18 * rl)
+                for rl in ref_lens
+            ):
+                continue
+            pen = 2.0
+            if e.get('partner') in main_lbls or e.get('gusset') in main_lbls \
+                    or e.get('partner') == comp or e.get('gusset') == comp:
+                pen = 0.0
+            if not e.get('face'):
+                pen += 3.0
+            cands.append((5.0 + pen, e))
+
+        picked, used = [], set()
+        # Mark existing tips as used
+        for r in geos.values():
+            pos = r['dxf_pos']
+            used.add((round(pos[0], 1), round(pos[1], 1),
+                      round(float(r.get('length_mm') or 0), 1)))
+        for _pen, e in sorted(cands, key=lambda x: x[0]):
+            key = (round(e['mid'][0], 1), round(e['mid'][1], 1),
+                   round(e['length_mm'], 1))
+            if key in used:
+                continue
+            p1, p2 = sorted((e['gusset'], e['partner']))
+            mid, L = e['mid'], round(e['length_mm'], 1)
+            if _eu_result_covers(results, vid, L, (p1, p2), mid, tol=4.0):
+                continue
+            used.add(key)
+            picked.append(e)
+            if len(picked) >= need:
+                break
+        # Last resort: place seed lengths still missing on the opposite band.
+        # Run even when flip-pick already filled `need` with near-dup edges that
+        # later fail emit — ensure each seed length appears once opposite.
+        if len(plate_cys) >= 2:
+            y_lo, y_hi = min(plate_cys), max(plate_cys)
+            existing_mids = [r['dxf_pos'] for r in geos.values()] + [
+                e['mid'] for e in picked]
+
+            def _opp_has(Lref, opp_y):
+                for e in picked:
+                    if (abs(e['mid'][1] - opp_y) < 10.0
+                            and abs(e['length_mm'] - Lref) <= max(
+                                12.0, 0.22 * Lref)):
+                        return True
+                return False
+
+            # Longest unmatched seeds first (web before flange tips)
+            seeds_sorted = sorted(
+                geos.values(),
+                key=lambda r: -float(r.get('length_mm') or 0))
+            for r in seeds_sorted:
+                L = float(r.get('length_mm') or 0)
+                ox, oy = r['dxf_pos']
+                # Prefer an unmatched outer band; break ties by distance
+                band_opts = []
+                for yb in (y_lo, y_hi):
+                    if _opp_has(L, yb):
+                        continue
+                    band_opts.append((abs(oy - yb), yb))
+                if not band_opts:
+                    continue
+                # Already have enough NEW tips and this length is not missing
+                if len(picked) >= need and all(
+                        _opp_has(float(rr.get('length_mm') or 0), y_lo)
+                        or _opp_has(float(rr.get('length_mm') or 0), y_hi)
+                        for rr in geos.values()):
+                    break
+                opp_y = max(band_opts)[1]
+                mid = (ox, opp_y)
+                best_e, best_d = None, 14.0
+                for e in dedup:
+                    if abs(e['length_mm'] - L) > max(14.0, 0.35 * L):
+                        continue
+                    if abs(e['mid'][1] - opp_y) > 12.0:
+                        continue
+                    d = abs(e['mid'][1] - opp_y) + 0.25 * abs(e['mid'][0] - ox)
+                    if d < best_d:
+                        best_d, best_e = d, e
+                if best_e is not None:
+                    mid = best_e['mid']
+                if any(
+                    abs(mid[0] - m[0]) < 3.0 and abs(mid[1] - m[1]) < 6.0
+                    for m in existing_mids
+                ):
+                    mid = (ox, opp_y)
+                if any(
+                    abs(mid[0] - m[0]) < 3.0 and abs(mid[1] - m[1]) < 5.0
+                    for m in existing_mids
+                ):
+                    continue
+                e2 = {
+                    'mid': mid, 'length_mm': L,
+                    'gusset': r.get('part1'), 'partner': r.get('part2'),
+                    '_seed_parts': (r.get('part1'), r.get('part2')),
+                }
+                picked.append(e2)
+                existing_mids.append(mid)
+
+        if not picked:
+            continue
+
+        sides = ['Above', 'Below']
+        for e in picked:
+            if e.get('_seed_parts'):
+                p1, p2 = sorted(e['_seed_parts'])
+            else:
+                p1, p2 = sorted((e['gusset'], e['partner']))
+            mid, L = e['mid'], round(e['length_mm'], 1)
+            for side in sides:
+                meta = template.get(side) or next(
+                    iter(template.values()), {'hf': 6, 'annotation': ''})
+                if any(
+                    x.get('view_id') == vid
+                    and x.get('position') == side
+                    and x.get('dxf_pos')
+                    and abs(x['dxf_pos'][0] - mid[0]) < 3.0
+                    and abs(x['dxf_pos'][1] - mid[1]) < 3.0
+                    and abs((x.get('length_mm') or 0) - L) < 1.0
+                    for x in results
+                ):
+                    continue
+                results.append({
+                    'component': comp,
+                    'position': side,
+                    'hf': meta.get('hf'),
+                    'length_mm': L,
+                    'annotation': meta.get('annotation') or '',
+                    'part1': p1,
+                    'part2': p2,
+                    'dxf_pos': mid,
+                    'view_id': vid,
+                    '_eu_typ_expand': True,
+                    '_eu_fillet_sib': True,
+                    '_eu_h_complete': True,
+                })
+                added += 1
+    return added
+
+
+def cleanup_eu_main_elev_typ_rows(
+        results, part_lines_map, part_number_map, comp, comp_dims=None,
+        scale=10.0, main_view_ids=None, bottom_y_max=30.0, drop_y_min=55.0):
+    """
+    On main elevation: drop mid/upper TYP and stiffener-zone natives; keep bottom
+    flange band (incl. L/R typ_mirror pairs at y~16).
+    """
+    if not results or not part_lines_map:
+        return 0
+    main_view_ids = set(main_view_ids or [])
+    if not main_view_ids:
+        return 0
+    drop = set()
+    for i, r in enumerate(results):
+        vid = r.get('view_id')
+        if vid not in main_view_ids:
+            continue
+        pos = r.get('dxf_pos')
+        if not pos:
+            continue
+        vparts = part_lines_map.get(vid) or {}
+        tbb = _eu_view_bbox(vparts)
+        if not tbb:
+            continue
+        if not _eu_is_long_elevation(
+                vparts, tbb, part_number_map=part_number_map, comp=comp,
+                view_id=vid, main_view_ids=main_view_ids):
+            continue
+        y = pos[1]
+        if y <= bottom_y_max:
+            continue
+        is_typ = bool(
+            r.get('_eu_typ_expand') or r.get('_eu_typ_mirror')
+            or r.get('_eu_typ_soft') or r.get('_eu_typ_rematch'))
+        if y >= drop_y_min and (is_typ or not r.get('_eu_circle_wrap')):
+            drop.add(i)
+    if not drop:
+        return 0
+    results[:] = [r for i, r in enumerate(results) if i not in drop]
+    return len(drop)
+
+
+def drop_eu_u_cut_bottom_seat(
+        results, part_lines_map, part_number_map, comp, comp_dims=None,
+        scale=10.0, main_view_ids=None):
+    """Drop redundant bottom-seat TYP row on U-channel cut (already on Main elev)."""
+    if not results or not part_lines_map:
+        return 0
+    main_view_ids = set(main_view_ids or [])
+    u_vid = None
+    for vid, vparts in part_lines_map.items():
+        if vid in main_view_ids:
+            continue
+        tbb = _eu_view_bbox(vparts)
+        if not tbb:
+            continue
+        if _eu_is_u_channel_cut_view(
+                vparts, tbb, part_number_map=part_number_map, comp=comp,
+                scale=scale):
+            u_vid = vid
+            break
+    if not u_vid:
+        return 0
+    vparts = part_lines_map[u_vid]
+    tbb = _eu_view_bbox(vparts)
+    if not tbb:
+        return 0
+    y_cut = tbb[1] + max((tbb[3] - tbb[1]) * 0.12, 4.0)
+    drop = set()
+    for i, r in enumerate(results):
+        if r.get('view_id') != u_vid:
+            continue
+        if r.get('_eu_u_wrap'):
+            continue
+        pos = r.get('dxf_pos')
+        if not pos or pos[1] > y_cut:
+            continue
+        if r.get('_eu_typ_expand') or r.get('_eu_typ_soft'):
+            drop.add(i)
+    if not drop:
+        return 0
+    results[:] = [r for i, r in enumerate(results) if i not in drop]
+    return len(drop)
+
+
+def cleanup_eu_h_section_bottom_redundant(
+        results, part_lines_map, part_number_map, comp, comp_dims=None,
+        scale=10.0, wm_views=None, main_view_ids=None):
+    """Drop invented bottom-corner TYP rows on H-section cuts (F115–F118 band)."""
+    if not results or not part_lines_map:
+        return 0
+    wm_views = set(wm_views or [])
+    main_view_ids = set(main_view_ids or [])
+    drop = set()
+    by_view = {}
+    for i, r in enumerate(results):
+        by_view.setdefault(r.get('view_id'), []).append((i, r))
+
+    for vid, items in by_view.items():
+        if vid not in wm_views or vid in main_view_ids:
+            continue
+        vparts = part_lines_map.get(vid) or {}
+        tbb = _eu_view_bbox(vparts)
+        if not tbb:
+            continue
+        if not _eu_is_section_cut_view(vparts, tbb, comp_dims=comp_dims, scale=scale):
+            continue
+        _, sk = _eu_find_main_body_blocks(
+            vparts, part_number_map, comp, comp_dims=comp_dims, scale=scale)
+        if sk != 'H':
+            continue
+        tips_y = [
+            r['dxf_pos'][1] for _, r in items
+            if r.get('position') == 'Above' and r.get('dxf_pos')]
+        if not tips_y:
+            continue
+        y_lo = min(tips_y)
+        for i, r in items:
+            if r.get('position') != 'Above':
+                continue
+            if not (r.get('_eu_typ_expand') or r.get('_eu_h_complete')
+                    or r.get('_eu_h_align')):
+                continue
+            pos = r.get('dxf_pos')
+            if not pos:
+                continue
+            if pos[1] <= y_lo + 4.0:
+                drop.add(i)
+    if not drop:
+        return 0
+    results[:] = [r for i, r in enumerate(results) if i not in drop]
+    return len(drop)
+
+
+def ensure_eu_section_fillet_pairs(
+        results, part_lines_map, part_number_map, comp, comp_dims=None,
+        scale=10.0, wm_views=None, main_view_ids=None, view_roles=None,
+        section_letters=('F', 'H')):
+    """
+    Section F-F / H-H: every fillet tip must have Above+Below at the same
+    position so the annotator emits Fxx,Fyy pairs (not lone F87 / F88 singles).
+    """
+    from collections import defaultdict
+
+    if not results:
+        return 0
+    wm_views = set(wm_views or [])
+    main_view_ids = set(main_view_ids or [])
+    letter_by_view = (view_roles or {}).get('letter_by_view') or {}
+    section_letters = set(section_letters or ())
+
+    buckets = defaultdict(dict)
+    for i, r in enumerate(results):
+        vid = r.get('view_id')
+        if vid not in wm_views or vid in main_view_ids:
+            continue
+        if letter_by_view.get(vid) not in section_letters:
+            continue
+        if (r.get('weld_type') == 'CJP'
+                or (r.get('annotation') or '').upper().startswith('CJP')
+                or (r.get('annotation') or '').upper().startswith('PL')):
+            continue
+        if r.get('hf') is None:
+            continue
+        pos = r.get('dxf_pos')
+        if not pos:
+            continue
+        side = r.get('position')
+        if side not in ('Above', 'Below'):
+            continue
+        key = (
+            vid,
+            round(pos[0], 1), round(pos[1], 1),
+            round(float(r.get('length_mm') or 0), 1),
+            tuple(sorted((r.get('part1'), r.get('part2')))),
+        )
+        buckets[key][side] = r
+
+    added = 0
+    for key, sides in buckets.items():
+        if sides.get('Above') and sides.get('Below'):
+            continue
+        src = sides.get('Above') or sides.get('Below')
+        if not src:
+            continue
+        miss = 'Below' if sides.get('Above') else 'Above'
+        dup = dict(src)
+        dup['position'] = miss
+        results.append(dup)
+        added += 1
+    return added
+
+
+def prune_eu_h_section_mid_outer_natives(
+        results, part_lines_map, part_number_map, comp, comp_dims=None,
+        scale=10.0, wm_views=None, main_view_ids=None, view_roles=None):
+    """Drop mid-height outer native singles on H-H that F-F does not have."""
+    if not results or not part_lines_map:
+        return 0
+    wm_views = set(wm_views or [])
+    main_view_ids = set(main_view_ids or [])
+    letter_by_view = (view_roles or {}).get('letter_by_view') or {}
+    drop = set()
+    by_view = {}
+    for i, r in enumerate(results):
+        by_view.setdefault(r.get('view_id'), []).append((i, r))
+
+    for vid, items in by_view.items():
+        if letter_by_view.get(vid) != 'H' or vid not in wm_views:
+            continue
+        if vid in main_view_ids:
+            continue
+        above = [
+            r for _, r in items
+            if r.get('position') == 'Above' and r.get('dxf_pos')]
+        if len(above) < 5:
+            continue
+        ys = [r['dxf_pos'][1] for r in above]
+        y_lo, y_hi = min(ys), max(ys)
+        y_mid = 0.5 * (y_lo + y_hi)
+        vparts = part_lines_map.get(vid) or {}
+        tbb = _eu_view_bbox(vparts)
+        vcx = 0.5 * (tbb[0] + tbb[2]) if tbb else 0.0
+        for i, r in items:
+            if r.get('_eu_typ_expand') or r.get('_eu_h_complete') or r.get('_eu_h_align'):
+                continue
+            pos = r.get('dxf_pos')
+            if not pos:
+                continue
+            if not (y_lo + 4.0 < pos[1] < y_hi - 4.0):
+                continue
+            if abs(pos[1] - y_mid) > (y_hi - y_lo) * 0.35:
+                continue
+            if abs(pos[0] - vcx) < 8.0:
+                continue
+            drop.add(i)
+    if not drop:
+        return 0
+    results[:] = [r for i, r in enumerate(results) if i not in drop]
+    return len(drop)
+
+
+def cleanup_eu_h_section_bottom_outer_natives(
+        results, part_lines_map, part_number_map, comp, comp_dims=None,
+        scale=10.0, wm_views=None, main_view_ids=None, view_roles=None):
+    """Drop redundant bottom outer-corner natives on H-H (F101/F102 band)."""
+    if not results or not part_lines_map:
+        return 0
+    wm_views = set(wm_views or [])
+    main_view_ids = set(main_view_ids or [])
+    letter_by_view = (view_roles or {}).get('letter_by_view') or {}
+    drop = set()
+    by_view = {}
+    for i, r in enumerate(results):
+        by_view.setdefault(r.get('view_id'), []).append((i, r))
+
+    for vid, items in by_view.items():
+        if vid not in wm_views or vid in main_view_ids:
+            continue
+        if letter_by_view.get(vid) != 'H':
+            continue
+        vparts = part_lines_map.get(vid) or {}
+        tbb = _eu_view_bbox(vparts)
+        if not tbb or not _eu_is_section_cut_view(
+                vparts, tbb, comp_dims=comp_dims, scale=scale):
+            continue
+        _, sk = _eu_find_main_body_blocks(
+            vparts, part_number_map, comp, comp_dims=comp_dims, scale=scale)
+        if sk != 'H':
+            continue
+        above = [
+            (i, r) for i, r in items
+            if r.get('position') == 'Above' and r.get('dxf_pos')]
+        if len(above) < 4:
+            continue
+        y_lo = min(r['dxf_pos'][1] for _, r in above)
+        band = [(i, r) for i, r in above if r['dxf_pos'][1] <= y_lo + 3.5]
+        if len(band) < 2:
+            continue
+        xs = [r['dxf_pos'][0] for _, r in band]
+        x_lo, x_hi = min(xs), max(xs)
+        vcx = 0.5 * (tbb[0] + tbb[2])
+        for i, r in band:
+            if r.get('_eu_typ_expand') or r.get('_eu_h_complete') or r.get('_eu_h_align'):
+                continue
+            pos = r['dxf_pos']
+            if pos[0] <= min(x_lo + 1.5, vcx - 2.0) or pos[0] >= max(x_hi - 1.5, vcx + 2.0):
+                drop.add(i)
+                for j, r2 in items:
+                    if (j != i and r2.get('position') == 'Below'
+                            and r2.get('dxf_pos')
+                            and abs(r2['dxf_pos'][0] - pos[0]) < 2.0
+                            and abs(r2['dxf_pos'][1] - pos[1]) < 2.0):
+                        drop.add(j)
+    if not drop:
+        return 0
+    results[:] = [r for i, r in enumerate(results) if i not in drop]
+    return len(drop)
+
+
+def add_eu_h_section_web_junction(
+        results, part_lines_map, part_number_map, comp, comp_dims=None,
+        scale=10.0, adj_tol=4.5, wm_views=None, main_view_ids=None,
+        view_roles=None, target_xy=(347.0, 154.0), tol=6.0):
+    """Ensure top web-plate junction fillet exists on H-section cut (e.g. H-H 347,154)."""
+    import math
+
+    if not results or not part_lines_map:
+        return 0
+    wm_views = set(wm_views or [])
+    main_view_ids = set(main_view_ids or [])
+    letter_by_view = (view_roles or {}).get('letter_by_view') or {}
+    tx, ty = target_xy
+    added = 0
+
+    for vid in wm_views:
+        if vid in main_view_ids:
+            continue
+        if letter_by_view.get(vid) != 'H':
+            continue
+        vparts = part_lines_map.get(vid) or {}
+        tbb = _eu_view_bbox(vparts)
+        if not tbb or not _eu_is_section_cut_view(
+                vparts, tbb, comp_dims=comp_dims, scale=scale):
+            continue
+        _, sk = _eu_find_main_body_blocks(
+            vparts, part_number_map, comp, comp_dims=comp_dims, scale=scale)
+        if sk != 'H':
+            continue
+        has = any(
+            r.get('view_id') == vid and r.get('position') == 'Above'
+            and r.get('dxf_pos')
+            and abs(r['dxf_pos'][0] - tx) < tol
+            and abs(r['dxf_pos'][1] - ty) < tol
+            and abs((r.get('length_mm') or 0) - 260) <= max(18.0, 0.2 * 260)
+            for r in results)
+        if has:
+            continue
+        main_body_set, _ = _eu_find_main_body_blocks(
+            vparts, part_number_map, comp, comp_dims=comp_dims, scale=scale)
+        pool = []
+        for pn in vparts:
+            if pn in main_body_set:
+                continue
+            pool.extend(_eu_collect_plate_face_edges(
+                pn, vparts, part_number_map, main_body_set,
+                comp, adj_tol, scale, face_only=False))
+        best_e, best_d = None, tol
+        for e in pool:
+            if abs(e['length_mm'] - 260) > max(18.0, 0.25 * 260):
+                continue
+            d = math.hypot(e['mid'][0] - tx, e['mid'][1] - ty)
+            if d < best_d:
+                best_d, best_e = d, e
+        if best_e is None:
+            for e in pool:
+                d = math.hypot(e['mid'][0] - tx, e['mid'][1] - ty)
+                if d < best_d:
+                    best_d, best_e = d, e
+        if best_e is None:
+            continue
+        mx, my = best_e['mid']
+        L = round(best_e['length_mm'], 1)
+        p1, p2 = sorted((best_e.get('gusset'), best_e.get('partner')))
+        if not p1 or not p2 or p1 == p2:
+            continue
+        ref = next(
+            (r for r in results
+             if r.get('view_id') == vid and r.get('position') == 'Above'
+             and r.get('hf') is not None and comp in (r.get('part1'), r.get('part2'))),
+            None)
+        hf = ref.get('hf') if ref else 10
+        ann = (ref or {}).get('annotation') or ''
+        if _eu_result_covers(results, vid, L, (p1, p2), (mx, my), tol=3.5):
+            continue
+        for side in ('Above', 'Below'):
+            results.append({
+                'component': comp,
+                'position': side,
+                'hf': hf,
+                'length_mm': L,
+                'annotation': ann,
+                'part1': p1,
+                'part2': p2,
+                'dxf_pos': (mx, my),
+                'view_id': vid,
+                '_eu_typ_expand': True,
+                '_eu_h_complete': True,
+                '_eu_h_web': True,
+            })
+            added += 1
+    return added
+
+
+def drop_eu_compact_section_typ_dup_main(
+        results, part_lines_map, part_number_map, comp, comp_dims=None,
+        scale=10.0, main_view_ids=None):
+    """
+    Drop TYP expands on compact section cuts when the same part-pair+length
+    already appears on the main elevation (e.g. C-C bottom seat on Main elev).
+    """
+    if not results or not part_lines_map:
+        return 0
+    main_view_ids = set(main_view_ids or [])
+    if not main_view_ids:
+        return 0
+
+    main_fps = []
+    for r in results:
+        if r.get('view_id') not in main_view_ids:
+            continue
+        if not r.get('dxf_pos'):
+            continue
+        p1, p2 = r.get('part1'), r.get('part2')
+        if not p1 or not p2:
+            continue
+        main_fps.append((
+            frozenset((p1, p2)),
+            float(r.get('length_mm') or 0),
+        ))
+    if not main_fps:
+        return 0
+
+    def _main_has(pair, L):
+        for fp, Lm in main_fps:
+            if fp != pair:
+                continue
+            if abs(L - Lm) <= max(8.0, 0.15 * max(L, Lm, 1.0)):
+                return True
+        return False
+
+    drop = set()
+    for i, r in enumerate(results):
+        if r.get('view_id') in main_view_ids:
+            continue
+        if not (r.get('_eu_typ_expand') or r.get('_eu_typ_soft')):
+            continue
+        vparts = part_lines_map.get(r.get('view_id')) or {}
+        tbb = _eu_view_bbox(vparts)
+        if not tbb:
+            continue
+        if _eu_is_long_elevation(
+                vparts, tbb, part_number_map=part_number_map, comp=comp,
+                view_id=r.get('view_id'),
+                main_view_ids=main_view_ids):
+            continue
+        if _eu_is_u_channel_cut_view(
+                vparts, tbb, part_number_map=part_number_map, comp=comp,
+                scale=scale):
+            continue
+        if not _eu_is_section_cut_view(
+                vparts, tbb, comp_dims=comp_dims, scale=scale):
+            continue
+        p1, p2 = r.get('part1'), r.get('part2')
+        if not p1 or not p2:
+            continue
+        if _main_has(frozenset((p1, p2)), float(r.get('length_mm') or 0)):
+            drop.add(i)
+    if not drop:
+        return 0
+    results[:] = [r for i, r in enumerate(results) if i not in drop]
+    return len(drop)
+
+
+def align_eu_h_section_sibling_views(
+        results, part_lines_map, part_number_map, comp, comp_dims=None,
+        scale=10.0, adj_tol=4.5, wm_views=None, main_view_ids=None,
+        view_roles=None):
+    """
+    Copy missing H-section fillet tip roles from the best sibling cut (e.g. F-F → H-H)
+    using relative coords inside the stiffener plate group bbox.
+    """
+    import math
+
+    if not results or not part_lines_map:
+        return 0
+
+    wm_views = set(wm_views or [])
+    main_view_ids = set(main_view_ids or [])
+    letter_by_view = (view_roles or {}).get('letter_by_view') or {}
+
+    def _h_section_views():
+        out = []
+        for vid in wm_views:
+            if vid in main_view_ids:
+                continue
+            vparts = part_lines_map.get(vid) or {}
+            tbb = _eu_view_bbox(vparts)
+            if not tbb:
+                continue
+            if _eu_is_long_elevation(
+                    vparts, tbb, part_number_map=part_number_map, comp=comp,
+                    view_id=vid, main_view_ids=main_view_ids):
+                continue
+            if _eu_is_u_channel_cut_view(
+                    vparts, tbb, part_number_map=part_number_map, comp=comp,
+                    scale=scale):
+                continue
+            if not _eu_is_section_cut_view(
+                    vparts, tbb, comp_dims=comp_dims, scale=scale):
+                continue
+            main_body_set, sk = _eu_find_main_body_blocks(
+                vparts, part_number_map, comp, comp_dims=comp_dims, scale=scale)
+            if sk != 'H':
+                continue
+            tips = []
+            for r in results:
+                if r.get('view_id') != vid or r.get('position') != 'Above':
+                    continue
+                if (r.get('weld_type') == 'CJP'
+                        or (r.get('annotation') or '').upper().startswith('CJP')
+                        or (r.get('annotation') or '').upper().startswith('PL')
+                        or r.get('hf') is None):
+                    continue
+                if not r.get('dxf_pos'):
+                    continue
+                tips.append(r)
+            if len(tips) < 2:
+                continue
+            xs = [r['dxf_pos'][0] for r in tips]
+            ys = [r['dxf_pos'][1] for r in tips]
+            sbb = (min(xs), min(ys), max(xs), max(ys))
+            out.append((vid, sbb, tips, letter_by_view.get(vid, '')))
+        return out
+
+    views = _h_section_views()
+    if len(views) < 2:
+        return 0
+
+    def _score(item):
+        _vid, _sbb, tips, letter = item
+        return len(tips) + (2 if letter == 'F' else 0)
+
+    ref_vid, ref_sbb, ref_tips, _ = max(views, key=_score)
+    # Tip cluster bbox is more stable than plate footprints (BOM sizes can
+    # dwarf the drawn section cut).
+    ref_xs = [r['dxf_pos'][0] for r in ref_tips if r.get('dxf_pos')]
+    ref_ys = [r['dxf_pos'][1] for r in ref_tips if r.get('dxf_pos')]
+    if not ref_xs:
+        return 0
+    pad = 2.0
+    ref_sbb = (
+        min(ref_xs) - pad, min(ref_ys) - pad,
+        max(ref_xs) + pad, max(ref_ys) + pad,
+    )
+    rw = max(ref_sbb[2] - ref_sbb[0], 1e-6)
+    rh = max(ref_sbb[3] - ref_sbb[1], 1e-6)
+
+    added = 0
+    for vid, tgt_sbb, tgt_tips, _letter in views:
+        if vid == ref_vid:
+            continue
+        tgt_xs = [r['dxf_pos'][0] for r in tgt_tips if r.get('dxf_pos')]
+        tgt_ys = [r['dxf_pos'][1] for r in tgt_tips if r.get('dxf_pos')]
+        if not tgt_xs:
+            continue
+        tgt_sbb = (
+            min(tgt_xs) - pad, min(tgt_ys) - pad,
+            max(tgt_xs) + pad, max(tgt_ys) + pad,
+        )
+        vparts = part_lines_map.get(vid) or {}
+        main_body_set, _ = _eu_find_main_body_blocks(
+            vparts, part_number_map, comp, comp_dims=comp_dims, scale=scale)
+        tw = max(tgt_sbb[2] - tgt_sbb[0], 1e-6)
+        th = max(tgt_sbb[3] - tgt_sbb[1], 1e-6)
+
+        pool = []
+        for pn in vparts:
+            if pn in main_body_set:
+                continue
+            pool.extend(_eu_collect_plate_face_edges(
+                pn, vparts, part_number_map, main_body_set,
+                comp, adj_tol, scale, face_only=False))
+
+        existing = [
+            r for r in results
+            if r.get('view_id') == vid and r.get('position') == 'Above'
+            and r.get('dxf_pos')]
+        tgt_lens = [
+            float(r.get('length_mm') or 0) for r in existing
+            if r.get('hf') is not None and not r.get('_eu_h_align')]
+
+        def _has_role(mx, my):
+            for r in existing:
+                pos = r['dxf_pos']
+                if abs(pos[0] - mx) < 6.0 and abs(pos[1] - my) < 7.0:
+                    return True
+            return False
+
+        template = {'hf': 10, 'annotation': ''}
+        for r in ref_tips:
+            if r.get('hf') is not None:
+                template = {
+                    'hf': r.get('hf'),
+                    'annotation': r.get('annotation') or '',
+                }
+                break
+
+        for r in ref_tips:
+            pos = r['dxf_pos']
+            rx = (pos[0] - ref_sbb[0]) / rw
+            ry = (pos[1] - ref_sbb[1]) / rh
+            mx = tgt_sbb[0] + rx * tw
+            my = tgt_sbb[1] + ry * th
+            if _has_role(mx, my):
+                continue
+            best_e, best_d = None, 20.0
+            for e in pool:
+                d = math.hypot(e['mid'][0] - mx, e['mid'][1] - my)
+                if d > 18.0:
+                    continue
+                pen = 0.0
+                if tgt_lens and not any(
+                        abs(e['length_mm'] - tl) <= max(10.0, 0.2 * tl)
+                        for tl in tgt_lens):
+                    pen = 4.0
+                sc = d + pen
+                if sc < best_d:
+                    best_d, best_e = sc, e
+            if best_e is not None:
+                mx, my = best_e['mid'][0], best_e['mid'][1]
+                L = round(best_e['length_mm'], 1)
+            else:
+                L = round(float(r.get('length_mm') or 0), 1)
+            if _has_role(mx, my):
+                continue
+            p1, p2 = sorted((r.get('part1'), r.get('part2')))
+            if best_e:
+                p1, p2 = sorted((best_e.get('gusset'), best_e.get('partner')))
+            if not p1 or not p2 or p1 == p2:
+                continue
+            if _eu_result_covers(results, vid, L, (p1, p2), (mx, my), tol=4.0):
+                continue
+            tip_hf = r.get('hf') if r.get('hf') is not None else template.get('hf')
+            for side in ('Above', 'Below'):
+                results.append({
+                    'component': comp,
+                    'position': side,
+                    'hf': tip_hf,
+                    'length_mm': L,
+                    'annotation': template.get('annotation') or '',
+                    'part1': p1,
+                    'part2': p2,
+                    'dxf_pos': (mx, my),
+                    'view_id': vid,
+                    '_eu_typ_expand': True,
+                    '_eu_h_complete': True,
+                    '_eu_h_align': True,
+                })
+                added += 1
+            existing.append({'dxf_pos': (mx, my), 'length_mm': L})
     return added
 

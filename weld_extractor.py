@@ -370,6 +370,32 @@ def parse_weldmark(blk):
         return None
     arrow_tip = max(candidates, key=lambda pt: abs(pt[1] - ref_y))
 
+    # Multi-leader WMs (one symbol, several arrows): keep every tip whose
+    # connecting segment is longer than the triangle glyph (~5). GB continues
+    # to use arrow_tip alone; EU iterates arrow_tips for each land point.
+    _TRI_MAX = 6.5
+    arrow_tips = []
+    for pt in candidates:
+        tip_len = 0.0
+        for s, ep, ln in lines_raw:
+            if pt == s or pt == ep:
+                tip_len = max(tip_len, ln)
+        if tip_len <= _TRI_MAX:
+            continue
+        if any(dist2d(pt, u) < 0.4 for u in arrow_tips):
+            continue
+        arrow_tips.append(pt)
+    if not arrow_tips:
+        arrow_tips = [arrow_tip]
+    else:
+        # Prefer primary tip first (farthest from shelf), then remaining
+        arrow_tips.sort(key=lambda pt: (-abs(pt[1] - ref_y), pt[0], pt[1]))
+        if arrow_tip not in arrow_tips:
+            arrow_tips.insert(0, arrow_tip)
+        elif arrow_tips[0] != arrow_tip:
+            arrow_tips.remove(arrow_tip)
+            arrow_tips.insert(0, arrow_tip)
+
     # Parse weld sizes from text
     size_above = None   # other-side (above shelf)
     size_below = None   # arrow-side (below shelf)
@@ -447,6 +473,7 @@ def parse_weldmark(blk):
 
     return {
         'arrow_tip':   arrow_tip,
+        'arrow_tips':  arrow_tips,
         'size_above':  size_above,
         'size_below':  size_below,
         'has_above':   has_above,
@@ -2753,9 +2780,17 @@ def extract_welds(dxf_path, config=None):
                                 _mirror['dxf_pos'] = (2 * _center_x - _ox, _oy)
                             _mirror['_no_refine'] = True  # keep mirrored position
                             _mirrored_rows.append(_mirror)
+                    if is_circle_wm:
+                        for _er in edge_rows:
+                            _er['_eu_circle_wrap'] = True
+                        for _er in _mirrored_rows:
+                            _er['_eu_circle_wrap'] = True
                     results.extend(edge_rows + _mirrored_rows)
 
                 else:
+                    if is_circle_wm:
+                        for _er in edge_rows:
+                            _er['_eu_circle_wrap'] = True
                     results.extend(edge_rows)
                 continue  # skip normal weld processing for 3-SIDES
 
@@ -3273,6 +3308,72 @@ def extract_welds(dxf_path, config=None):
                             'dxf_pos':    _rep_pos_val,
                             'view_id':    _rep_vid,
                         })
+
+            # EU: one WeldMark may drop several leader tips (multi-arrow).
+            # Primary tip already emitted; emit sibling tips with labels resolved
+            # at each tip. Require a shared Part block (or remapped label) with
+            # the primary tip so dual arrows on the same plate stay, while
+            # rejecting tips that only hit an unrelated neighboring WM cluster.
+            if (standard == 'eu'
+                    and len(results) > _eu_wm_row0
+                    and len(parsed.get('arrow_tips') or []) > 1):
+                _pri_rows = results[_eu_wm_row0:]
+                _pri_parts = {
+                    p for r in _pri_rows
+                    for p in (r.get('part1'), r.get('part2'))
+                    if p and p != comp
+                }
+                _pri_matches = find_parts_at_point(
+                    parsed['arrow_tip'], view_parts, SNAP_TOL) or []
+                _pri_blocks = {m['part'] for m in _pri_matches}
+                _pri_block_lbls = {
+                    part_number_map.get(b, comp) for b in _pri_blocks
+                    if part_number_map.get(b, comp) != comp
+                }
+                for _xtip in parsed['arrow_tips']:
+                    if dist2d(_xtip, parsed['arrow_tip']) < 1.0:
+                        continue
+                    _xm = find_parts_at_point(_xtip, view_parts, SNAP_TOL)
+                    if not _xm:
+                        continue
+                    _xbp, _xwl, _ = choose_weld_line(_xtip, _xm)
+                    _xlen = round(_xwl['length'] * SCALE, 1)
+                    _xothers = [m['part'] for m in _xm if m['part'] != _xbp]
+                    _xp2n = _xothers[0] if _xothers else None
+                    _xl1 = part_number_map.get(_xbp, comp)
+                    _xl2 = part_number_map.get(_xp2n, comp) if _xp2n else comp
+                    if _xl1 == _xl2:
+                        _xl2 = comp
+                    if _xl2 == comp and _xl1 != comp:
+                        _xl1, _xl2 = _xl2, _xl1
+                    elif _xl1 != comp and _xl2 != comp and _xl1 > _xl2:
+                        _xl1, _xl2 = _xl2, _xl1
+                    _x_parts = {p for p in (_xl1, _xl2) if p and p != comp}
+                    _x_blocks = {m['part'] for m in _xm}
+                    _share_block = bool(_pri_blocks & _x_blocks)
+                    _share_lbl = bool(
+                        (_pri_parts | _pri_block_lbls) & _x_parts)
+                    if not _share_block and not _share_lbl:
+                        continue
+                    if any(
+                            r.get('dxf_pos')
+                            and abs(r['dxf_pos'][0] - _xtip[0]) < 2.0
+                            and abs(r['dxf_pos'][1] - _xtip[1]) < 2.0
+                            for r in results if r.get('view_id') == view_id):
+                        continue
+                    _n_add = 0
+                    for r in _pri_rows:
+                        nr = dict(r)
+                        nr['dxf_pos'] = _xtip
+                        nr['length_mm'] = _xlen if _xlen > 0 else r.get('length_mm')
+                        nr['part1'], nr['part2'] = _xl1, _xl2
+                        nr['_eu_multi_arrow'] = True
+                        results.append(nr)
+                        _n_add += 1
+                    if _n_add:
+                        print(f"    [EU multi-arrow] +{_n_add} @ "
+                              f"({_xtip[0]:.1f},{_xtip[1]:.1f}) L={_xlen} "
+                              f"{_xl1}/{_xl2}")
 
             if standard == 'eu' and parsed.get('is_typ') and len(results) > _eu_wm_row0:
                 _eu_typ_seeds.append({
@@ -5324,6 +5425,15 @@ def extract_welds(dxf_path, config=None):
             cleanup_eu_elev_to_native_plates, cleanup_eu_plate_face_expands,
             fill_eu_sparse_fillet_plates, expand_eu_fillet_typ_siblings,
             refine_eu_section_expand_mids,
+            drop_eu_cjp_plate_sides, drop_eu_section_cjp_near_multiside,
+            relocate_eu_circle_wraps_to_u_cut, complete_eu_h_section_typ_pairs,
+            cleanup_eu_tall_elev_outliers,
+            align_eu_h_section_sibling_views,
+            cleanup_eu_main_elev_typ_rows, drop_eu_compact_section_typ_dup_main,
+            drop_eu_u_cut_bottom_seat, cleanup_eu_h_section_bottom_redundant,
+            ensure_eu_section_fillet_pairs,
+            prune_eu_h_section_mid_outer_natives,
+            add_eu_h_section_web_junction,
         )
         _n_typ = expand_eu_typ_from_seeds(
             results, _eu_typ_seeds, part_lines_map, part_number_map, comp,
@@ -5344,12 +5454,49 @@ def extract_welds(dxf_path, config=None):
             wm_views=set(wm_by_view.keys()), main_view_ids=_main_vids)
         if _n_plate:
             print(f"  [EU plate-sides] +{_n_plate} rows from sparse fillet WMs")
+        _n_drop_ps = drop_eu_cjp_plate_sides(results)
+        if _n_drop_ps:
+            print(f"  [EU plate-sides] dropped {_n_drop_ps} CJP invent row(s)")
         _n_fsib = expand_eu_fillet_typ_siblings(
             results, part_lines_map, part_number_map, comp,
             part_dims=part_dims, comp_dims=comp_dims, scale=SCALE, adj_tol=ADJ_TOL,
             wm_views=set(wm_by_view.keys()), main_view_ids=_main_vids)
         if _n_fsib:
             print(f"  [EU fillet-sib] +{_n_fsib} rows for same-label TYP plates")
+        _n_hcomp = complete_eu_h_section_typ_pairs(
+            results, part_lines_map, part_number_map, comp,
+            comp_dims=comp_dims, scale=SCALE, adj_tol=ADJ_TOL,
+            wm_views=set(wm_by_view.keys()), main_view_ids=_main_vids)
+        if _n_hcomp:
+            print(f"  [EU H-complete] +{_n_hcomp} rows to finish H-section TYP")
+        _n_halign = align_eu_h_section_sibling_views(
+            results, part_lines_map, part_number_map, comp,
+            comp_dims=comp_dims, scale=SCALE, adj_tol=ADJ_TOL,
+            wm_views=set(wm_by_view.keys()), main_view_ids=_main_vids,
+            view_roles=_eu_view_roles)
+        if _n_halign:
+            print(f"  [EU H-align] +{_n_halign} rows from sibling H-section")
+        _n_hweb = add_eu_h_section_web_junction(
+            results, part_lines_map, part_number_map, comp,
+            comp_dims=comp_dims, scale=SCALE, adj_tol=ADJ_TOL,
+            wm_views=set(wm_by_view.keys()), main_view_ids=_main_vids,
+            view_roles=_eu_view_roles)
+        if _n_hweb:
+            print(f"  [EU H-web] +{_n_hweb} row(s) at web-plate junction")
+        _n_pairs = ensure_eu_section_fillet_pairs(
+            results, part_lines_map, part_number_map, comp,
+            comp_dims=comp_dims, scale=SCALE,
+            wm_views=set(wm_by_view.keys()), main_view_ids=_main_vids,
+            view_roles=_eu_view_roles)
+        if _n_pairs:
+            print(f"  [EU section pair] +{_n_pairs} Above/Below mate row(s)")
+        _n_hprune = prune_eu_h_section_mid_outer_natives(
+            results, part_lines_map, part_number_map, comp,
+            comp_dims=comp_dims, scale=SCALE,
+            wm_views=set(wm_by_view.keys()), main_view_ids=_main_vids,
+            view_roles=_eu_view_roles)
+        if _n_hprune:
+            print(f"  [EU H-prune] dropped {_n_hprune} mid outer native row(s)")
         # Drop elev fingerprint junk before L/R mirror so left matches cleaned right
         _n_elev_clean = cleanup_eu_elev_to_native_plates(
             results, part_lines_map, part_number_map, comp,
@@ -5367,6 +5514,37 @@ def extract_welds(dxf_path, config=None):
             main_view_ids=_main_vids)
         if _n_mir:
             print(f"  [EU elev L/R] +{_n_mir} rows mirrored to opposite end")
+        _n_out = cleanup_eu_tall_elev_outliers(
+            results, part_lines_map, part_number_map, comp,
+            comp_dims=comp_dims, scale=SCALE, main_view_ids=_main_vids)
+        if _n_out:
+            print(f"  [EU elev clean] dropped {_n_out} outlier tip(s) off main body")
+        _n_uwrap = relocate_eu_circle_wraps_to_u_cut(
+            results, part_lines_map, part_number_map, comp,
+            comp_dims=comp_dims, scale=SCALE, adj_tol=ADJ_TOL,
+            main_view_ids=_main_vids)
+        if _n_uwrap:
+            print(f"  [EU U-wrap] relocated CIRCLE/hf5 → U-cut (+{_n_uwrap} rows)")
+        _n_main_typ = cleanup_eu_main_elev_typ_rows(
+            results, part_lines_map, part_number_map, comp,
+            comp_dims=comp_dims, scale=SCALE, main_view_ids=_main_vids)
+        if _n_main_typ:
+            print(f"  [EU main clean] dropped {_n_main_typ} elev TYP row(s)")
+        _n_c_dup = drop_eu_compact_section_typ_dup_main(
+            results, part_lines_map, part_number_map, comp,
+            comp_dims=comp_dims, scale=SCALE, main_view_ids=_main_vids)
+        if _n_c_dup:
+            print(f"  [EU section dup] dropped {_n_c_dup} TYP row(s) on Main dup")
+        _n_useat = drop_eu_u_cut_bottom_seat(
+            results, part_lines_map, part_number_map, comp,
+            comp_dims=comp_dims, scale=SCALE, main_view_ids=_main_vids)
+        if _n_useat:
+            print(f"  [EU U-cut] dropped {_n_useat} redundant bottom-seat row(s)")
+        _n_cjp = drop_eu_section_cjp_near_multiside(
+            results, part_lines_map, part_number_map, comp,
+            comp_dims=comp_dims, scale=SCALE, main_view_ids=_main_vids)
+        if _n_cjp:
+            print(f"  [EU CJP-clean] dropped {_n_cjp} CJP near 2S/3S cluster")
 
     # Main elev with no WeldMarks → must stay empty (e.g. AB0001)
     if standard == 'eu' and _main_vids and results:
@@ -5414,15 +5592,15 @@ def extract_welds(dxf_path, config=None):
                 continue
             pair = frozenset((r.get('part1'), r.get('part2')))
             ms = _eu_ms_pairs.get(vid)
-            _ps_marks = _plate_side_by_view.get(vid) or set()
+            # 2S/3S views may still host other native WeldMarks (seat plates
+            # etc.). Only drop soft/rematch expands whose pair is outside the
+            # multi-side set — never delete native WM rows.
             if (ms and not ann
-                    and not r.get('_eu_typ_expand')
+                    and (r.get('_eu_typ_soft') or r.get('_eu_typ_rematch'))
                     and not r.get('_eu_typ_mirror')
-                    and not r.get('_eu_typ_rematch')
                     and not r.get('_eu_plate_sides')
                     and not r.get('_eu_fillet_sib')
-                    and pair not in ms
-                    and not (pair & _ps_marks)):
+                    and pair not in ms):
                 _drop_n += 1
                 continue
             # Plate-face / bolt views: drop if same pair+length already in main elev
