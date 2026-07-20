@@ -512,6 +512,16 @@ def get_part_circles(blk):
             circles.append((c[0], c[1], r))
     return circles
 
+def get_part_arcs(blk):
+    """Return list of (cx, cy, radius) for ARC entities in a Part block."""
+    arcs = []
+    for e in blk:
+        if e.dxftype() != 'ARC':
+            continue
+        c = e.dxf.center
+        arcs.append((round(c.x, 4), round(c.y, 4), round(e.dxf.radius, 4)))
+    return arcs
+
 def get_part_arc_radius(blk):
     """Return max ARC radius (CAD units) in a Part block, or 0 if no ARCs."""
     max_r = 0.0
@@ -521,6 +531,55 @@ def get_part_arc_radius(blk):
             if r > max_r:
                 max_r = r
     return max_r
+
+
+def gusset_has_wrap_scallops(gusset_pn, view_parts, part_arcs_list,
+                             scale=10.0, r_mm=(15.0, 40.0), pad_cad=8.0,
+                             min_hits=2):
+    """
+    True if cope-sized ARCs sit on/near this wrap gusset's contact face.
+
+    Wrap scallops (焊孔) are typically ~25 mm ARCs on the *neighbor/comp*
+    at the gusset flange face — not bolt CIRCLEs and not distant stiffener
+    corner copes in other views.  Used for both GB and EU to decide:
+      scallops → keep per-edge CIRCLE segments
+      none     → collapse to one perimeter weld
+    """
+    if not gusset_pn or not view_parts or not part_arcs_list:
+        return False
+    lines = view_parts.get(gusset_pn) or []
+    if not lines:
+        return False
+    xs, ys = [], []
+    for ln in lines:
+        xs.extend([ln['start'][0], ln['end'][0]])
+        ys.extend([ln['start'][1], ln['end'][1]])
+    if not xs:
+        return False
+    x0, x1 = min(xs), max(xs)
+    y0, y1 = min(ys), max(ys)
+    r_lo, r_hi = r_mm[0] / scale, r_mm[1] / scale
+    # Same-view arcs only (Part name ends with ' - {view_id}')
+    view_id = None
+    if ' - ' in gusset_pn:
+        view_id = gusset_pn.rsplit(' - ', 1)[-1]
+    hits = []
+    seen = set()
+    for pn, arcs in part_arcs_list.items():
+        if view_id and ' - ' in pn and not pn.endswith(view_id):
+            continue
+        for cx, cy, r in arcs:
+            if r < r_lo or r > r_hi:
+                continue
+            key = (round(cx, 1), round(cy, 1), round(r, 2))
+            if key in seen:
+                continue
+            seen.add(key)
+            # Center inside padded gusset bbox (contact-face scallops land here)
+            if (x0 - pad_cad - r <= cx <= x1 + pad_cad + r
+                    and y0 - pad_cad - r <= cy <= y1 + pad_cad + r):
+                hits.append((cx, cy, r))
+    return len(hits) >= min_hits
 
 def part_centroid(lines):
     if not lines:
@@ -963,11 +1022,15 @@ def extract_welds(dxf_path, config=None):
     # Collect bolt-hole CIRCLE entities and corner ARC radii from Part blocks
     part_circles = {}  # part_block_name -> [(cx, cy, radius)]
     part_arcs    = {}  # part_block_name -> max ARC radius (CAD units)
+    part_arcs_list = {}  # part_block_name -> [(cx, cy, radius), ...]
     for blk in doc.blocks:
         if blk.name.startswith('Part') and ' - ' in blk.name:
             circles = get_part_circles(blk)
             if circles:
                 part_circles[blk.name] = circles
+            _arcs = get_part_arcs(blk)
+            if _arcs:
+                part_arcs_list[blk.name] = _arcs
             _ar = get_part_arc_radius(blk)
             if _ar > 0:
                 part_arcs[blk.name] = _ar
@@ -2781,16 +2844,29 @@ def extract_welds(dxf_path, config=None):
                             _mirror['_no_refine'] = True  # keep mirrored position
                             _mirrored_rows.append(_mirror)
                     if is_circle_wm:
+                        _has_sc = gusset_has_wrap_scallops(
+                            gusset_name, view_parts, part_arcs_list,
+                            scale=SCALE)
+                        if _has_sc:
+                            print(f"    [wrap-scallops] keep per-edge segments")
                         for _er in edge_rows:
                             _er['_eu_circle_wrap'] = True
+                            _er['_wrap_has_scallops'] = _has_sc
                         for _er in _mirrored_rows:
                             _er['_eu_circle_wrap'] = True
+                            _er['_wrap_has_scallops'] = _has_sc
                     results.extend(edge_rows + _mirrored_rows)
 
                 else:
                     if is_circle_wm:
+                        _has_sc = gusset_has_wrap_scallops(
+                            gusset_name, view_parts, part_arcs_list,
+                            scale=SCALE)
+                        if _has_sc:
+                            print(f"    [wrap-scallops] keep per-edge segments")
                         for _er in edge_rows:
                             _er['_eu_circle_wrap'] = True
+                            _er['_wrap_has_scallops'] = _has_sc
                     results.extend(edge_rows)
                 continue  # skip normal weld processing for 3-SIDES
 
@@ -5692,7 +5768,8 @@ def extract_welds(dxf_path, config=None):
             comp_dims=comp_dims, scale=SCALE, adj_tol=ADJ_TOL,
             main_view_ids=_main_vids)
         if _n_uwrap:
-            print(f"  [EU U-wrap] relocated CIRCLE/hf5 → U-cut (+{_n_uwrap} rows)")
+            print(f"  [wrap] continuous CIRCLE/hf5 → main perimeter "
+                  f"(+{_n_uwrap} rows)")
         _n_mir2 = mirror_eu_long_elev_native(
             results, part_lines_map, part_number_map, comp,
             comp_dims=comp_dims, scale=SCALE, adj_tol=ADJ_TOL,
@@ -5716,7 +5793,8 @@ def extract_welds(dxf_path, config=None):
             print(f"  [EU section dup] dropped {_n_c_dup} TYP row(s) on Main dup")
         _n_u_typ = drop_eu_section_typ_when_u_wrap_present(
             results, part_lines_map, part_number_map, comp,
-            comp_dims=comp_dims, scale=SCALE, main_view_ids=_main_vids)
+            comp_dims=comp_dims, scale=SCALE, main_view_ids=_main_vids,
+            view_roles=_eu_view_roles)
         if _n_u_typ:
             print(f"  [EU U-wrap dup] dropped {_n_u_typ} redundant section TYP row(s)")
         _n_uc_typ = cleanup_eu_u_cut_typ_when_u_wrap(
@@ -5734,6 +5812,23 @@ def extract_welds(dxf_path, config=None):
             comp_dims=comp_dims, scale=SCALE, main_view_ids=_main_vids)
         if _n_cjp:
             print(f"  [EU CJP-clean] dropped {_n_cjp} CJP near 2S/3S cluster")
+
+    # GB: continuous CIRCLE (no wrap-scallop ARCs) → same perimeter collapse
+    if standard == 'gb' and results and part_lines_map:
+        from weld_extractor_eu import relocate_eu_circle_wraps_to_u_cut
+        _gb_main = {
+            r.get('view_id') for r in results
+            if r.get('_eu_circle_wrap') and not r.get('_wrap_has_scallops')
+            and r.get('view_id')
+        }
+        if _gb_main:
+            _n_uwrap = relocate_eu_circle_wraps_to_u_cut(
+                results, part_lines_map, part_number_map, comp,
+                comp_dims=comp_dims, scale=SCALE, adj_tol=ADJ_TOL,
+                main_view_ids=_gb_main)
+            if _n_uwrap:
+                print(f"  [wrap] continuous CIRCLE → main perimeter "
+                      f"(+{_n_uwrap} rows)")
 
     # Main elev with no WeldMarks → must stay empty (e.g. AB0001)
     if standard == 'eu' and _main_vids and results:
@@ -5826,22 +5921,56 @@ def extract_welds(dxf_path, config=None):
         r['source_dxf'] = _dxf_base
 
     # 抽检焊缝：按构件固定种子随机抽样，标记 _sampled
+    # U 型短边（短叉 + 非腹板翼缘）不参与抽检
     _sample_pct = _cfg.get('_sampled_percent', 0.2) if isinstance(_cfg, dict) else 0.2
     if _sample_pct > 0:
         import random
+        _u_no_sample = set()
+        _u_by_st = defaultdict(list)
+        for _i, _r in enumerate(results):
+            if not (_r.get('_eu_u_wrap') or _r.get('_eu_u_short_pair')):
+                continue
+            if _r.get('_eu_u_short_pair'):
+                _u_no_sample.add(_i)
+                _r['_eu_no_sample'] = True
+                continue
+            _key = (_r.get('view_id'), _r.get('_eu_u_station'), _r.get('_eu_u_lane'))
+            _u_by_st[_key].append((_i, _r))
+        for _members in _u_by_st.values():
+            if len(_members) < 2:
+                # lone flange / incomplete station — treat as short side
+                for _i, _r in _members:
+                    _u_no_sample.add(_i)
+                    _r['_eu_no_sample'] = True
+                continue
+            _by_L = sorted(
+                _members, key=lambda x: -float(x[1].get('length_mm') or 0))
+            # Keep longest (web) sampleable; skip top/bot short flanges
+            for _i, _r in _by_L[1:]:
+                _u_no_sample.add(_i)
+                _r['_eu_no_sample'] = True
         _by_comp = defaultdict(list)
-        for r in results:
-            _by_comp[r.get('component', comp)].append(r)
-        for _c, _crows in _by_comp.items():
+        for _i, r in enumerate(results):
+            if _i in _u_no_sample:
+                continue
+            _by_comp[r.get('component', comp)].append((_i, r))
+        for _c, _cpairs in _by_comp.items():
+            _crows = [r for _i, r in _cpairs]
+            if not _crows:
+                continue
             _n = math.ceil(len(_crows) * _sample_pct)
-            if _n < 1: _n = 1
+            if _n < 1:
+                _n = 1
+            _n = min(_n, len(_crows))
             seed_key = f"{_c}_{os.path.basename(dxf_path)}"
             _rng = random.Random(hash(seed_key) & 0x7FFFFFFF)
             _sampled_idxs = sorted(_rng.sample(range(len(_crows)), _n))
-            for i in _sampled_idxs:
-                _crows[i]['_sampled'] = True
+            for j in _sampled_idxs:
+                _crows[j]['_sampled'] = True
         _sampled_count = sum(1 for r in results if r.get('_sampled'))
-        print(f"  [sampling] {_sampled_count} welds marked for inspection ({_sample_pct*100:.0f}%)")
+        _skip_u = sum(1 for r in results if r.get('_eu_no_sample'))
+        print(f"  [sampling] {_sampled_count} welds marked for inspection "
+              f"({_sample_pct*100:.0f}%); skipped {_skip_u} U short-side(s)")
 
     return results, skipped
 

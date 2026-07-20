@@ -1091,6 +1091,210 @@ def _eu_group_u_plate_bands(small_pns, y_tol=3.5):
     return bands
 
 
+def _eu_count_wrap_stations(wrap_rows, y_tol=4.0):
+    """
+    CIRCLE/hf5 station count on main elev.
+    Prefer Above-tip count / 3 (TYP multiplies whole 3-edge packs that may
+    still share one seed Y). Fall back to unique Y clusters.
+    """
+    above = [
+        r for r in wrap_rows
+        if r.get('position') == 'Above' and r.get('dxf_pos')
+    ]
+    if not above:
+        above = [r for r in wrap_rows if r.get('dxf_pos')]
+    if not above:
+        return 0
+    # TYP xN duplicates the CIRCLE edge pack (~3 edges) at the seed before
+    # geometric relocate — Y clustering alone under-counts (e.g. 2 WMs → 2).
+    n_edge = int(round(len(above) / 3.0))
+    ys = sorted(r['dxf_pos'][1] for r in above)
+    clusters = [ys[0]]
+    for y in ys[1:]:
+        if abs(y - clusters[-1]) > y_tol:
+            clusters.append(y)
+        else:
+            clusters[-1] = 0.5 * (clusters[-1] + y)
+    n_y = len(clusters)
+    return max(n_edge, n_y)
+
+
+def _eu_perimeter_length_by_gusset(wrap_rows, comp):
+    """
+    Perimeter length per CIRCLE gusset label = sum of one native 3-edge pack.
+
+    TYP mirrors often pile at the same Y on the opposite flange; take the
+    leftmost pack (seed WM side) so L is 300+100+300 / 300+120+300, not a
+    collapsed duplicate sum.
+    """
+    from collections import defaultdict
+
+    by_g = defaultdict(list)
+    for r in wrap_rows:
+        if r.get('position') != 'Above' or not r.get('dxf_pos'):
+            continue
+        g = None
+        for p in (r.get('part1'), r.get('part2')):
+            if p and p != comp:
+                g = p
+                break
+        if not g:
+            continue
+        by_g[g].append(r)
+    out = {}
+    for g, rows in by_g.items():
+        rows = sorted(rows, key=lambda r: (r['dxf_pos'][0], r['dxf_pos'][1]))
+        x0 = rows[0]['dxf_pos'][0]
+        pack = [r for r in rows if abs(r['dxf_pos'][0] - x0) < 50.0][:3]
+        if len(pack) < 3:
+            pack = rows[:3]
+        L = round(sum(float(r.get('length_mm') or 0) for r in pack), 1)
+        if L > 0:
+            out[g] = L
+    return out
+
+
+def _eu_list_main_wrap_plates(
+        vparts, part_number_map, wrap_labels, main_body_set, scale=10.0,
+        min_size_mm=40.0):
+    """Main-elev plate instances whose BOM label is a CIRCLE wrap gusset."""
+    wrap_labels = set(wrap_labels or [])
+    if not wrap_labels:
+        return []
+    items = []
+    for pn, lns in vparts.items():
+        if pn in main_body_set:
+            continue
+        bb = _eu_part_bbox(lns)
+        if not bb:
+            continue
+        lbl = part_number_map.get(pn)
+        if lbl not in wrap_labels:
+            continue
+        pw = (bb[2] - bb[0]) * scale
+        ph = (bb[3] - bb[1]) * scale
+        if max(pw, ph) < min_size_mm:
+            continue
+        items.append({
+            'pn': pn,
+            'bb': bb,
+            'lbl': lbl,
+            'cy': 0.5 * (bb[1] + bb[3]),
+        })
+    items.sort(key=lambda x: x['cy'])
+    return items
+
+
+def _eu_wrap_stations_from_seeds(wrap_rows, n_target=0, y_tol=4.0):
+    """
+    Build one perimeter-wrap station per CIRCLE/hf5 pack on main elev.
+
+    Each station: mid = mean of pack tip positions, L = sum of the ~3 edge
+    lengths (full U perimeter, no scallop holes on EU AC plates).
+
+    Note: TYP×N mirrors often share one seed Y, so this under-counts the
+    physical station stack — prefer `_eu_list_main_wrap_plates` for emit.
+    """
+    above = [
+        r for r in wrap_rows
+        if r.get('position') == 'Above' and r.get('dxf_pos')
+    ]
+    if not above:
+        above = [r for r in wrap_rows if r.get('dxf_pos')]
+    if not above:
+        return []
+    above = sorted(above, key=lambda r: (r['dxf_pos'][1], r['dxf_pos'][0]))
+    # Cluster by Y, then chunk each cluster into packs of ~3 edges
+    y_groups = []
+    for r in above:
+        y = r['dxf_pos'][1]
+        if not y_groups or abs(y - y_groups[-1][0]['dxf_pos'][1]) > y_tol:
+            y_groups.append([r])
+        else:
+            y_groups[-1].append(r)
+    stations = []
+    for grp in y_groups:
+        grp = sorted(grp, key=lambda r: (r['dxf_pos'][0], float(r.get('length_mm') or 0)))
+        # One CIRCLE pack ≈ 3 Above edges
+        i = 0
+        while i < len(grp):
+            pack = grp[i:i + 3]
+            i += 3
+            if not pack:
+                break
+            L = round(sum(float(r.get('length_mm') or 0) for r in pack), 1)
+            if L <= 0:
+                continue
+            mx = sum(r['dxf_pos'][0] for r in pack) / len(pack)
+            my = sum(r['dxf_pos'][1] for r in pack) / len(pack)
+            p1 = pack[0].get('part1')
+            p2 = pack[0].get('part2')
+            stations.append({
+                'mid': (mx, my),
+                'L': L,
+                'p1': p1,
+                'p2': p2,
+                'hf': pack[0].get('hf'),
+                'annotation': pack[0].get('annotation') or '',
+            })
+    stations.sort(key=lambda s: s['mid'][1])
+    if n_target and len(stations) > n_target:
+        # Keep evenly spaced by Y (prefer covering the full stack)
+        if n_target == 1:
+            stations = [stations[len(stations) // 2]]
+        else:
+            idxs = [
+                int(round(i * (len(stations) - 1) / (n_target - 1)))
+                for i in range(n_target)
+            ]
+            seen = set()
+            picked = []
+            for j in idxs:
+                if j not in seen:
+                    seen.add(j)
+                    picked.append(stations[j])
+            stations = picked
+    return stations
+
+
+def _eu_trim_u_bands_to_target(bands, n_target, prefer_labels=None):
+    """
+    Keep at most n_target U-station bands on the cut view.
+
+    When prefer_labels (CIRCLE wrap plates) is set, bands that carry other BOM
+    labels (e.g. F/H stiffeners A0191/A0368) are ranked last so they cannot
+    displace the real single-U stack — including low-Y bottom stations.
+    """
+    if not bands or n_target <= 0 or len(bands) <= n_target:
+        return bands
+    prefer_labels = set(prefer_labels or [])
+
+    def _band_cy(band):
+        return 0.5 * (band[0][1][1] + band[0][1][3])
+
+    def _band_score(band):
+        area = 0.0
+        hit = 0
+        foreign = 0
+        for item in band:
+            bb = item[1]
+            area += max(bb[2] - bb[0], 0.0) * max(bb[3] - bb[1], 0.0)
+            lbl = item[2] if len(item) >= 3 else None
+            if not lbl:
+                continue
+            if lbl in prefer_labels:
+                hit += 1
+            elif prefer_labels:
+                foreign += 1
+        # clean=1 for unlabeled / wrap-label U stack; foreign stiffener bands last
+        clean = 0 if foreign else 1
+        return (clean, hit, area)
+
+    ranked = sorted(bands, key=_band_score, reverse=True)
+    keep = ranked[:n_target]
+    return sorted(keep, key=_band_cy)
+
+
 def _eu_collect_plate_face_edges(pn, view_parts, part_number_map, main_body_set,
                                  comp, adj_tol, scale, min_len_cad=1.5,
                                  face_only=True):
@@ -3198,6 +3402,10 @@ def mirror_eu_long_elev_native(results, part_lines_map, part_number_map, comp,
         cover_tol = 8.0 if tall_col else 16.0
 
         for r in src:
+            # Perimeter wraps already cover TYP L/R via plate stack — do not
+            # invent a second column of wrap tips on the opposite flange.
+            if r.get('_eu_u_wrap_main') or r.get('_eu_u_perimeter'):
+                continue
             ox, oy = r['dxf_pos']
             mx, my = (2 * cx - ox), oy
             L = float(r.get('length_mm') or 0)
@@ -3907,10 +4115,13 @@ def relocate_eu_circle_wraps_to_u_cut(
         results, part_lines_map, part_number_map, comp, comp_dims=None,
         scale=10.0, adj_tol=4.5, main_view_ids=None):
     """
-    Move CIRCLE / hf=5 wrap clusters off the main elev onto a U-channel cut
-    view.  Single-U bands: all 4 pairs on the side cut.  Dual-U bands: only
-    short-edge bifurcations on the side cut; the 3 singles per U return to
-    main elev as 3+3 tips on the left/right plate–column junctions.
+    Continuous CIRCLE/hf5 wraps (no wrap-scallop ARCs on the contact face):
+    one perimeter weld per station on the main elev.  Do NOT explode onto a
+    U-channel cut.  Scalloped wraps (`_wrap_has_scallops`) keep per-edge
+    segments and are left untouched.
+
+    Geometry gate (GB + EU, not component family): see
+    `gusset_has_wrap_scallops` → `_wrap_has_scallops` on seed rows.
     """
     import math
     from collections import defaultdict
@@ -3920,9 +4131,16 @@ def relocate_eu_circle_wraps_to_u_cut(
 
     main_view_ids = set(main_view_ids or [])
     if not main_view_ids:
+        # Fallback: any view that hosts continuous CIRCLE wrap seeds
+        main_view_ids = {
+            r.get('view_id') for r in results
+            if r.get('_eu_circle_wrap') and not r.get('_wrap_has_scallops')
+            and r.get('view_id')
+        }
+    if not main_view_ids:
         return 0
 
-    # Find U-cut destination
+    # U-cut optional: used only to clean cut-view junk after perimeter emit
     u_vid = None
     for vid, vparts in part_lines_map.items():
         if vid in main_view_ids:
@@ -3939,19 +4157,20 @@ def relocate_eu_circle_wraps_to_u_cut(
                 scale=scale):
             u_vid = vid
             break
-    if not u_vid:
-        return 0
 
-    # Collect elev wrap seeds (CIRCLE tag or hf=5 clusters on main)
+    # Collect elev wrap seeds (continuous CIRCLE only — skip scalloped)
     wrap_rows = []
     for r in results:
         if r.get('view_id') not in main_view_ids:
+            continue
+        if r.get('_wrap_has_scallops'):
             continue
         if r.get('_eu_circle_wrap'):
             wrap_rows.append(r)
             continue
         if (r.get('hf') == 5 and r.get('dxf_pos')
-                and not (r.get('annotation') or '').upper().startswith('CJP')):
+                and not (r.get('annotation') or '').upper().startswith('CJP')
+                and not r.get('_wrap_has_scallops')):
             wrap_rows.append(r)
     if not wrap_rows:
         return 0
@@ -3985,7 +4204,7 @@ def relocate_eu_circle_wraps_to_u_cut(
     plate_lbl = sorted(wrap_plates)[0] if wrap_plates else None
     main_vid = sorted(main_view_ids)[0] if main_view_ids else None
 
-    # Main elev geometry for dual-U 3+3 placement
+    # Main elev geometry for dual-U L/R placement
     main_vparts = part_lines_map.get(main_vid) or {}
     main_aabb = _eu_view_bbox(main_vparts)
     main_body_main, _ = _eu_find_main_body_blocks(
@@ -3995,29 +4214,21 @@ def relocate_eu_circle_wraps_to_u_cut(
     dual_pairs = _eu_list_main_dual_plate_pairs(
         main_vparts, part_number_map, comp, comp_dims=comp_dims, scale=scale)
 
-    # Small plates = U stations on the cut view
-    small_pns = []
-    for pn, lns in vparts.items():
-        if pn in main_body_set:
-            continue
-        bb = _eu_part_bbox(lns)
-        if not bb:
-            continue
-        pw = (bb[2] - bb[0]) * scale
-        ph = (bb[3] - bb[1]) * scale
-        if max(pw, ph) >= 200:
-            continue
-        if min(pw, ph) >= 90 and max(pw, ph) >= 160:
-            continue
-        small_pns.append((pn, bb))
-    if not small_pns:
-        return 0
+    L_by_gusset = _eu_perimeter_length_by_gusset(wrap_rows, comp)
+    wrap_plate_list = _eu_list_main_wrap_plates(
+        main_vparts, part_number_map, wrap_plates, main_body_main, scale=scale)
+    n_wrap = _eu_count_wrap_stations(wrap_rows)
+    n_dual = len(dual_pairs) if dual_pairs else 0
+    n_plates = len(wrap_plate_list)
+    # Physical main-elev plates (TYP×2 + TYP×7 → 9) beat Y-collapsed seed packs
+    n_target = max(n_plates, n_wrap, n_dual) if (n_plates or n_wrap or n_dual) else 0
+    stations = _eu_wrap_stations_from_seeds(wrap_rows, n_target=n_wrap or n_target)
 
-    bands = _eu_group_u_plate_bands(small_pns)
     # Lowest U-stack seed Y on main (for keeping bottom-flange natives)
     seed_ys = [r['dxf_pos'][1] for r in wrap_rows if r.get('dxf_pos')]
-    # Prefer dual-pair cys when available (more accurate than sparse wrap seeds)
-    if dual_pairs:
+    if wrap_plate_list:
+        lowest_station_y = min(p['cy'] for p in wrap_plate_list)
+    elif dual_pairs:
         lowest_station_y = min(p['cy'] for p in dual_pairs)
     elif seed_ys:
         lowest_station_y = min(seed_ys)
@@ -4025,7 +4236,8 @@ def relocate_eu_circle_wraps_to_u_cut(
         lowest_station_y = 1e9
     bottom_keep_y = min(40.0, lowest_station_y - 35.0)
 
-    # Strip elev CIRCLE/hf5 wraps; keep bottom-flange seeds below the U stack
+    # Strip continuous elev CIRCLE/hf5 wraps only; keep scalloped per-edge
+    # segments and bottom-flange seeds below the U stack.
     n_drop = 0
     kept = []
     for r in results:
@@ -4033,36 +4245,27 @@ def relocate_eu_circle_wraps_to_u_cut(
                 r.get('_eu_circle_wrap')
                 or (r.get('hf') == 5
                     and not (r.get('annotation') or '').upper().startswith('CJP'))):
+            if r.get('_wrap_has_scallops'):
+                kept.append(r)
+                continue
             pos = r.get('dxf_pos')
             if bottom_keep_y is not None and pos and pos[1] <= bottom_keep_y:
                 kept.append(r)
                 continue
             n_drop += 1
             continue
-        if (r.get('view_id') == u_vid and r.get('hf') == 5
-                and not r.get('_eu_u_wrap')
-                and (r.get('_eu_typ_expand') or r.get('_eu_typ_soft'))):
+        if u_vid and r.get('view_id') == u_vid and (
+                r.get('_eu_u_wrap')
+                or r.get('_eu_u_short_pair')
+                or (r.get('hf') == 5 and (
+                    r.get('_eu_typ_expand') or r.get('_eu_typ_soft')))):
             n_drop += 1
             continue
-        if r.get('view_id') == u_vid and r.get('_eu_u_wrap'):
-            n_drop += 1
-            continue
-        # Drop stale wrap_main from prior logic
         if r.get('_eu_u_wrap_main'):
             n_drop += 1
             continue
         kept.append(r)
     results[:] = kept
-
-    stack_flat = []
-    for band in bands:
-        for item in sorted(band, key=lambda x: 0.5 * (x[1][0] + x[1][2])):
-            stack_flat.append(item)
-
-    local_map = dict(part_number_map)
-    for i, (pn, _bb) in enumerate(stack_flat):
-        if not local_map.get(pn):
-            local_map[pn] = f"$U{i}"
 
     def _in_main_aabb(mid, pad=8.0):
         if not main_aabb or not mid:
@@ -4070,265 +4273,114 @@ def relocate_eu_circle_wraps_to_u_cut(
         return (main_aabb[0] - pad <= mid[0] <= main_aabb[2] + pad
                 and main_aabb[1] - pad <= mid[1] <= main_aabb[3] + pad)
 
-    def _emit_row(mid, L, p1, p2, st_i, lane, target_vid, short_pair=False,
-                  short_tips=None, to_main=False):
+    added = 0
+
+    def _emit_perimeter(mid, L, p1, p2, st_i, lane=0):
         nonlocal added
+        if not main_vid or not mid or L <= 0:
+            return
         if p1 == p2:
             return
-        if to_main and not _in_main_aabb(mid):
+        if not _in_main_aabb(mid):
             return
-        cover_tol = 1.5 if to_main else 3.5
         if _eu_result_covers(
-                results, target_vid, L, (p1, p2), mid, tol=cover_tol,
+                results, main_vid, L, (p1, p2), mid, tol=1.5,
                 lane=lane, station=st_i):
             return
-        # Extra guard: same view + near mid already emitted (any length)
-        if to_main and any(
-                x.get('view_id') == target_vid
+        if any(
+                x.get('view_id') == main_vid
                 and x.get('_eu_u_wrap_main')
                 and x.get('dxf_pos')
                 and abs(x['dxf_pos'][0] - mid[0]) < 1.2
                 and abs(x['dxf_pos'][1] - mid[1]) < 1.2
                 for x in results):
             return
-        for side in ('Above', 'Below'):
-            row = {
-                'component': comp,
-                'position': side,
-                'hf': hf,
-                'length_mm': L,
-                'annotation': ann,
-                'part1': p1,
-                'part2': p2,
-                'dxf_pos': mid,
-                'view_id': target_vid,
-                '_eu_typ_expand': True,
-                '_eu_u_station': st_i,
-                '_eu_u_lane': lane,
-            }
-            if to_main:
-                row['_eu_u_wrap_main'] = True
-            else:
-                row['_eu_u_wrap'] = True
-            if short_pair and short_tips:
-                row['_eu_u_short_pair'] = True
-                row['_eu_u_short_tips'] = [
-                    tuple(short_tips[0]), tuple(short_tips[1])]
-            results.append(row)
-            added += 1
-
-    def _emit_edge(e, st_i, lane=0, short_pair=False, short_tips=None):
-        """Emit onto the U-cut view only (singles for single-U, short for all)."""
-        g = e.get('gusset')
-        p = e.get('partner')
-        ends = []
-        for x in (g, p):
-            if not x or (isinstance(x, str) and x.startswith('$U')):
-                continue
-            ends.append(x)
-        if plate_lbl and comp:
-            p1, p2 = sorted((plate_lbl, comp))
-        elif len(ends) >= 2 and ends[0] != ends[1]:
-            p1, p2 = sorted(ends[:2])
-        elif len(ends) == 1 and ends[0] != comp:
-            p1, p2 = sorted((ends[0], comp))
-        else:
-            p1, p2 = sorted((plate_lbl or spine_lbl or comp, comp))
-        mid = e['mid']
-        if short_pair and short_tips:
-            mid = (
-                0.5 * (short_tips[0][0] + short_tips[1][0]),
-                0.5 * (short_tips[0][1] + short_tips[1][1]),
-            )
-        L = round(e['length_mm'], 1)
-        _emit_row(mid, L, p1, p2, st_i, lane, u_vid,
-                  short_pair=short_pair, short_tips=short_tips, to_main=False)
-
-    def _emit_dual_main(st_i, dual_idx, singles_lens):
-        """3 tips left + 3 tips right on main elev for one dual-U station."""
-        if dual_idx < 0 or dual_idx >= len(dual_pairs) or not main_vid:
-            return
-        pair = dual_pairs[dual_idx]
-        left = pair.get('L')
-        right = pair.get('R')
-        if not left or not right:
-            return
-        # Prefer lengths from U-cut singles (sorted short→long → bot/mid/top-ish)
-        lens = sorted(singles_lens) if singles_lens else None
-        for lane, side_key in ((1, 'L'), (0, 'R')):
-            pn, bb, lbl = pair[side_key]
-            tips = _eu_tips_on_plate_column_contact(
-                pn, bb, main_vparts, part_number_map, main_body_main, comp,
-                col_lo, col_hi, scale, n_tips=3, lengths=lens)
-            p1, p2 = sorted((lbl, comp))
-            for tip in tips:
-                _emit_row(
-                    tip['mid'], tip['length_mm'], p1, p2, st_i, lane,
-                    main_vid, to_main=True)
-
-    # Match A-A bands → main dual_pairs (by cy order). A-A may miss a peer
-    # plate (AC0003 upper) so len(band)==1 can still be dual if a main
-    # L+R pair remains.
-    band_infos = []
-    for st_i, band in enumerate(bands):
-        cy = 0.5 * (band[0][1][1] + band[0][1][3])
-        band_infos.append({
-            'st_i': st_i, 'band': band, 'cy': cy, 'dual_idx': None,
+        # Perimeter wrap = one weld (all-around) → single F label, not Above/Below pair
+        results.append({
+            'component': comp,
+            'position': 'Above',
+            'hf': hf,
+            'length_mm': L,
+            'annotation': ann,
+            'part1': p1,
+            'part2': p2,
+            'dxf_pos': mid,
+            'view_id': main_vid,
+            '_eu_typ_expand': True,
+            '_eu_u_station': st_i,
+            '_eu_u_lane': lane,
+            '_eu_u_wrap_main': True,
+            '_eu_u_perimeter': True,
         })
-    dual_bands = sorted(
-        [b for b in band_infos if len(b['band']) >= 2], key=lambda x: x['cy'])
-    for i, db in enumerate(dual_bands):
-        if i < len(dual_pairs):
-            db['dual_idx'] = i
-    assigned = {b['dual_idx'] for b in band_infos if b['dual_idx'] is not None}
-    remain_pairs = [i for i in range(len(dual_pairs)) if i not in assigned]
-    single_bands = sorted(
-        [b for b in band_infos if b['dual_idx'] is None], key=lambda x: x['cy'])
-    for i, pair_i in enumerate(remain_pairs):
-        if i < len(single_bands):
-            # Prefer higher bands when leftover duals (upper missed peer on cut)
-            # Assign in cy order: leftover pairs go to unmatched bands by cy
-            single_bands[i]['dual_idx'] = pair_i
-    dual_idx_by_st = {b['st_i']: b['dual_idx'] for b in band_infos}
+        added += 1
 
-    # Typical lane x spacing for mirrored short-pair when A-A misses a peer plate
-    lane_short_dx = 5.0
-    for band in bands:
-        if len(band) >= 2:
-            cxs = sorted(0.5 * (bb[0] + bb[2]) for _, bb in band)
-            lane_short_dx = max(abs(cxs[1] - cxs[0]), 4.0)
-            break
-    x_template = _eu_build_section_u_x_template(bands, dual_pairs, dual_idx_by_st)
+    def _parts_for(st):
+        p1, p2 = st.get('p1'), st.get('p2')
+        if p1 and p2 and p1 != p2:
+            return sorted((p1, p2))
+        if plate_lbl and comp:
+            return sorted((plate_lbl, comp))
+        return sorted((spine_lbl or comp, comp))
 
-    added = 0
-    short_tips_by_st_lane = {}
-    for st_i, band in enumerate(bands):
-        matched_dual = dual_idx_by_st.get(st_i)
-        dual_u = matched_dual is not None
-        peer_spine_x = None
-        band_sorted = sorted(band, key=lambda x: 0.5 * (x[1][0] + x[1][2]))
-        band_singles_lens = []
+    def _lane_for_bb(bb):
+        cpx = 0.5 * (bb[0] + bb[2])
+        return 1 if cpx < col_cx else 0
 
-        # Single visible plate on a dual-U station: L/R are asymmetric — assign
-        # lane by profile (L→lane0/right tips, R→lane1/left tips) and infer the
-        # missing peer from main-elev bbox Y + section X template.
-        if (dual_u and len(band) == 1 and matched_dual is not None
-                and matched_dual < len(dual_pairs) and x_template):
-            dual_pair = dual_pairs[matched_dual]
-            pn_vis, bb_vis = band_sorted[0]
-            vis_side = _eu_classify_u_plate_side(bb_vis, dual_pair)
-            if not vis_side:
-                vis_side = 'R'
-            vis_lane = _eu_u_plate_lane(vis_side)
-            miss_side = 'R' if vis_side == 'L' else 'L'
-            miss_lane = 1 - vis_lane
-            packs = _pick_u_station_four_pairs(
-                pn_vis, bb_vis, vparts, local_map, main_body_set, comp,
-                adj_tol, scale, lane=vis_lane, peer_spine_x=None)
-            y_offsets = None
-            if packs:
-                singles = packs.get('singles') or []
-                for e in singles:
-                    band_singles_lens.append(e['length_mm'])
-                sp = packs.get('short_pair')
-                if sp:
-                    top_e, bot_e = sp
-                    vis_tips = (
-                        top_e.get('_open_tip') or top_e['mid'],
-                        bot_e.get('_open_tip') or bot_e['mid'],
-                    )
-                    y_offsets = _eu_short_tip_y_offsets(bb_vis, vis_tips)
-                    ref = (top_e if top_e['length_mm'] >= bot_e['length_mm']
-                           else bot_e)
-                    _emit_edge(ref, st_i, lane=vis_lane, short_pair=True,
-                               short_tips=vis_tips)
-                    short_tips_by_st_lane[(st_i, vis_lane)] = vis_tips
-            miss_bb_main = dual_pair[miss_side][1]
-            mir_tips = _eu_infer_section_short_tips(
-                miss_bb_main, miss_side, x_template, y_offsets)
-            if mir_tips:
-                ref_mid = (
-                    0.5 * (mir_tips[0][0] + mir_tips[1][0]),
-                    0.5 * (mir_tips[0][1] + mir_tips[1][1]),
-                )
-                L = round(
-                    ((mir_tips[1][0] - mir_tips[0][0]) ** 2
-                     + (mir_tips[1][1] - mir_tips[1][1]) ** 2) ** 0.5 * scale, 1)
-                if plate_lbl and comp:
-                    p1, p2 = sorted((plate_lbl, comp))
-                else:
-                    p1, p2 = sorted((spine_lbl or comp, comp))
-                _emit_row(ref_mid, L, p1, p2, st_i, miss_lane, u_vid,
-                          short_pair=True, short_tips=mir_tips, to_main=False)
-                short_tips_by_st_lane[(st_i, miss_lane)] = mir_tips
-            _emit_dual_main(st_i, matched_dual, band_singles_lens)
-            continue
-
-        for lane, (pn, bb) in enumerate(band_sorted):
-            packs = _pick_u_station_four_pairs(
-                pn, bb, vparts, local_map, main_body_set, comp, adj_tol, scale,
-                lane=lane, peer_spine_x=peer_spine_x)
-            if not packs:
+    # Prefer physical wrap plates on main elev: covers dual L/R stacks and
+    # single-side TYP stacks (e.g. AC0002 A0100×3 left-only).
+    if wrap_plate_list:
+        for st_i, pl in enumerate(wrap_plate_list):
+            L = L_by_gusset.get(pl['lbl'])
+            if not L:
                 continue
-            if lane == 0:
-                singles0 = packs.get('singles') or []
-                if singles0:
-                    peer_spine_x = singles0[0]['mid'][0]
-            singles = packs.get('singles') or []
-            for e in singles:
-                band_singles_lens.append(e['length_mm'])
-                if not dual_u:
-                    _emit_edge(e, st_i, lane=lane)
-            sp = packs.get('short_pair')
-            if sp:
-                top_e, bot_e = sp
-                tips = (
-                    top_e.get('_open_tip') or top_e['mid'],
-                    bot_e.get('_open_tip') or bot_e['mid'],
-                )
-                ref = top_e if top_e['length_mm'] >= bot_e['length_mm'] else bot_e
-                _emit_edge(ref, st_i, lane=lane, short_pair=True, short_tips=tips)
-                short_tips_by_st_lane[(st_i, lane)] = tips
-        # Dual-U: ensure both lanes have a short-edge bifurcation on A-A
-        if dual_u:
-            for need_lane in (0, 1):
-                if (st_i, need_lane) in short_tips_by_st_lane:
+            tips = _eu_tips_on_plate_column_contact(
+                pl['pn'], pl['bb'], main_vparts, part_number_map,
+                main_body_main, comp, col_lo, col_hi, scale,
+                n_tips=1, lengths=[L])
+            if tips:
+                mid = tips[0]['mid']
+            else:
+                contact_x = (
+                    col_lo if 0.5 * (pl['bb'][0] + pl['bb'][2]) < col_cx
+                    else col_hi)
+                mid = (contact_x, pl['cy'])
+            p1, p2 = sorted((pl['lbl'], comp))
+            _emit_perimeter(mid, L, p1, p2, st_i, lane=_lane_for_bb(pl['bb']))
+        return added if added else n_drop
+
+    # Dual-U fallback when wrap plates were not listed
+    if dual_pairs and (stations or L_by_gusset):
+        dual_sorted = list(enumerate(dual_pairs))
+        dual_sorted.sort(key=lambda x: x[1]['cy'])
+        st_sorted = sorted(stations, key=lambda s: s['mid'][1]) if stations else []
+        for k, (_di, pair) in enumerate(dual_sorted):
+            sy = pair['cy']
+            st = st_sorted[k] if k < len(st_sorted) else None
+            for lane, side_key in ((1, 'L'), (0, 'R')):
+                if side_key not in pair:
                     continue
-                donor_lane = 1 - need_lane
-                donor = short_tips_by_st_lane.get((st_i, donor_lane))
-                if not donor:
+                pn, bb, lbl = pair[side_key]
+                L = (L_by_gusset.get(lbl)
+                     or (st['L'] if st else 0)
+                     or next(iter(L_by_gusset.values()), 0))
+                if L <= 0:
                     continue
-                if (len(band) == 1 and matched_dual is not None
-                        and matched_dual < len(dual_pairs) and x_template):
-                    miss_side = 'L' if need_lane == 0 else 'R'
-                    miss_bb_main = dual_pairs[matched_dual][miss_side][1]
-                    mir_tips = _eu_infer_section_short_tips(
-                        miss_bb_main, miss_side, x_template,
-                        _eu_short_tip_y_offsets(band_sorted[0][1], donor))
+                tips = _eu_tips_on_plate_column_contact(
+                    pn, bb, main_vparts, part_number_map, main_body_main, comp,
+                    col_lo, col_hi, scale, n_tips=1, lengths=[L])
+                if tips:
+                    mid = tips[0]['mid']
+                    mid = (mid[0], 0.35 * mid[1] + 0.65 * sy)
                 else:
-                    sign = 1.0 if need_lane > donor_lane else -1.0
-                    dx = sign * lane_short_dx
-                    mir_tips = (
-                        (donor[0][0] + dx, donor[0][1]),
-                        (donor[1][0] + dx, donor[1][1]),
-                    )
-                if not mir_tips:
-                    continue
-                ref_mid = (
-                    0.5 * (mir_tips[0][0] + mir_tips[1][0]),
-                    0.5 * (mir_tips[0][1] + mir_tips[1][1]),
-                )
-                L = round(
-                    ((mir_tips[1][0] - mir_tips[0][0]) ** 2
-                     + (mir_tips[1][1] - mir_tips[0][1]) ** 2) ** 0.5 * scale, 1)
-                if plate_lbl and comp:
-                    p1, p2 = sorted((plate_lbl, comp))
-                else:
-                    p1, p2 = sorted((spine_lbl or comp, comp))
-                _emit_row(ref_mid, L, p1, p2, st_i, need_lane, u_vid,
-                          short_pair=True, short_tips=mir_tips, to_main=False)
-                short_tips_by_st_lane[(st_i, need_lane)] = mir_tips
-            _emit_dual_main(st_i, matched_dual, band_singles_lens)
+                    mx = bb[0] if side_key == 'L' else bb[2]
+                    mid = (mx, sy)
+                p1, p2 = sorted((lbl, comp))
+                _emit_perimeter(mid, L, p1, p2, k, lane=lane)
+        return added if added else n_drop
+
+    for st_i, st in enumerate(stations):
+        p1, p2 = _parts_for(st)
+        _emit_perimeter(st['mid'], st['L'], p1, p2, st_i, lane=0)
     return added if added else n_drop
 
 
@@ -4816,8 +4868,10 @@ def cleanup_eu_u_cut_typ_when_u_wrap(
         results, part_lines_map, part_number_map, comp, comp_dims=None,
         scale=10.0, main_view_ids=None):
     """
-    On the U-cut view (A-A): once u_wrap rows exist, keep only u_wrap welds.
-    Drops fingerprint TYP, CIRCLE wrap junk, and any other invented rows.
+    On the U-cut view (B-B / A-A): once perimeter wraps live on main
+    (`_eu_u_wrap_main`) or legacy `_eu_u_wrap` rows exist on the cut, clear
+    other invented TYP / CIRCLE junk from the cut so B-B stays empty of
+    wrap explosions.
     """
     if not results or not part_lines_map:
         return 0
@@ -4836,14 +4890,19 @@ def cleanup_eu_u_cut_typ_when_u_wrap(
             break
     if not u_vid:
         return 0
-    if not any(r.get('_eu_u_wrap') for r in results if r.get('view_id') == u_vid):
+    has_cut_wrap = any(
+        r.get('_eu_u_wrap') for r in results if r.get('view_id') == u_vid)
+    has_main_wrap = any(r.get('_eu_u_wrap_main') for r in results)
+    if not has_cut_wrap and not has_main_wrap:
         return 0
     drop = set()
     for i, r in enumerate(results):
         if r.get('view_id') != u_vid:
             continue
-        if r.get('_eu_u_wrap'):
+        # Keep legacy cut wraps only when that path is still active
+        if has_cut_wrap and r.get('_eu_u_wrap'):
             continue
+        # Perimeter-on-main mode: drop everything on the U-cut
         drop.add(i)
     if not drop:
         return 0
@@ -5275,16 +5334,21 @@ def drop_eu_compact_section_typ_dup_main(
 
 def drop_eu_section_typ_when_u_wrap_present(
         results, part_lines_map, part_number_map, comp, comp_dims=None,
-        scale=10.0, main_view_ids=None):
+        scale=10.0, main_view_ids=None, view_roles=None):
     """
     When U-wrap rows exist on the U-cut view, drop redundant TYP expands on
     sibling compact section cuts (B/C/D etc.).
+
+    Keep F-F / H-H H-section fillet pads (same-view mirror + cross-view align):
+    rows tagged _eu_h_complete / _eu_h_align / _eu_fillet_sib, and whole views
+    lettered F or H.
     """
     if not results or not part_lines_map:
         return 0
     main_view_ids = set(main_view_ids or [])
     if not main_view_ids:
         return 0
+    letter_by_view = (view_roles or {}).get('letter_by_view') or {}
 
     u_vid = None
     for vid, vparts in part_lines_map.items():
@@ -5300,22 +5364,32 @@ def drop_eu_section_typ_when_u_wrap_present(
             break
     if not u_vid:
         return 0
-    if not any(r.get('_eu_u_wrap') for r in results if r.get('view_id') == u_vid):
+    has_cut_wrap = any(
+        r.get('_eu_u_wrap') for r in results if r.get('view_id') == u_vid)
+    has_main_wrap = any(r.get('_eu_u_wrap_main') for r in results)
+    if not has_cut_wrap and not has_main_wrap:
         return 0
 
     drop = set()
     for i, r in enumerate(results):
-        if r.get('view_id') in main_view_ids or r.get('view_id') == u_vid:
+        vid = r.get('view_id')
+        if vid in main_view_ids or vid == u_vid:
             continue
         if not (r.get('_eu_typ_expand') or r.get('_eu_typ_soft')):
             continue
-        vparts = part_lines_map.get(r.get('view_id')) or {}
+        # Preserve H-section 3sides pads (F-F / H-H same-view + cross-view TYP)
+        if (r.get('_eu_h_complete') or r.get('_eu_h_align')
+                or r.get('_eu_fillet_sib')):
+            continue
+        if letter_by_view.get(vid) in ('F', 'H'):
+            continue
+        vparts = part_lines_map.get(vid) or {}
         tbb = _eu_view_bbox(vparts)
         if not tbb:
             continue
         if _eu_is_long_elevation(
                 vparts, tbb, part_number_map=part_number_map, comp=comp,
-                view_id=r.get('view_id'),
+                view_id=vid,
                 main_view_ids=main_view_ids):
             continue
         if _eu_is_u_channel_cut_view(

@@ -61,7 +61,7 @@ pip install ezdxf openpyxl ifcopenshell
 | 文件 | 用途 |
 |------|------|
 | `weld_extractor.py` | **核心**：读取所有 DXF + IFC → 输出 Excel 统计表 + 调用标注（国标/欧标分流） |
-| `weld_extractor_eu.py` | **欧标提取**：U 型围焊、TYP 扩展、A-A 剖面 U-cut 重定位、双 U 分流 |
+| `weld_extractor_eu.py` | **欧标提取**：连续 CIRCLE 周长围焊、TYP 扩展、U 剖清理、双 U 分流 |
 | `dxf_annotator.py` | **DXF 标注引擎**：象限约束、碰撞规避、引出标注 |
 | `dxf_annotator_eu.py` | **欧标标注入口**：调用 `dxf_annotator` 并输出至 `annotated/eu/` |
 | `eu_catalog_from_pdf.py` | 从欧标型钢 PDF 生成 `eu_sections.json`（截面尺寸） |
@@ -159,7 +159,18 @@ python compare_r3.py
 | `SNAP_TOL` | 1.5 | 箭头到零件线捕捉容差 |
 | `MAX_HF` | 20 | hf 上限；过大视为板厚 |
 
-主要特性：CIRCLE 围焊、3-SIDES、pp-mirror 对称板、TYP 分发、抽检清单、柱体通用后处理（CO007/CO008 共用）等。细节见源码 `COMP_CONFIG`。
+主要特性：CIRCLE 围焊（有/无焊孔几何分流）、3-SIDES、pp-mirror 对称板、TYP 分发、抽检清单、柱体通用后处理（CO007/CO008 共用）等。细节见源码 `COMP_CONFIG`。
+
+#### CIRCLE 围焊：焊孔几何分流（国标 / 欧标共用）
+
+不按构件族（AC/CO）硬编码，而用接触面附近的 **ARC 焊孔** 判别（`gusset_has_wrap_scallops`）：
+
+| 几何 | 行为 | 典型 |
+|------|------|------|
+| **无焊孔**（接触面无 15–40 mm ARC） | 收成 **1 条周长** 标在主视（单 F，非 Above/Below 成对） | EU AC U 板 |
+| **有焊孔**（邻件/柱体在接触面有扇形 ARC） | **按边保留** 多段焊缝（如 250+172+250） | GB CO007/CO008 |
+
+核心函数：`relocate_eu_circle_wraps_to_u_cut`（连续围焊 → `_eu_u_wrap_main`；有孔种子带 `_wrap_has_scallops` 则跳过）。国标在 GB 后处理中同样调用。
 
 柱体 D-D / E-E 近期约定（CO007/CO008）：
 
@@ -176,7 +187,7 @@ python compare_r3.py
 |------|------|
 | **编号** | FW/PP → `F{n}`；CJP → `W{n}` |
 | **引出** | 斜段 + 短水平线；字在水平线末端 |
-| **配对** | 同位置 Above/Below 共用一根引线（`F11,F12`） |
+| **配对** | 同位置 Above/Below 共用一根引线（`F11,F12`）；连续周长围焊（`_eu_u_wrap_main`）为单 F |
 | **象限** | 焊点相对本视图焊点中心分 Q1–Q4；默认同半区放置（左 Q2↔Q3，右 Q1↔Q4） |
 | **斜角禁区** | 相对**水平 ±10°**、**垂直 ±10°** 不可作斜引线（有效倾角约 10°–80°） |
 | **字号** | 与图纸剖面标题（A-A / B-B）字高一致；**不再**按密集区缩小 |
@@ -264,41 +275,37 @@ DXF 文件
 
 欧标与国标共用 `python weld_extractor.py` 入口；`weld_extractor_eu.extract_eu` 完成提取后由 `dxf_annotator_eu.annotate_eu` 标注。
 
-### U 型围焊（CIRCLE / hf5）重定位
+### CIRCLE / hf5 连续围焊（无焊孔）
 
-主视图上的 U 型零件围焊标记会重定位到 **A-A 剖面**（U-cut 视图），核心函数 `relocate_eu_circle_wraps_to_u_cut`：
+主视图连续 CIRCLE 围焊（`gusset_has_wrap_scallops` = False）收成周长，标在主视板–柱接触 tip；**不再**炸到 B-B/A-A U 剖。有焊孔的 CIRCLE 仍按边保留。
 
-| 场景 | A-A 剖面 | 主视图 |
-|------|----------|--------|
-| **单 U** | 4 对焊缝全保留（3 单焊 + 1 短边分叉） | 剥离 CIRCLE wrap |
-| **双 U** | 每 lane 仅保留短边分叉（V 形引线） | 左右各 3 对（共 6 点）回主视图 |
+| 场景 | 主视图 | U 剖视（B-B / A-A） |
+|------|--------|-------------------|
+| **单 U**（如 AC0001） | 每站 1 条周长（TYP×N → 物理板数，如 9） | 无围焊标注 |
+| **双 U**（如 AC0002/3） | 每站 L/R 各 1 条；单侧堆（如 A0100×3）亦补全 | 无围焊标注 |
+| **有焊孔 CIRCLE** | 按边多段（不收周长） | 不走周长路径 |
 
-短边分叉使用 `_draw_branched_paired_weld_label`：引线 V 口朝向短边开口端（`_eu_u_short_tips`）。
+标注：`_eu_u_wrap_main` 单 F；左侧 NW / 右侧 NE 扇形引线，文字在构件框外侧。
 
 ### 双 U 不对称截面（AC0003）
 
-主视图左右 U 板底边 Y 可能相差约 2 mm（L 板更低、R 板更高）。A-A 剖面有时只露出一块板（如 AC0003 上层仅 R 板）。此时：
-
-- 用主视图 `dual_pairs` 的 L/R bbox 底边识别可见板属于哪一侧；
-- L 板 → lane0（右侧开口），R 板 → lane1（左侧开口）；
-- 缺失的一侧从主视图对应板 bbox Y + 完整双板截面的 X 模板推断短边 tips（**不**简单镜像 Y）。
-
-对称双 U（AC0002 st3–st7，A-A 双板齐全）仍走原有几何拾取路径，不受影响。
+主视图左右 U 板底边 Y 可能相差约 2 mm（L 板更低、R 板更高）。此时按主视 `dual_pairs` / 围焊板列表分 L/R tip，引线朝柱外侧（左← / 右→）。
 
 ### 其他欧标后处理（`weld_extractor_eu.py`）
 
 - `expand_eu_typ_from_seeds`：相似结构 TYP 扩展
 - `mirror_eu_long_elev_native` / `ensure_eu_bottom_flange_lr`：主视图左右端镜像、底法兰三对
-- `cleanup_eu_u_cut_typ_when_u_wrap`：A-A 有 U-wrap 后清理冗余 TYP
+- `cleanup_eu_u_cut_typ_when_u_wrap`：主视已有周长围焊时清空 U 剖冗余
 - `drop_eu_section_typ_when_u_wrap_present`：剖面 B/C/D 冗余 TYP 剔除
 
 ### 当前欧标标注状态
 
-| 图纸 | 主视图 | A-A 剖面 | 备注 |
-|------|--------|----------|------|
-| **AC0002** | 双 U st3–7 各 6 点 + 底部 L/C/R | 单 U 全 4 对；双 U 仅短边 | 对称 U，双板完整 |
-| **AC0003** | 双 U st0/st1 各 6 点 | 仅短边分叉；上层单板不对称补全 | F31/F32 下方 tip y≈73 |
-| **AB0001** | — | — | 基线锁定，不必每次回归 |
+| 图纸 | 主视图围焊 | U 剖 | 备注 |
+|------|------------|------|------|
+| **AC0001** | 9 条周长（单 F） | 空 | 无焊孔连续围焊 |
+| **AC0002** | 13 条周长（含左侧 A0100×3） | 空 | 双 U + 单侧堆 |
+| **AC0003** | 4 条周长（2 站 × L/R） | 空 | 双 U |
+| **AB0001** | — | — | 基线锁定 |
 | **AB/AC/AT** 其余 | 持续迭代 | — | 见 `annotated/eu/` |
 
 ---
