@@ -4773,6 +4773,171 @@ def extract_welds(dxf_path, config=None):
             results.pop(i)
         if _p127_rm_idx:
             print(f"    [p127-dedup] removed {len(_p127_rm_idx)} extra Above entries")
+
+        # D-D: p127 top + p125 bottom at T-junction fillet corners (under flange)
+        def _plate_h_edge(plate_lbl, view_id, which):
+            """Longest H-edge at top/bottom → (length_mm, mid, left_end, right_end)."""
+            _vparts = part_lines_map.get(view_id, {})
+            _edges = []
+            _ys = []
+            for _pn, _plns in _vparts.items():
+                if part_number_map.get(_pn, comp) != plate_lbl:
+                    continue
+                for _ln in _plns:
+                    _s, _e = _ln['start'], _ln['end']
+                    _dx, _dy = _e[0] - _s[0], _e[1] - _s[1]
+                    _L = math.hypot(_dx, _dy)
+                    if _L < 0.5:
+                        continue
+                    if abs(_dy) > abs(_dx) * 0.35:
+                        continue
+                    _mid = ((_s[0] + _e[0]) / 2, (_s[1] + _e[1]) / 2)
+                    _lo = _s if _s[0] <= _e[0] else _e
+                    _hi = _e if _s[0] <= _e[0] else _s
+                    _edges.append((_L, _mid, _lo, _hi))
+                    _ys.extend([_s[1], _e[1]])
+            if not _edges or not _ys:
+                return None
+            _ty = max(_ys) if which == 'top' else min(_ys)
+            _cands = [t for t in _edges if abs(t[1][1] - _ty) < 1.5]
+            if not _cands:
+                return None
+            _cands.sort(key=lambda x: -x[0])
+            _L, _mid, _lo, _hi = _cands[0]
+            return round(_L * SCALE, 1), _mid, _lo, _hi
+
+        # Tips at T-junction fillets (stem top under p125): nearest edge end to p102
+        def _stem_x_range(view_id):
+            _xs = []
+            for _pn, _plns in part_lines_map.get(view_id, {}).items():
+                if part_number_map.get(_pn, comp) != _pm('p100'):
+                    continue
+                _xs.extend(p[0] for ln in _plns for p in (ln['start'], ln['end']))
+            if not _xs:
+                return None
+            return min(_xs), max(_xs)
+
+        def _ensure_dd_fillet(plate_lbl, which, view_id, side):
+            """side 'left'|'right' of stem — tip on plate H-edge nearest that stem corner."""
+            _info = _plate_h_edge(plate_lbl, view_id, which)
+            if not _info:
+                return
+            _len, _mid, _lo, _hi = _info
+            _stem = _stem_x_range(view_id)
+            if _stem:
+                _sx0, _sx1 = _stem
+                _tx = _sx0 if side == 'left' else _sx1
+            else:
+                _tx = _lo[0] if side == 'left' else _hi[0]
+            # Clamp stem-corner x onto the plate H-edge segment
+            _tx = min(max(_tx, _lo[0]), _hi[0])
+            # Short fillet H-edges (under-flange T weld): tip at edge mid so the
+            # leader leaves the weld body, not the stem corner (e.g. −6.8→−9.3).
+            # Longer flange-scale edges keep the stem-corner tip.
+            _edge_w = abs(_hi[0] - _lo[0])
+            if _edge_w < 12.0:
+                _tip = (_mid[0], _mid[1])
+            else:
+                _tip = (_tx, _mid[1])
+            _pd = part_dims.get(plate_lbl, {})
+            _bw = round(_pd.get('width') or 0)
+            _bl = round(_pd.get('bom_len') or 0)
+            try:
+                _cp = int(_get_cope_for_plate(plate_lbl) or 0)
+            except Exception:
+                _cp = 0
+            for _cand in (_bw, _bl, round(_bw - _cp) if _bw and _cp else 0):
+                if _cand and abs(_len - _cand) / max(_cand, 1) < 0.30:
+                    _len = float(_cand)
+                    break
+            _hf = next(
+                (_r['hf'] for _r in results
+                 if _r.get('component') == comp
+                 and { _r.get('part1'), _r.get('part2') } == {comp, plate_lbl}
+                 and _r.get('hf')),
+                hf_from_thickness(_pd.get('thick') or 12) or 7)
+            _near = []
+            for _r in results:
+                if _r.get('component') != comp:
+                    continue
+                if { _r.get('part1'), _r.get('part2') } != {comp, plate_lbl}:
+                    continue
+                _pos = _r.get('dxf_pos')
+                if _pos and math.hypot(_pos[0] - _mid[0], _pos[1] - _mid[1]) < 6.0:
+                    _near.append(_r)
+                elif abs((_r.get('length_mm') or 0) - _len) < 5.0 and (
+                        _pos is None or abs(_pos[1] - _mid[1]) < 8.0):
+                    _near.append(_r)
+            if not _near:
+                for _pos_name in ('Above', 'Below'):
+                    results.append({
+                        'component': comp, 'position': _pos_name, 'hf': _hf,
+                        'length_mm': _len, 'annotation': '',
+                        'part1': comp, 'part2': plate_lbl,
+                        'dxf_pos': _tip, 'view_id': view_id,
+                        '_no_refine': True, '_synthetic': True,
+                    })
+                print(f"    [dd-edge] add {plate_lbl} {which}/{side} "
+                      f"len={_len} tip=({_tip[0]:.1f},{_tip[1]:.1f})")
+                return
+            for _r in _near:
+                _r['dxf_pos'] = _tip
+                _r['view_id'] = view_id
+                _r['length_mm'] = _len
+                _r['_no_refine'] = True
+            _have = { _r.get('position') for _r in _near }
+            for _pos_name in ('Above', 'Below'):
+                if _pos_name not in _have:
+                    results.append({
+                        'component': comp, 'position': _pos_name, 'hf': _hf,
+                        'length_mm': _len, 'annotation': '',
+                        'part1': comp, 'part2': plate_lbl,
+                        'dxf_pos': _tip, 'view_id': view_id,
+                        '_no_refine': True, '_synthetic': True,
+                    })
+            print(f"    [dd-edge] retarget {plate_lbl} {which}/{side} "
+                  f"len={_len} tip=({_tip[0]:.1f},{_tip[1]:.1f})")
+
+        _ensure_dd_fillet(_pm('p127'), 'top', dd, 'left')
+        _ensure_dd_fillet(_pm('p125'), 'bottom', dd, 'right')
+
+        # E-E: p102/p124 tip on solid edge y≈115 (not dashed extension below)
+        _stiff = _pm('p100')  # CO008 map→p102; CO007→p100
+        _flange = _pm('p124')
+        _stiff_tip = None
+        _wl_pp = _find_weld_line_for_pair(_stiff, _flange, ee)
+        if _wl_pp:
+            # Prefer contact mid nearest y=115 (lower flange / stiffener joint)
+            _stiff_tip = min(_wl_pp, key=lambda w: abs(w[2][1] - 115.0))[2]
+        if _stiff_tip is None:
+            _stiff_xs = []
+            for _pn, _plns in part_lines_map.get(ee, {}).items():
+                if part_number_map.get(_pn, comp) != _stiff:
+                    continue
+                _stiff_xs.extend(
+                    p[0] for ln in _plns for p in (ln['start'], ln['end']))
+            if _stiff_xs:
+                _stiff_tip = (sum(_stiff_xs) / len(_stiff_xs), 115.0)
+        if _stiff_tip is not None:
+            # Force y≈115 on solid flange/stiffener edge (not dashed extension)
+            _stiff_tip = (_stiff_tip[0], 115.0)
+            _n_pp_tip = 0
+            for _r in results:
+                if _r.get('component') != comp:
+                    continue
+                if { _r.get('part1'), _r.get('part2') } != {_stiff, _flange}:
+                    continue
+                _r['dxf_pos'] = _stiff_tip
+                _r['view_id'] = ee
+                _r['_no_refine'] = True
+                # Underside mid-flange tip: label must go below into H pocket
+                # (not up into inter-view blank above E-E).
+                _r['_prefer_leader_down'] = True
+                _n_pp_tip += 1
+            if _n_pp_tip:
+                print(f"    [ee-stiff] {_stiff}/{_flange} tip→"
+                      f"({_stiff_tip[0]:.1f},{_stiff_tip[1]:.1f}) n={_n_pp_tip}")
+
         # p124: remove bl-side F-type duplicates
         _p124_rm = [i for i, r in enumerate(results)
                     if r.get('component') == comp and r.get('part1') == comp and r.get('part2') == _pm('p124')
@@ -5959,13 +6124,22 @@ def run_pipeline(config: JobConfig):
         excel_path = alt
 
     sampled = []
-    # Annotation: EU only (never call GB annotate in this pipeline)
+    if config.run_annotate and gb_results:
+        try:
+            import dxf_annotator
+            progress("Annotating GB DXF", 93)
+            gb_anno = [f for f in gb_paths if not any(s in os.path.basename(f) for s in skip)]
+            sampled.extend(dxf_annotator.annotate(gb_results, gb_anno) or [])
+            progress("GB DXF annotation complete.", 96)
+        except Exception as exc:
+            import traceback
+            progress(f"GB DXF annotation failed: {exc}\n{traceback.format_exc()}", None)
     if config.run_annotate and eu_results:
         try:
             import dxf_annotator_eu
-            progress("Annotating EU DXF", 95)
+            progress("Annotating EU DXF", 97)
             eu_anno = [f for f in eu_paths if not any(s in os.path.basename(f) for s in skip)]
-            sampled = dxf_annotator_eu.annotate_eu(eu_results, eu_anno) or []
+            sampled.extend(dxf_annotator_eu.annotate_eu(eu_results, eu_anno) or [])
             progress("EU DXF annotation complete.", 99)
         except Exception as exc:
             import traceback
